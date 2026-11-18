@@ -1,0 +1,10 @@
+# Upstream Release, PR & Technique Log (`records/research-log.md`)
+
+Every trial appends a 1-line check of upstream inference engines (`vllm-project/vllm`, `sgl-project/sglang`, `NVIDIA/TensorRT-LLM`, `ggml-org/llama.cpp`, `ashhart/TensorFold`, `sharar-project/hibana`), recent PRs, papers, or X releases before editing `<site>/candidate.sh`.
+
+| Checked (JST) | Trial | Source / URL | Finding | Action |
+|---|---:|---|---|---|
+| 2026-11-19 00:30 | init | <https://github.com/ashhart/TensorFold/releases/tag/v1.2.9> | TensorFold v1.2.9 (`6b9de695`) native CUDA serve with MTP + copies for GB10 SM121 and NVFP4 | Adopted as `spark/candidate.sh` trial 0 baseline |
+| 2026-11-19 00:30 | init | <https://github.com/sharar-project/hibana/releases/tag/v0.1.0> | Hibana v0.1.0 (`d474b74`) reports 119.6 tok/s single-stream in fast mode (3-bit + expert sharing + relaxed MTP `s=0.5`, GPQA drop -1.6 to -3.7 pt) and exact mode | Tracked in `records/world-records.tsv`; test exact/guard-compliant techniques in R1 |
+| 2026-11-19 00:30 | init | <https://github.com/NVIDIA/local-ai-inference-recipes/blob/bb515086841e7a81e7d51925561338e7dee35023/models/qwen/qwen3.8-flash-next/dgx-spark/linux/vllm/fp4-local/performance.yaml> | NVIDIA GB10 vLLM + b12x + FP4-Local + MTP 4 recipe (`37.77 tok/s` active decode avg on SPEED-Bench coding) | Tracked as `GB10-C1-NVIDIA` verified reference |
+| 2026-11-19 00:30 | init | <https://github.com/vllm-project/vllm/releases/tag/v0.34.0>, <https://github.com/sgl-project/sglang/releases/tag/v0.5.23>, <https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v1.4.0rc3> | Latest upstream engine releases identified for per-trial SM121 / NVFP4 / MTP kernel & scheduler delta checks | Queued for R1 per-trial inspection |

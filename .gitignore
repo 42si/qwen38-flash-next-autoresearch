@@ -1,0 +1,11 @@
+private/
+inputs-private*
+runs/
+*.jsonl
+*.log
+*.pid
+__pycache__/
+*.pyc
+.venv*
+.DS_Store
+STOP
