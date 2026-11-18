@@ -18,6 +18,10 @@ PRIVATE_DIR="${QFN_PRIVATE_DIR:-$ROOT_DIR/private}"
 AGENT_RUN_BIN="${QFN_AGENT_RUN:-$HOME/agent-hub/scripts/agent-run}"
 
 mkdir -p "$PRIVATE_DIR"
+if [[ -f "$PRIVATE_DIR/host.env" ]]; then
+  # shellcheck disable=SC1090
+  source "$PRIVATE_DIR/host.env"
+fi
 
 log() {
   printf '[%s JST] [loop:%s] %s\n' "$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S')" "$SITE" "$*"
@@ -38,6 +42,31 @@ while true; do
   if ! (cd "$LOOP_DIR" && shasum -a 256 -c bench/FROZEN.sha256 >/dev/null 2>&1); then
     log "STOP: bench/FROZEN.sha256 verification failed in loop worktree."
     exit 2
+  fi
+
+  # Pre-round host reachability & exclusive-GPU gate on spark (avoids burning LLM quota if host is offline or busy)
+  if [[ "$SITE" == "spark" && -n "${QFN_SSH_TARGET:-}" ]]; then
+    # shellcheck disable=SC2206
+    SSH_OPTS=(${QFN_SSH_OPTS:--o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=15})
+    PORT_CHECK="${QFN_PORT:-29771}"
+    HOST_GATE="$(ssh "${SSH_OPTS[@]}" "$QFN_SSH_TARGET" "PORT='$PORT_CHECK' bash -s" <<'EOF' 2>/dev/null || echo "UNREACHABLE"
+set -euo pipefail
+if tmux has-session -t qfn-ar-spark-trial 2>/dev/null; then echo "BUSY:trial_lock"; exit 0; fi
+if ss -H -ltn "sport = :$PORT or sport = :29761" | grep -q .; then echo "BUSY:port_occupied"; exit 0; fi
+APPS="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | tr -d ' ' || true)"
+if [[ -n "$APPS" ]]; then echo "BUSY:gpu_apps($APPS)"; exit 0; fi
+if pgrep -u "$(id -u)" -fa 'vllm|sglang|llama-server|tensorfold-native|hibana|trtllm' | grep -v 'pgrep' >/dev/null 2>&1; then
+  echo "BUSY:existing_inference_server"
+  exit 0
+fi
+echo "READY"
+EOF
+)"
+    if [[ "$HOST_GATE" != "READY" ]]; then
+      log "Target host gate is '$HOST_GATE' (not stopping or modifying host services); sleeping 120s without spending agent quota..."
+      sleep 120
+      continue
+    fi
   fi
 
   # Colab CU safety gate before round
