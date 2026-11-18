@@ -33,7 +33,7 @@ Full ledger: [`colab/results.tsv`](colab/results.tsv)
 <!-- FRONTIER_TABLE_START -->
 | Track | Hardware | Best Trial | Commit | `decode_c1_tps` | `total_c4_tps` | `total_c8_tps` | `total_c16_tps` | `ttft_c1_s` | `prefill_tps` | GPQA Guard | Engine & Quantization |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
-| `spark` | DGX Spark (GB10 x1) | `0` | `91ee67fc` | **74.87** | 137.76 | 187.93 | 228.41 | 0.185 s | 1,743.19 | `G13` 13/13 | TensorFold v1.2.9 (`6b9de695`) + NVFP4 (`fc694b54`) |
+| `spark` | DGX Spark (GB10 x1) | `0` | `36ee7423` | **74.87** | 137.76 | 187.93 | 228.41 | 0.185 s | 1,743.19 | `G13` 13/13 | TensorFold v1.2.9 (`6b9de695`) + NVFP4 (`fc694b54`) |
 | `colab` | RTX PRO 6000 (G4 x1) | — | — | — | — | — | — | — | — | — | — |
 <!-- FRONTIER_TABLE_END -->
 
