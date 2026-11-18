@@ -56,10 +56,6 @@ PY
 
   start)
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    export TF_FLASHNEXT_DRAFT_HEAD="affine4"
-    export TF_FLASHNEXT_DRAFTS_GREEDY="14"
-    export TF_FLASHNEXT_CONFIDENCE="-0.10"
-    export TF_FLASHNEXT_GREEDY_WIDE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       CTX="$GUARD_CONTEXT"
