@@ -27,8 +27,19 @@ Switching away from NVFP4 is permitted **only** when all three plateau criteria 
 
 When switching, candidate formats are evaluated in accuracy-preserving order (`FP4-Local`, `MXFP4`, calibrated `INT4` AWQ/GPTQ/AutoRound, `FP8`, calibrated 3-bit), and the new starting point must pass the full `G198` GPQA Diamond guard before becoming the parent commit.
 
-## 4. Decision Log
+## 4. Decision Log (Q0 Completed — Locked to NVFP4)
+
+### Q0 Same-Engine / Same-Harness Comparison on DGX Spark (GB10 × 1)
+
+Measured on `TensorFold v1.2.9` (`6b9de695`) with the identical frozen 16-prompt 400-token code benchmark (`temperature=0`, `ignore_eos=True`, thinking disabled, 3 repeats median) and identical GPQA Diamond `G13` split (`temperature=1.0`, `top_p=0.95`, `top_k=20`, thinking enabled, `seed=42`, choice order `seed=0`):
+
+| Candidate Checkpoint | `decode_c1_tps` | Gain vs NVFP4 | `total_c4_tps` | `total_c8_tps` | `total_c16_tps` | `ttft_c1_s` | `prefill_tps` | GPQA `G13` | Meets Q0 Rule (`>= +10%` speed AND `>=` GPQA)? |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`nvidia/Qwen3.8-Flash-Next-NVFP4` (`fc694b54`)** | **74.87** | baseline | 137.76 | 187.93 | 228.41 | 0.185 | 1,743.19 | **13 / 13** | **Selected (Locked)** |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` (`b9ce18a6`) | 80.19 | +7.11% | 159.10 | 206.31 | 242.83 | 0.174 | 1,638.51 | 12 / 13 | No (`+7.11% < +10%`, and `12/13 < 13/13`) |
+
+*(Reference check on `Hibana v0.1.0` `exact` profile with `RadixArk/Qwen3.8-Flash-Next-NVFP4`: `decode_c1_tps = 78.67`, `total_c4_tps = 162.11`, `total_c16_tps = 269.84`, GPQA `G13 = 13 / 13`.)*
 
 | Date/Time (JST) | Site | Selected Quantization | Status | Evidence & Notes |
 |---|---|---|---|---|
-| 2026-11-19 | spark | `NVFP4` (`fc694b54`) | Initial baseline (Q0 comparison pending baseline run completion) | Starting checkpoint fixed to `nvidia/Qwen3.8-Flash-Next-NVFP4`; Q0 comparison against `FP4-Local` (`b9ce18a6`) recorded upon baseline measurement completion. |
+| 2026-11-19 04:20 | spark | **`NVFP4` (`fc694b54`)** | **Locked after Q0** | `FP4-Local` achieved `+7.11%` single-stream decode (below `+10%` threshold) and `12/13` vs `13/13` on `G13` (`-6.0%` slower prefill). Quantization is locked to **NVFP4**; all subsequent trials focus on engines, kernels, schedulers, speculative decoding (MTP), CUDA graphs, and KV cache until plateau criteria (§3) are met. |

@@ -1,1 +1,2 @@
 trial	commit	started_jst	decode_c1_tps	total_c4_tps	total_c8_tps	total_c16_tps	ttft_c1_s	prefill_tps	gpqa_set	gpqa_correct	gpqa_total	hash_match	peak_mem_gib	status	description	engine	engine_rev	quant	weights_rev	parent	gain_vs_parent_pct	wr_ref	vs_wr_pct	agent	cu_spent
+0	91ee67fc	2026-11-19 01:31:37	74.87	137.76	187.93	228.41	0.185	1743.19	G13	13	13	1		keep	baseline (先行の計測ラン, TensorFold v1.2.9, NVFP4)	TensorFold v1.2.9	6b9de695	NVFP4	fc694b54					gpt-6.2-astra/xhigh	
