@@ -124,8 +124,8 @@
 
 ## 担当の分け方
 
-- **orchestrator（仮説・検収・方針更新）：** Claude Fable 5.2（High）、Gemini 4 Carbon（High）、GPT-6.2-Astra（xhigh）のいずれか。
-- **実装（`candidate.sh` の編集、ビルド、試行の実行）：** Gemini 4 Carbon（High）と GPT-6.2-Astra（xhigh）。Fable は実装に使わない。
+- **orchestrator（仮説・検収・方針更新）：** Claude Fable 5.2（High）、Gemini 4 Neon（xhigh）、GPT-6.2-Astra（xhigh）のいずれか。
+- **実装（`candidate.sh` の編集、ビルド、試行の実行）：** Gemini 4 Neon（High）と GPT-6.2-Astra（xhigh）。Fable は実装に使わない。
 - **調査（最新エンジンの GitHub リポジトリ、X、世界記録、量子化など）：** 安くて高速なモデルを並列で使ってよい。GPT-6.2-Sol（xhigh）も調査に限り使ってよい。
 - **GPT-6.x-Sol は、実装と orchestrator には使わない。フォールバック先にもしない。**
 - **各ラウンドの最初に利用枠の残量を確認する。** 枯渇した枠・確認できなかった値・古い値は余力として扱わず、余力のある枠だけを使う。実装役が 2 つとも余力なしのときは、枠が戻るまで待つ（別のモデルに置き換えない）。確認した値と割り振りは `records/allocation-log.md` に書く。
