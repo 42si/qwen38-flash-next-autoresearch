@@ -2,6 +2,24 @@
 
 Every trial appends a 1-line check of upstream inference engines (`vllm-project/vllm`, `sgl-project/sglang`, `NVIDIA/TensorRT-LLM`, `ggml-org/llama.cpp`, `ashhart/TensorFold`, `sharar-project/hibana`), recent PRs, papers, or X releases before editing `<site>/candidate.sh`.
 
+## Priority Queue for Next Trials (owner directive, 2026-11-20 08:39 JST)
+
+Read this before choosing each hypothesis. Try these Hibana-derived ideas in this order before other ideas, one focused trial at a time, still editing only `<site>/candidate.sh` and keeping NVFP4 weights. Sources: [arXiv:2611.10469v1](https://arxiv.org/abs/2611.10469v1) (Sec. 3.1.1, 3.3.1, 4.4 / Fig. 8, Table 4) and [`sharar-project/hibana` v0.1.0](https://github.com/sharar-project/hibana/tree/v0.1.0). Hibana's single-stream ablation on Flash-Next: MTP +97%, 3-bit +43%, expert sharing +32%, adaptive drafting +5%, NVFP4 KV +5%.
+
+1. **Expert sharing in MTP verify / decode (highest priority, not yet tried in trials 0-48).** Each verify forward reads one shared, budgeted set of routed experts per MoE layer instead of the union of every row's top-10.
+   - Hibana code: `hibana/model/flashnext/moe.py` (`route()` -> `route_budget`, `guarantee()`, `MIN_GUARANTEE=2`, `MIN_CAP=16`) and `hibana/kernels/flashnext_fused` (`route_budget`, `route_topk`). Env knobs `HIBANA_MOE_KEEP` / `HIBANA_MOE_BUDGET` (fast profile `keep 4`, budget `12:64` = alpha 12 per request, cap in [16, 64]).
+   - Rule: per layer, each row first keeps its own top-`g` experts (`g = max(2, min(keep, 2*cap/rows))`), then fill the remaining budget with experts ranked by routing mass (sum of softmax prob over rows whose original top-10 contains the expert); each row then uses up to 10 of its candidates inside the set and renormalizes weights. Unused slots get weight 0. Only decode/verify forwards; prefill keeps full routing. The always-on shared expert is untouched.
+   - Single stream (c1) cap = 16 experts (MIN_CAP). Hibana notes 12 lost accuracy (GSM8K -4.7 pt) and 16 was within noise; do not go below 16 / guarantee 2 without evidence.
+   - Implement inside the existing TensorFold router/topk-plan kernels (`tf_route_topk_plan`, NVFP4 expert gather) via the candidate's inline patches. Verified output will differ, so `hash_match` will fail: the guard is `G40` within 2 items of the parent, and a new best still needs `G198` within 2 items / 1.0 pt of baseline. Record expected bytes saved per round.
+2. **KV cache dtype: FP8 KV first, then NVFP4 KV.** Current best runs BF16 KV. FP8 KV also matches the MiaAI-Lab TensorFold comparison condition (`fp8` KV) and NVIDIA's recipe.
+   - Hibana code: `hibana/kernels/kv_fp4.py` (NVFP4 = E2M1 codes, one E4M3 scale per 16 values along head_dim, global scale 1; `sim-fp4` / `sim-k8v4` = FP8 K + NVFP4 V accuracy screen in a BF16 pool), `hibana/kernels/kv_copy.py`, `docs/operations.md#nvfp4-kv`. Try FP8 K+V, then K FP8 / V NVFP4, then full NVFP4.
+   - Guard as above (`G40`; `G198` for a new best). Check c4/c8/ttft constraints too.
+3. **Acceptance-rate-based adaptive draft depth.** Prior trials (6, 8, 22, 24, 32, 46, 47) only used draft-confidence floors / cliff stops. Hibana instead tracks each request's recent acceptance.
+   - Hibana code: `hibana/engine/depth.py` (`AcceptanceDepth`, `observe()`: per-position survival counters decayed each round, `rate` 0.02), `docs/flashnext.md` (the MTP draft): q = moving-average accepted drafts per tested position; choose depth d maximizing `(1 - q^(d+1)) / (1 - q)` divided by round cost `1 + c*(d-1)`, c = `HIBANA_SPEC_STEP_COST` = 0.14 on one Spark (31.5 ms at depth 1, ~4.3 ms per extra token). Combine with the existing confidence early-stop if it helps; greedy output must stay exact (`hash_match`).
+   - Note from Hibana: with expert sharing, deeper verify costs little, so re-tune depth after item 1.
+
+Deprioritized: **3-bit expert weights** (Hibana +43% but GPQA -0.3, LCB -2.3; only after the formal NVFP4 plateau criteria in `program.md` and a full `G198` re-baseline). Excluded: **relaxed verification** (`s=0.5`, GPQA -1.3 pt, violates the 1.0 pt guard). Log each attempt here with the trial number and `Hibana item N` in the Action column.
+
 | Checked (JST) | Trial | Source / URL | Finding | Action |
 |---|---:|---|---|---|
 | 2026-11-19 00:30 | init | <https://github.com/ashhart/TensorFold/releases/tag/v1.2.9> | TensorFold v1.2.9 (`6b9de695`) native CUDA serve with MTP + copies for GB10 SM121 and NVFP4 | Adopted as `spark/candidate.sh` trial 0 baseline |
