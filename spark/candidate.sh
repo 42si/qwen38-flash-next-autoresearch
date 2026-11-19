@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4-bf12"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-t20"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -37,14 +37,16 @@ apply_patches() {
   local cuda_dir="$SRC_DIR/zig/src/cuda"
   local kern_dir="$SRC_DIR/zig/kernels/cuda"
 
-  # 1a. Append W2 group-32 proposal GEMV + shared-BF16 exact top-64 rescore kernels to flashnext_mtp.cu
+  # 1a. Append fused 2.25-bit E4M3 W2 proposal GEMV + single-block top-64 exact BF16 rescore-to-best kernels to flashnext_mtp.cu
   cat >> "$kern_dir/flashnext_mtp.cu" <<'CU'
 
-extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv(
+extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
     const __nv_bfloat16* __restrict__ X,
-    const uint64_t* __restrict__ W,
-    const unsigned short* __restrict__ S,
+    const uint4* __restrict__ W,
+    const uint16_t* __restrict__ S,
+    const float* __restrict__ G,
     __nv_bfloat16* __restrict__ out,
+    float2* __restrict__ stats,
     int V) {
     __shared__ float sx[2560];
     __shared__ float sg_sum[80];
@@ -63,63 +65,345 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv(
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
     const int blk = blockIdx.x * 4 + warp;
-    if (blk * 32 >= V) return;
-    const uint64_t* wp = W + static_cast<size_t>(blk) * 80 * 32 + lane;
-    const unsigned short* sp = S + static_cast<size_t>(blk) * 80 * 32 + lane;
-    float acc = 0.0f;
-    for (int g = 0; g < 80; ++g) {
-        const uint64_t bits = __ldg(wp + g * 32);
-        const unsigned short sb = __ldg(sp + g * 32);
-        const float sc = __uint_as_float(static_cast<uint32_t>(sb) << 16);
-        const float* xg = sx + g * 32;
-        float dot = 0.0f;
-        const uint32_t lo = static_cast<uint32_t>(bits);
-        const uint32_t hi = static_cast<uint32_t>(bits >> 32);
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            dot = fmaf(xg[j], static_cast<float>((lo >> (2 * j)) & 3u), dot);
-        }
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            dot = fmaf(xg[16 + j], static_cast<float>((hi >> (2 * j)) & 3u), dot);
-        }
-        acc = fmaf(sc, dot - sg_sum[g], acc);
-    }
     const int row = blk * 32 + lane;
-    if (row < V) out[row] = __float2bfloat16_rn(acc);
+    float fv = -CUDART_INF_F;
+    if (blk * 32 < V) {
+        const uint4* wp = W + static_cast<size_t>(blk) * 40 * 32 + lane;
+        const uint16_t* sp = S + static_cast<size_t>(blk) * 40 * 32 + lane;
+        float acc = 0.0f;
+        for (int g2 = 0; g2 < 40; ++g2) {
+            const uint4 w4 = __ldg(wp + g2 * 32);
+            const uint32_t s2 = __ldg(sp + g2 * 32);
+            const uint32_t sx2 = (s2 & 0xFFu) | ((s2 & 0xFF00u) << 8);
+            const uint32_t ts = ((sx2 & 0x007F007Fu) << 4) | ((sx2 & 0x00800080u) << 8);
+            uint32_t bf2;
+            asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(bf2) : "r"(ts), "r"(0x7B807B80u), "r"(0x80008000u));
+            const float sc0 = __uint_as_float((bf2 & 0xFFFFu) << 16);
+            const float sc1 = __uint_as_float(bf2 & 0xFFFF0000u);
+            const int g0 = g2 * 2;
+            const float* xg0 = sx + g0 * 32;
+            float dot0 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[j], static_cast<float>((w4.x >> (2 * j)) & 3u), dot0);
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[16 + j], static_cast<float>((w4.y >> (2 * j)) & 3u), dot0);
+            acc = fmaf(sc0, dot0 - sg_sum[g0], acc);
+            const float* xg1 = sx + (g0 + 1) * 32;
+            float dot1 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[j], static_cast<float>((w4.z >> (2 * j)) & 3u), dot1);
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[16 + j], static_cast<float>((w4.w >> (2 * j)) & 3u), dot1);
+            acc = fmaf(sc1, dot1 - sg_sum[g0 + 1], acc);
+        }
+        acc *= __ldg(G + row);
+        if (row < V) {
+            const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
+            out[row] = bv;
+            fv = __bfloat162float(bv);
+        }
+    }
+    float wm = fv;
+    for (int o = 16; o; o >>= 1) wm = fmaxf(wm, __shfl_xor_sync(0xffffffffu, wm, o));
+    __shared__ float smax[4], ssum[4], sbmax;
+    if (lane == 0) smax[warp] = wm;
+    __syncthreads();
+    if (tid == 0) {
+        sbmax = fmaxf(fmaxf(smax[0], smax[1]), fmaxf(smax[2], smax[3]));
+    }
+    __syncthreads();
+    const float bmax = sbmax;
+    float ex = (row < V) ? expf(fv - bmax) : 0.0f;
+    for (int o = 16; o; o >>= 1) ex += __shfl_xor_sync(0xffffffffu, ex, o);
+    if (lane == 0) ssum[warp] = ex;
+    __syncthreads();
+    if (tid == 0) {
+        stats[blockIdx.x] = make_float2(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3]);
+    }
 }
 
-extern "C" __global__ void __launch_bounds__(256) fn_w2_rescore(
+extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best(
     const __nv_bfloat16* __restrict__ X,
     const __nv_bfloat16* __restrict__ W_full_bf16,
     const uint32_t* __restrict__ vocab_ids,
-    const int* __restrict__ cols,
     __nv_bfloat16* __restrict__ dlogits,
-    int V) {
-    const int c = cols[blockIdx.x];
-    if (c < 0 || c >= V) return;
-    const uint32_t gid = vocab_ids[c];
-    const uint32_t* xp = reinterpret_cast<const uint32_t*>(X);
-    const uint32_t* wp = reinterpret_cast<const uint32_t*>(W_full_bf16 + static_cast<size_t>(gid) * 2560);
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < 1280; i += 256) {
-        const uint32_t xv = __ldg(xp + i);
-        const uint32_t wv = __ldg(wp + i);
-        const float x0 = __uint_as_float((xv & 0xFFFFu) << 16);
-        const float x1 = __uint_as_float(xv & 0xFFFF0000u);
-        const float w0 = __uint_as_float((wv & 0xFFFFu) << 16);
-        const float w1 = __uint_as_float(wv & 0xFFFF0000u);
-        sum = fmaf(x0, w0, fmaf(x1, w1, sum));
+    const float2* __restrict__ stats,
+    int n_blocks,
+    int V,
+    float* __restrict__ best_out) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    __shared__ float sx[320 * 9];
+    __shared__ float sv[32], ss[32];
+    __shared__ int si[32];
+    __shared__ unsigned int hist[128];
+    __shared__ int cand_col[64];
+    __shared__ float cand_old[64], cand_new[64];
+    __shared__ float sgmax, sgsum, srmax;
+    __shared__ int srcol, s_strict_cut, s_b_cut;
+    __shared__ unsigned int s_eq_need, n_cand, n_eq_taken;
+
+    for (int i = t; i < 2560; i += 1024) {
+        sx[(i >> 3) * 9 + (i & 7)] = __bfloat162float(X[i]);
     }
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    __shared__ float ws[8];
-    if (lane == 0) ws[warp] = sum;
+    if (t < 128) hist[t] = 0;
+
+    float bm = -CUDART_INF_F;
+    int bad = 0;
+    for (int b = t; b < n_blocks; b += 1024) {
+        const float2 st = stats[b];
+        bad |= (!isfinite(st.x)) | (!isfinite(st.y));
+        bm = fmaxf(bm, st.x);
+    }
+    for (int o = 16; o; o >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, o));
+    if (lane == 0) sv[warp] = bm;
     __syncthreads();
     if (warp == 0) {
-        sum = lane < 8 ? ws[lane] : 0.0f;
-        for (int o = 4; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        if (lane == 0) dlogits[c] = __float2bfloat16_rn(sum);
+        bm = sv[lane];
+        for (int o = 16; o; o >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, o));
+        if (lane == 0) sgmax = bm;
+    }
+    const int bad_stats = __syncthreads_or(bad);
+    if (bad_stats || !isfinite(sgmax)) {
+        if (t == 0) {
+            best_out[0] = CUDART_NAN_F;
+            best_out[1] = CUDART_NAN_F;
+            best_out[2] = 0.0f;
+            best_out[3] = 0.0f;
+        }
+        return;
+    }
+
+    const float gmax = sgmax;
+    float ws = 0.0f;
+    for (int b = t; b < n_blocks; b += 1024) {
+        const float2 st = stats[b];
+        ws += st.y * expf(st.x - gmax);
+    }
+    for (int o = 16; o; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
+    if (lane == 0) ss[warp] = ws;
+    __syncthreads();
+    if (warp == 0) {
+        ws = ss[lane];
+        for (int o = 16; o; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
+        if (lane == 0) sgsum = ws;
+    }
+
+    const unsigned short* drow = reinterpret_cast<const unsigned short*>(dlogits);
+    for (int i = t; i < V; i += 1024) {
+        const float v = __uint_as_float(static_cast<uint32_t>(drow[i]) << 16);
+        const float diff = gmax - v;
+        if (diff < 15.75f) {
+            int b = (v >= gmax) ? 0 : (1 + min(125, static_cast<int>(diff * 8.0f)));
+            atomicAdd(&hist[b], 1u);
+        }
+    }
+    __syncthreads();
+    if (t == 0) {
+        unsigned int cum = 0;
+        int bc = 127;
+        for (int b = 0; b <= 126; ++b) {
+            if (cum + hist[b] >= 64u) {
+                bc = b;
+                break;
+            }
+            cum += hist[b];
+        }
+        if (bc == 127) {
+            s_strict_cut = 127;
+            s_b_cut = 127;
+            s_eq_need = 0;
+        } else {
+            s_strict_cut = bc;
+            s_b_cut = bc;
+            s_eq_need = 64u - cum;
+        }
+        n_cand = 0;
+        n_eq_taken = 0;
+    }
+    __syncthreads();
+
+    const int sc = s_strict_cut, bc = s_b_cut;
+    const unsigned int eq_lim = s_eq_need;
+    float rmax = -CUDART_INF_F;
+    int rcol = 0x7fffffff;
+    for (int i = t; i < V; i += 1024) {
+        const float v = __uint_as_float(static_cast<uint32_t>(drow[i]) << 16);
+        const float diff = gmax - v;
+        const int b = (diff < 15.75f) ? ((v >= gmax) ? 0 : (1 + min(125, static_cast<int>(diff * 8.0f)))) : 127;
+        bool take = false;
+        if (b < sc) {
+            take = true;
+        } else if (b == bc && eq_lim > 0u) {
+            if (atomicAdd(&n_eq_taken, 1u) < eq_lim) take = true;
+        }
+        if (take) {
+            const unsigned int slot = atomicAdd(&n_cand, 1u);
+            if (slot < 64u) {
+                cand_col[slot] = i;
+                cand_old[slot] = v;
+            } else {
+                fn_mtp::better(rmax, rcol, v, i);
+            }
+        } else {
+            fn_mtp::better(rmax, rcol, v, i);
+        }
+    }
+    for (int o = 16; o; o >>= 1) {
+        fn_mtp::better(rmax, rcol, __shfl_xor_sync(0xffffffffu, rmax, o), __shfl_xor_sync(0xffffffffu, rcol, o));
+    }
+    if (lane == 0) {
+        sv[warp] = rmax;
+        si[warp] = rcol;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        rmax = sv[lane];
+        rcol = si[lane];
+        for (int o = 16; o; o >>= 1) {
+            fn_mtp::better(rmax, rcol, __shfl_xor_sync(0xffffffffu, rmax, o), __shfl_xor_sync(0xffffffffu, rcol, o));
+        }
+        if (lane == 0) {
+            srmax = rmax;
+            srcol = rcol;
+        }
+    }
+    __syncthreads();
+
+    const int K = static_cast<int>(min(n_cand, 64u));
+    for (int j = warp; j < K; j += 32) {
+        const int c = cand_col[j];
+        const uint32_t gid = vocab_ids[c];
+        const uint4* wp4 = reinterpret_cast<const uint4*>(W_full_bf16 + static_cast<size_t>(gid) * 2560);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = lane; i < 320; i += 32) {
+            const uint4 wv = __ldg(wp4 + i);
+            const float* xp = sx + i * 9;
+            const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
+            sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+        }
+        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) {
+            const __nv_bfloat16 nb = __float2bfloat16_rn(sum);
+            dlogits[c] = nb;
+            cand_new[j] = __bfloat162float(nb);
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float best_v = (lane == 0) ? srmax : -CUDART_INF_F;
+        int best_c = (lane == 0) ? srcol : 0x7fffffff;
+        float sub_old = 0.0f;
+        int bad_new = 0;
+        for (int j = lane; j < K; j += 32) {
+            const float nv = cand_new[j];
+            bad_new |= !isfinite(nv);
+            fn_mtp::better(best_v, best_c, nv, cand_col[j]);
+            sub_old += expf(cand_old[j] - gmax);
+        }
+        const unsigned int any_bad = __ballot_sync(0xffffffffu, bad_new != 0);
+        for (int o = 16; o; o >>= 1) {
+            fn_mtp::better(best_v, best_c, __shfl_xor_sync(0xffffffffu, best_v, o), __shfl_xor_sync(0xffffffffu, best_c, o));
+            sub_old += __shfl_xor_sync(0xffffffffu, sub_old, o);
+        }
+        const float new_max = __shfl_sync(0xffffffffu, best_v, 0);
+        const float rest_sum = fmaxf(sgsum - sub_old, 0.0f) * expf(gmax - new_max);
+        float add_new = 0.0f;
+        for (int j = lane; j < K; j += 32) {
+            add_new += expf(cand_new[j] - new_max);
+        }
+        for (int o = 16; o; o >>= 1) add_new += __shfl_xor_sync(0xffffffffu, add_new, o);
+        if (lane == 0) {
+            if (any_bad != 0u || !isfinite(new_max)) {
+                best_out[0] = CUDART_NAN_F;
+                best_out[1] = CUDART_NAN_F;
+                best_out[2] = 0.0f;
+                best_out[3] = 0.0f;
+            } else {
+                const float tot_sum = fmaxf(rest_sum + add_new, 1.0f);
+                best_out[0] = new_max;
+                best_out[1] = new_max + logf(tot_sum);
+                best_out[2] = __int_as_float(best_c);
+                best_out[3] = 0.0f;
+            }
+        }
+    }
+}
+
+// Single-pass vectorized uint4 argmax for greedy verify: zero expf() calls, bit-exact tie-breaking & finiteness check.
+extern "C" __global__ void __launch_bounds__(1024) fn_row_argmax(
+    const __nv_bfloat16* __restrict__ L,
+    int V,
+    long long ld,
+    float* __restrict__ out) {
+    using namespace fn_mtp;
+    const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const __nv_bfloat16* row = L + static_cast<long long>(r) * ld;
+    float v = -CUDART_INF_F;
+    int at = 0x7fffffff;
+    int bad = 0;
+    if ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u && (V & 7) == 0) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(row);
+        const int v8 = V >> 3;
+        for (int c = t; c < v8; c += blockDim.x) {
+            const uint4 q = row4[c];
+            const uint32_t ws[4] = {q.x, q.y, q.z, q.w};
+            const int base = c << 3;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t u0 = ws[k] & 0xFFFFu;
+                const uint32_t u1 = ws[k] >> 16;
+                bad |= ((u0 & 0x7FFFu) > 0x7F80u) | (u0 == 0x7F80u);
+                bad |= ((u1 & 0x7FFFu) > 0x7F80u) | (u1 == 0x7F80u);
+                better(v, at, __uint_as_float(u0 << 16), base + 2 * k);
+                better(v, at, __uint_as_float(u1 << 16), base + 2 * k + 1);
+            }
+        }
+    } else {
+        for (int i = t; i < V; i += blockDim.x) {
+            const unsigned short u = reinterpret_cast<const unsigned short*>(row)[i];
+            bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
+            better(v, at, __uint_as_float(static_cast<uint32_t>(u) << 16), i);
+        }
+    }
+    const int row_bad = __syncthreads_or(bad);
+    for (int o = 16; o; o >>= 1) {
+        better(v, at, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, at, o));
+    }
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    if (lane == 0) {
+        sv[warp] = v;
+        si[warp] = at;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < (int)(blockDim.x >> 5) ? sv[lane] : -CUDART_INF_F;
+        at = lane < (int)(blockDim.x >> 5) ? si[lane] : 0x7fffffff;
+        for (int o = 16; o; o >>= 1) {
+            better(v, at, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, at, o));
+        }
+        if (lane == 0) {
+            if (row_bad) {
+                out[r * 4 + 0] = CUDART_NAN_F;
+                out[r * 4 + 1] = CUDART_NAN_F;
+                out[r * 4 + 2] = __int_as_float(-1);
+                out[r * 4 + 3] = 0.0f;
+            } else {
+                out[r * 4 + 0] = v;
+                out[r * 4 + 1] = v;
+                out[r * 4 + 2] = __int_as_float(at);
+                out[r * 4 + 3] = 0.0f;
+            }
+        }
     }
 }
 CU
@@ -179,23 +463,55 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
     int* oc = out_c + static_cast<long long>(r) * K;
     __shared__ unsigned int hist[256];
-    __shared__ unsigned int scan[1024], scan_eq[1024];
-    __shared__ unsigned int pick_hi, pick_lo, above;
-    for (int i = t; i < 256; i += nt) hist[i] = 0;
-    __syncthreads();
-    int bad = 0;
-    for (int i = t; i < V; i += nt) {
-        const unsigned short u = row[i];
-        bad |= ((u & 0x7fff) > 0x7f80) | (u == 0x7f80);
+    __shared__ unsigned short cand_k[2048];
+    __shared__ int cand_c[2048];
+    __shared__ unsigned int pick_hi, pick_lo, above, n_gt, n_eq;
+
+    auto okey = [](unsigned short u) -> unsigned int {
         const unsigned short uk = (u == 0x8000u) ? 0u : u;
-        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
-        atomicAdd(&hist[ok >> 8], 1u);
+        return (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+    };
+
+    const bool aligned8 = ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) && ((V & 7) == 0);
+    int bad = 0;
+    unsigned int tmax = 0u;
+    if (aligned8) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(row);
+        const int v8 = V >> 3;
+        for (int c = t; c < v8; c += nt) {
+            const uint4 q = row4[c];
+            const uint32_t ws[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const unsigned short u0 = static_cast<unsigned short>(ws[w] & 0xFFFFu);
+                const unsigned short u1 = static_cast<unsigned short>(ws[w] >> 16);
+                bad |= ((u0 & 0x7FFFu) > 0x7F80u) | (u0 == 0x7F80u);
+                bad |= ((u1 & 0x7FFFu) > 0x7F80u) | (u1 == 0x7F80u);
+                const unsigned int k0 = okey(u0);
+                const unsigned int k1 = okey(u1);
+                if (k0 > tmax) tmax = k0;
+                if (k1 > tmax) tmax = k1;
+            }
+        }
+    } else {
+        for (int i = t; i < V; i += nt) {
+            const unsigned short u = row[i];
+            bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
+            const unsigned int k = okey(u);
+            if (k > tmax) tmax = k;
+        }
     }
     const int row_bad = __syncthreads_or(bad);
     if (row_bad) {
         if (t == 0) oc[0] = -1;
         return;
     }
+
+    // Pigeonhole lower bound: K-th largest of the 1024 per-thread maxima <= true K-th largest.
+    for (int i = t; i < 256; i += nt) hist[i] = 0;
+    __syncthreads();
+    atomicAdd(&hist[tmax >> 8], 1u);
+    __syncthreads();
     if (t == 0) {
         unsigned int cum = 0;
         int b = 255;
@@ -207,15 +523,10 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
         above = cum;
     }
     __syncthreads();
-    const unsigned int hi = pick_hi;
+    const unsigned int lb_hi = pick_hi;
     for (int i = t; i < 256; i += nt) hist[i] = 0;
     __syncthreads();
-    for (int i = t; i < V; i += nt) {
-        unsigned short uk = row[i];
-        if (uk == 0x8000u) uk = 0u;
-        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
-        if ((ok >> 8) == hi) atomicAdd(&hist[ok & 255u], 1u);
-    }
+    if ((tmax >> 8) == lb_hi) atomicAdd(&hist[tmax & 255u], 1u);
     __syncthreads();
     if (t == 0) {
         unsigned int cum = above;
@@ -225,58 +536,193 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
             cum += hist[b];
         }
         pick_lo = b;
-        above = cum;
+        n_gt = 0;
+        n_eq = 0;
     }
     __syncthreads();
-    const unsigned int kth = (hi << 8) | pick_lo, high = above, need = K - high;
-    const int per = (V + nt - 1) / nt, lo = t * per, end = min(V, lo + per);
-    unsigned int gt = 0, eq = 0;
-    for (int i = lo; i < end; ++i) {
-        unsigned short uk = row[i];
-        if (uk == 0x8000u) uk = 0u;
-        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
-        gt += ok > kth;
-        eq += ok == kth;
-    }
-    scan[t] = gt;
-    scan_eq[t] = eq;
-    __syncthreads();
-    if (t == 0) {
-        unsigned int s = 0, q = 0;
-        for (int i = 0; i < nt; ++i) {
-            const unsigned int x = scan[i], y = scan_eq[i];
-            scan[i] = s;
-            scan_eq[i] = q;
-            s += x;
-            q += y;
+    const unsigned int lb = (lb_hi << 8) | pick_lo;
+
+    // Pass 2: only the ~128 threads with tmax >= lb re-read their L1-cached slice to harvest ok >= lb.
+    if (tmax >= lb) {
+        if (aligned8) {
+            const uint4* row4 = reinterpret_cast<const uint4*>(row);
+            const int v8 = V >> 3;
+            for (int c = t; c < v8; c += nt) {
+                const uint4 q = row4[c];
+                const uint32_t ws[4] = {q.x, q.y, q.z, q.w};
+                const int base = c << 3;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const unsigned int k0 = okey(static_cast<unsigned short>(ws[w] & 0xFFFFu));
+                    if (k0 >= lb) {
+                        const unsigned int slot = atomicAdd(&n_gt, 1u);
+                        if (slot < 2048u) {
+                            cand_k[slot] = static_cast<unsigned short>(k0);
+                            cand_c[slot] = base + 2 * w;
+                        }
+                    }
+                    const unsigned int k1 = okey(static_cast<unsigned short>(ws[w] >> 16));
+                    if (k1 >= lb) {
+                        const unsigned int slot = atomicAdd(&n_gt, 1u);
+                        if (slot < 2048u) {
+                            cand_k[slot] = static_cast<unsigned short>(k1);
+                            cand_c[slot] = base + 2 * w + 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int i = t; i < V; i += nt) {
+                const unsigned int k = okey(row[i]);
+                if (k >= lb) {
+                    const unsigned int slot = atomicAdd(&n_gt, 1u);
+                    if (slot < 2048u) {
+                        cand_k[slot] = static_cast<unsigned short>(k);
+                        cand_c[slot] = i;
+                    }
+                }
+            }
         }
     }
     __syncthreads();
-    unsigned int at = scan[t], rank = scan_eq[t];
-    for (int i = lo; i < end; ++i) {
-        unsigned short uk = row[i];
-        if (uk == 0x8000u) uk = 0u;
-        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
-        if (ok > kth) {
-            oc[at++] = i;
-        } else if (ok == kth && rank < need) {
-            oc[high + rank] = i;
-            ++rank;
+
+    if (n_gt <= 2048u) {
+        const unsigned int nc = n_gt;
+        if (nc <= static_cast<unsigned int>(K)) {
+            for (int i = t; i < static_cast<int>(nc); i += nt) oc[i] = cand_c[i];
+        } else {
+            for (int i = t; i < 256; i += nt) hist[i] = 0;
+            __syncthreads();
+            for (int i = t; i < static_cast<int>(nc); i += nt) atomicAdd(&hist[cand_k[i] >> 8], 1u);
+            __syncthreads();
+            if (t == 0) {
+                unsigned int cum = 0;
+                int b = 255;
+                for (; b > 0; --b) {
+                    if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+                    cum += hist[b];
+                }
+                pick_hi = b;
+                above = cum;
+            }
+            __syncthreads();
+            const unsigned int hi = pick_hi;
+            for (int i = t; i < 256; i += nt) hist[i] = 0;
+            __syncthreads();
+            for (int i = t; i < static_cast<int>(nc); i += nt) {
+                if ((cand_k[i] >> 8) == hi) atomicAdd(&hist[cand_k[i] & 255u], 1u);
+            }
+            __syncthreads();
+            if (t == 0) {
+                unsigned int cum = above;
+                int b = 255;
+                for (; b > 0; --b) {
+                    if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+                    cum += hist[b];
+                }
+                pick_lo = b;
+                above = cum;
+                n_eq = 0;
+            }
+            __syncthreads();
+            const unsigned int kth = (hi << 8) | pick_lo;
+            const unsigned int high = above;
+            const unsigned int need = static_cast<unsigned int>(K) - high;
+            for (int i = t; i < static_cast<int>(nc); i += nt) {
+                const unsigned int ck = cand_k[i];
+                if (ck > kth) {
+                    const unsigned int slot = atomicAdd(&n_eq, 1u);
+                    if (slot < high) oc[slot] = cand_c[i];
+                } else if (ck == kth) {
+                    const int col = cand_c[i];
+                    unsigned int rank = 0;
+                    for (unsigned int j = 0; j < nc; ++j) {
+                        if (cand_k[j] == kth && cand_c[j] < col) ++rank;
+                    }
+                    if (rank < need) oc[high + rank] = col;
+                }
+            }
+        }
+    } else {
+        for (int i = t; i < 256; i += nt) hist[i] = 0;
+        __syncthreads();
+        for (int i = t; i < V; i += nt) atomicAdd(&hist[okey(row[i]) >> 8], 1u);
+        __syncthreads();
+        if (t == 0) {
+            unsigned int cum = 0;
+            int b = 255;
+            for (; b > 0; --b) {
+                if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+                cum += hist[b];
+            }
+            pick_hi = b;
+            above = cum;
+        }
+        __syncthreads();
+        const unsigned int hi = pick_hi;
+        for (int i = t; i < 256; i += nt) hist[i] = 0;
+        __syncthreads();
+        for (int i = t; i < V; i += nt) {
+            const unsigned int ok = okey(row[i]);
+            if ((ok >> 8) == hi) atomicAdd(&hist[ok & 255u], 1u);
+        }
+        __syncthreads();
+        if (t == 0) {
+            unsigned int cum = above;
+            int b = 255;
+            for (; b > 0; --b) {
+                if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+                cum += hist[b];
+            }
+            pick_lo = b;
+            above = cum;
+        }
+        __syncthreads();
+        const unsigned int kth = (hi << 8) | pick_lo;
+        const unsigned int high = above;
+        const unsigned int need = static_cast<unsigned int>(K) - high;
+        unsigned int* scan = reinterpret_cast<unsigned int*>(cand_c);
+        unsigned int* scan_eq = scan + 1024;
+        const int per = (V + nt - 1) / nt, lo = t * per, end = min(V, lo + per);
+        unsigned int gt = 0, eq = 0;
+        for (int i = lo; i < end; ++i) {
+            const unsigned int ok = okey(row[i]);
+            gt += ok > kth;
+            eq += ok == kth;
+        }
+        scan[t] = gt;
+        scan_eq[t] = eq;
+        __syncthreads();
+        if (t == 0) {
+            unsigned int s = 0, q = 0;
+            for (int i = 0; i < nt; ++i) {
+                const unsigned int x = scan[i], y = scan_eq[i];
+                scan[i] = s;
+                scan_eq[i] = q;
+                s += x;
+                q += y;
+            }
+        }
+        __syncthreads();
+        unsigned int at = scan[t], rank = scan_eq[t];
+        for (int i = lo; i < end; ++i) {
+            const unsigned int ok = okey(row[i]);
+            if (ok > kth) oc[at++] = i;
+            else if (ok == kth && rank < need) { oc[high + rank] = i; ++rank; }
         }
     }
     __syncthreads();
-    if ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) {
+    if (aligned8) {
         const uint4 fill4 = make_uint4(0xC680C680u, 0xC680C680u, 0xC680C680u, 0xC680C680u);
         uint4* row4 = reinterpret_cast<uint4*>(row);
-        const int v8 = V / 8;
+        const int v8 = V >> 3;
         for (int i = t; i < v8; i += nt) row4[i] = fill4;
-        for (int i = v8 * 8 + t; i < V; i += nt) row[i] = 0xC680u;
     } else {
         for (int i = t; i < V; i += nt) row[i] = 0xC680u;
     }
 }
 
-extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
+extern "C" __global__ void __launch_bounds__(256) fn_head_rescore(
     const __nv_bfloat16* __restrict__ X,
     const __nv_bfloat16* __restrict__ W_bf16,
     const int* __restrict__ cols,
@@ -287,33 +733,37 @@ extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
     if (cols[static_cast<long long>(r) * K] < 0) return;
     __shared__ float sx[320 * 9];
     const __nv_bfloat16* xr = X + static_cast<size_t>(r) * 2560;
-    for (int idx = threadIdx.x; idx < 2560; idx += 128) {
+    for (int idx = threadIdx.x; idx < 2560; idx += 256) {
         sx[(idx >> 3) * 9 + (idx & 7)] = __bfloat162float(xr[idx]);
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int j = blockIdx.x * 4 + warp;
-    if (j >= K) return;
-    const int c = cols[static_cast<long long>(r) * K + j];
-    if (c < 0 || c >= V) return;
-    const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
-    float sum = 0.0f;
+    const int j0 = blockIdx.x * 16 + warp * 2;
     #pragma unroll
-    for (int i = lane; i < 320; i += 32) {
-        const uint4 wv = __ldg(wp4 + i);
-        const float* xp = sx + i * 9;
-        const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
-        sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
-        sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
-        sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
-        sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
-        sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
-        sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
-        sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
-        sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+    for (int q = 0; q < 2; ++q) {
+        const int j = j0 + q;
+        if (j >= K) return;
+        const int c = cols[static_cast<long long>(r) * K + j];
+        if (c < 0 || c >= V) continue;
+        const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = lane; i < 320; i += 32) {
+            const uint4 wv = __ldg(wp4 + i);
+            const float* xp = sx + i * 9;
+            const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
+            sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+        }
+        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) out[static_cast<size_t>(r) * V + c] = __float2bfloat16_rn(sum);
     }
-    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    if (lane == 0) out[static_cast<size_t>(r) * V + c] = __float2bfloat16_rn(sum);
 }
 CU
 
@@ -336,35 +786,31 @@ patch_k(
     "enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4 };",
     """enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, BF12 = 5 };
 
-__device__ __forceinline__ uint16_t bf12_esc_lookup(
-        const uint8_t* __restrict__ bs, size_t total_tiles, size_t tile_idx, uint32_t key12) {
+__device__ __noinline__ uint32_t dec12_pair_esc(
+        uint32_t x, uint32_t d_pair, uint32_t em,
+        const uint8_t* __restrict__ bs, size_t total_tiles, size_t tile_idx, uint32_t key_base) {
     const size_t dir_off = (total_tiles * 64 + 15) & ~static_cast<size_t>(15);
     const uint32_t* dir = reinterpret_cast<const uint32_t*>(bs + dir_off);
     const uint32_t* ents = dir + (total_tiles + 1);
-    const uint32_t lo = __ldg(dir + tile_idx);
-    const uint32_t hi = __ldg(dir + tile_idx + 1);
-    for (uint32_t idx = lo; idx < hi; ++idx) {
-        const uint32_t e = __ldg(ents + idx);
-        if ((e >> 16) == key12) return static_cast<uint16_t>(e & 0xFFFFu);
-    }
-    return 0u;
-}
-
-__device__ __forceinline__ uint32_t dec12_pair(
-        uint32_t ms, uint32_t perm, uint32_t d_pair, uint32_t em_pair,
-        bool lane_has_esc, const uint8_t* __restrict__ bs, size_t total_tiles, size_t tile_idx, uint32_t key_base) {
-    const uint32_t x = __byte_perm(ms, 0u, perm);
-    if (__builtin_expect(!lane_has_esc, 1)) {
-        return ((x & 0x00800080u) << 8) | ((em_pair - d_pair) << 7) | (x & 0x007F007Fu);
-    }
+    const uint32_t lo_i = __ldg(dir + tile_idx);
+    const uint32_t hi_i = __ldg(dir + tile_idx + 1);
     const uint32_t d0 = d_pair & 0xFu, d1 = (d_pair >> 16) & 0xFu;
-    const uint32_t em = em_pair & 0xFFu;
-    const uint16_t lo = (d0 == 0xFu)
-        ? bf12_esc_lookup(bs, total_tiles, tile_idx, key_base)
-        : static_cast<uint16_t>(((x & 0x80u) << 8) | ((em - d0) << 7) | (x & 0x7Fu));
-    const uint16_t hi = (d1 == 0xFu)
-        ? bf12_esc_lookup(bs, total_tiles, tile_idx, key_base + 1u)
-        : static_cast<uint16_t>((((x >> 16) & 0x80u) << 8) | ((em - d1) << 7) | ((x >> 16) & 0x7Fu));
+    uint16_t lo = static_cast<uint16_t>(((x & 0x80u) << 8) | ((em - d0) << 7) | (x & 0x7Fu));
+    if (d0 == 0xFu) {
+        lo = 0u;
+        for (uint32_t idx = lo_i; idx < hi_i; ++idx) {
+            const uint32_t e = __ldg(ents + idx);
+            if ((e >> 16) == key_base) { lo = static_cast<uint16_t>(e & 0xFFFFu); break; }
+        }
+    }
+    uint16_t hi = static_cast<uint16_t>((((x >> 16) & 0x80u) << 8) | ((em - d1) << 7) | ((x >> 16) & 0x7Fu));
+    if (d1 == 0xFu) {
+        hi = 0u;
+        for (uint32_t idx = lo_i; idx < hi_i; ++idx) {
+            const uint32_t e = __ldg(ents + idx);
+            if ((e >> 16) == key_base + 1u) { hi = static_cast<uint16_t>(e & 0xFFFFu); break; }
+        }
+    }
     return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
 }""",
 )
@@ -388,7 +834,7 @@ patch_k(
 extern "C" __global__ void __launch_bounds__(128) NAME( \\
         const __nv_bfloat16* x, const unsigned char* w, const uint8_t* bs, float scale, float* out, \\
         int M, int N, int K, int npad, int ldx, int group, int ldy) { \\
-    qmmf_body<BF12, BM, BN, 1, 4, 4, true, false, false>( \\
+    qmmf_body<BF12, BM, BN, 1, 4, 3, true, false, false>( \\
         x, w, bs, scale, out, nullptr, M, N, K, 1, npad, ldx, group, ldy); \\
 }
 TF_SHARED_DOWN_BF12(tf_qmmf_shared_bf12_16_half, 16, 32)
@@ -404,40 +850,42 @@ patch_k(
     """BF16_PROMPT(true, true)
 #undef BF16_PROMPT
 
-// Lossless BF12 decode, half, fused split-K (PR #3475), and 128x128 prompt instances.
+// Lossless BF12 decode/half/fused split-K (STAGES=3: 4 CTAs/SM at BM=16, 2 CTAs/SM at BM=64) and 128x128 prompt instances.
 #define BF12_INST(BM, BN, WM, WN, ST, F32, CL, FU) \\
     template __global__ void qmmf_kernel<BF12, BM, BN, WM, WN, ST, F32, CL, FU>( \\
         const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
         void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
-BF12_INST(16, 64, 1, 4, 4, false, false, false)
-BF12_INST(16, 64, 1, 4, 4, false, true, false)
-BF12_INST(16, 64, 1, 4, 4, false, false, true)
-BF12_INST(32, 64, 1, 4, 4, false, false, false)
-BF12_INST(32, 64, 1, 4, 4, false, true, false)
-BF12_INST(32, 64, 1, 4, 4, false, false, true)
-BF12_INST(64, 64, 1, 4, 4, false, false, false)
-BF12_INST(64, 64, 1, 4, 4, false, true, false)
-BF12_INST(64, 64, 1, 4, 4, false, false, true)
-BF12_INST(16, 64, 1, 4, 4, true, false, false)
-BF12_INST(16, 64, 1, 4, 4, true, true, false)
-BF12_INST(16, 64, 1, 4, 4, true, false, true)
-BF12_INST(32, 64, 1, 4, 4, true, false, false)
-BF12_INST(32, 64, 1, 4, 4, true, true, false)
-BF12_INST(32, 64, 1, 4, 4, true, false, true)
-BF12_INST(64, 64, 1, 4, 4, true, false, false)
-BF12_INST(64, 64, 1, 4, 4, true, true, false)
-BF12_INST(64, 64, 1, 4, 4, true, false, true)
-BF12_INST(16, 32, 1, 4, 4, false, false, false)
-BF12_INST(16, 32, 1, 4, 4, false, true, false)
-BF12_INST(16, 32, 1, 4, 4, true, false, false)
-BF12_INST(16, 32, 1, 4, 4, true, true, false)
+BF12_INST(16, 64, 1, 4, 3, false, false, false)
+BF12_INST(16, 64, 1, 4, 3, false, true, false)
+BF12_INST(16, 64, 1, 4, 3, false, false, true)
+BF12_INST(32, 64, 1, 4, 3, false, false, false)
+BF12_INST(32, 64, 1, 4, 3, false, true, false)
+BF12_INST(32, 64, 1, 4, 3, false, false, true)
+BF12_INST(64, 64, 1, 4, 3, false, false, false)
+BF12_INST(64, 64, 1, 4, 3, false, true, false)
+BF12_INST(64, 64, 1, 4, 3, false, false, true)
+BF12_INST(16, 64, 1, 4, 3, true, false, false)
+BF12_INST(16, 64, 1, 4, 3, true, true, false)
+BF12_INST(16, 64, 1, 4, 3, true, false, true)
+BF12_INST(32, 64, 1, 4, 3, true, false, false)
+BF12_INST(32, 64, 1, 4, 3, true, true, false)
+BF12_INST(32, 64, 1, 4, 3, true, false, true)
+BF12_INST(64, 64, 1, 4, 3, true, false, false)
+BF12_INST(64, 64, 1, 4, 3, true, true, false)
+BF12_INST(64, 64, 1, 4, 3, true, false, true)
+BF12_INST(16, 32, 1, 4, 3, false, false, false)
+BF12_INST(16, 32, 1, 4, 3, false, true, false)
+BF12_INST(16, 32, 1, 4, 3, false, false, true)
+BF12_INST(16, 32, 1, 4, 3, true, false, false)
+BF12_INST(16, 32, 1, 4, 3, true, true, false)
+BF12_INST(16, 32, 1, 4, 3, true, false, true)
 BF12_INST(128, 128, 2, 4, 3, false, false, false)
 BF12_INST(128, 128, 2, 4, 3, false, false, true)
 BF12_INST(128, 128, 2, 4, 3, true, false, false)
 BF12_INST(128, 128, 2, 4, 3, true, false, true)
 #undef BF12_INST
 
-// PR #3475 fused split-K at row tiles 16 and 32 for MXFP8 and BF16.
+// PR #3475 fused split-K at row tiles 16 and 32 for MXFP8 and BF16 (+ BN=32 fused split-K for N=2048/2560).
 #define FUSE_SPLIT(MD, BM, F32) \\
     template __global__ void qmmf_kernel<MD, BM, 64, 1, 4, 4, F32, false, true>( \\
         const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
@@ -450,7 +898,16 @@ FUSE_SPLIT(BF16, 16, false)
 FUSE_SPLIT(BF16, 32, false)
 FUSE_SPLIT(BF16, 16, true)
 FUSE_SPLIT(BF16, 32, true)
-#undef FUSE_SPLIT""",
+#undef FUSE_SPLIT
+#define FUSE_SPLIT_HALF(MD, F32) \\
+    template __global__ void qmmf_kernel<MD, 16, 32, 1, 4, 4, F32, false, true>( \\
+        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
+        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+FUSE_SPLIT_HALF(MXFP8, false)
+FUSE_SPLIT_HALF(MXFP8, true)
+FUSE_SPLIT_HALF(BF16, false)
+FUSE_SPLIT_HALF(BF16, true)
+#undef FUSE_SPLIT_HALF""",
 )
 
 patch_k(
@@ -499,8 +956,8 @@ patch_k(
                 const uint32_t d23 = reinterpret_cast<const uint32_t*>(pjj + 640)[lane];
                 const uint32_t f01 = d01 & (d01 >> 1) & (d01 >> 2) & (d01 >> 3) & 0x11111111u;
                 const uint32_t f23 = d23 & (d23 >> 1) & (d23 >> 2) & (d23 >> 3) & 0x11111111u;
-                const uint32_t em = static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) * 0x00010001u;
-                wq[j] = make_uint4(d01, d23, em, f01 | f23);
+                const uint32_t em_sh = (static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) << 7) * 0x00010001u;
+                wq[j] = make_uint4(d01, d23, em_sh, f01 | f23);
             } else if constexpr (MODE != BF16) {
                 wq[j] = reinterpret_cast<const uint4*>(pw)[jj * 32 + lane];
             }""",
@@ -522,13 +979,22 @@ patch_k(
                     const uint32_t ms = reinterpret_cast<const uint32_t*>(pjj)[kt * 32 + lane];
                     const uint32_t dlo = kt < 2 ? wq[j].x : wq[j].y;
                     const int sh = (kt & 1) * 8;
-                    const bool has_esc = wq[j].w != 0u;
-                    const int local_jj = (BN == 32) ? (((n0 & 32) ? 4 : 0) + jj_in_pw) : (jj_in_pw & 7);
-                    const size_t total_tiles = static_cast<size_t>(npad / 64) * KG;
-                    const size_t tile_idx = static_cast<size_t>(n0 / 64 + (BN == 128 ? (jj_in_pw >> 3) : 0)) * KG + (g0 + it);
-                    const uint32_t kbase = (static_cast<uint32_t>(local_jj) << 9) | (static_cast<uint32_t>(kt) << 7) | (static_cast<uint32_t>(lane) << 2);
-                    b0 = dec12_pair(ms, 0x4140u, (dlo >> sh) & 0x000F000Fu, wq[j].z, has_esc, bs, total_tiles, tile_idx, kbase);
-                    b1 = dec12_pair(ms, 0x4342u, (dlo >> (sh + 4)) & 0x000F000Fu, wq[j].z, has_esc, bs, total_tiles, tile_idx, kbase + 2u);
+                    const uint32_t d0 = (dlo >> sh) & 0x000F000Fu;
+                    const uint32_t d1 = (dlo >> (sh + 4)) & 0x000F000Fu;
+                    const uint32_t x0 = __byte_perm(ms, 0u, 0x4140u);
+                    const uint32_t x1 = __byte_perm(ms, 0u, 0x4342u);
+                    if (__builtin_expect(wq[j].w == 0u, 1)) {
+                        b0 = ((x0 & 0x00800080u) << 8) | (wq[j].z - (d0 << 7)) | (x0 & 0x007F007Fu);
+                        b1 = ((x1 & 0x00800080u) << 8) | (wq[j].z - (d1 << 7)) | (x1 & 0x007F007Fu);
+                    } else {
+                        const int local_jj = (BN == 32) ? (((n0 & 32) ? 4 : 0) + jj_in_pw) : (jj_in_pw & 7);
+                        const size_t total_tiles = static_cast<size_t>(npad / 64) * KG;
+                        const size_t tile_idx = static_cast<size_t>(n0 / 64 + (BN == 128 ? (jj_in_pw >> 3) : 0)) * KG + (g0 + it);
+                        const uint32_t kbase = (static_cast<uint32_t>(local_jj) << 9) | (static_cast<uint32_t>(kt) << 7) | (static_cast<uint32_t>(lane) << 2);
+                        const uint32_t em = (wq[j].z >> 7) & 0xFFu;
+                        b0 = dec12_pair_esc(x0, d0, em, bs, total_tiles, tile_idx, kbase);
+                        b1 = dec12_pair_esc(x1, d1, em, bs, total_tiles, tile_idx, kbase + 2u);
+                    }
                 } else {
                     const uint32_t word = comp(wq[j], kt);
                     b0 = fp8pair(word & 0xFFFFu);
@@ -537,6 +1003,308 @@ patch_k(
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
                     if constexpr (MODE == FP8 || MODE == BF16 || MODE == BF12) mma(acc[i][j], a[i], b0, b1);""",
+)
+
+# Fast bit-exact bf16x2 E4M3 scale decode in qmmf_body.cuh (FP4) and nvfp4_experts.cu (+ mma0)
+patch_k(
+    "qmmf_body.cuh",
+    """                        } else if constexpr (MODE == FP4) {
+                            s0 = e4m3f(static_cast<uint8_t>(sq[j][0] >> (8 * blk)));
+                            s1 = e4m3f(static_cast<uint8_t>(sq[j][1] >> (8 * blk)));""",
+    """                        } else if constexpr (MODE == FP4) {
+                            const uint32_t b2 = ((sq[j][0] >> (8 * blk)) & 0xFFu) | (((sq[j][1] >> (8 * blk)) & 0xFFu) << 8);
+                            const uint32_t sp = tf_common::fp8pair_unit(b2, 0x7B807B80u);
+                            s0 = __uint_as_float((sp & 0xFFFFu) << 16);
+                            s1 = __uint_as_float(sp & 0xFFFF0000u);""",
+)
+
+patch_k(
+    "nvfp4_experts.cu",
+    """template <int M>
+struct Stage {
+  uint4 w[M];
+  uint4 s[M];
+  uint2 xa[2], xb[2];
+};
+
+template <int M>
+__device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g, int lane, int t,
+                                           const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  const uint4* b = blk + (size_t)g * (M * BLOCK4);
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    st.w[m] = ld_nc(b + m * BLOCK4 + lane);
+    st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
+  }
+  const uint2 zero = make_uint2(0u, 0u);
+  const int k0 = g * 32 + 4 * t;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    st.xa[h] = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
+    st.xb[h] = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
+  }
+}
+
+template <int M>
+__device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const Stage<M>& st, bool hi) {
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y, a1 = st.xb[h].x, a3 = st.xb[h].y;
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) {
+        const uint32_t word = comp(st.w[m], j);
+        float p[4] = {0.f, 0.f, 0.f, 0.f};
+        mma(p, a0, a1, a2, a3, fp4pair(word, 8 * h), fp4pair(word, 8 * h + 4));
+        const uint32_t sw = comp(st.s[m], 2 * h + (j >> 1));
+        const int sh = (j & 1) * 16;
+        const float s0 = e4m3f((sw >> sh) & 0xFFu), s1 = e4m3f((sw >> (sh + 8)) & 0xFFu);
+        float(&a)[4] = acc[m][0][j];
+        a[0] = fmaf(p[0], s0, a[0]);
+        a[1] = fmaf(p[1], s1, a[1]);
+        if (hi) {
+          a[2] = fmaf(p[2], s0, a[2]);
+          a[3] = fmaf(p[3], s1, a[3]);
+        }
+      }
+    }
+}
+
+template <int M>
+__device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, int KG, int lane, int t,
+                                       const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  constexpr int D = 2;
+  Stage<M> st[D];
+#pragma unroll
+  for (int d = 0; d < D; ++d)
+    if (d < KG) load_stage<M>(st[d], blk, d, lane, t, x0, x1, v0, v1);
+  for (int g0 = 0; g0 < KG; g0 += D) {
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+      const int g = g0 + d;
+      if (g < KG) {
+        compute_stage<M>(acc, st[d], v1);
+        if (g + D < KG) load_stage<M>(st[d], blk, g + D, lane, t, x0, x1, v0, v1);
+      }
+    }
+  }
+}""",
+    """template <int M>
+struct Stage {
+  uint4 w[M];
+  uint4 s[M];
+};
+
+template <int M>
+__device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g, int lane, int t) {
+  const uint4* b = blk + (size_t)g * (M * BLOCK4);
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    st.w[m] = ld_nc(b + m * BLOCK4 + lane);
+    st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
+  }
+}
+
+template <int M>
+__device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const Stage<M>& st, int g, int t,
+                                              const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  const uint2 zero = make_uint2(0u, 0u);
+  const int k0 = g * 32 + 4 * t;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const uint2 xa = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
+    const uint2 xb = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
+    const uint32_t a0 = xa.x, a2 = xa.y, a1 = xb.x, a3 = xb.y;
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) {
+        const uint32_t word = comp(st.w[m], j);
+        float p[4];
+        qmm_frag::mma0(p, a0, a1, a2, a3, fp4pair(word, 8 * h), fp4pair(word, 8 * h + 4));
+        const uint32_t sw = comp(st.s[m], 2 * h + (j >> 1));
+        const uint32_t sp = tf_common::fp8pair_unit((sw >> ((j & 1) * 16)) & 0xFFFFu, 0x7B807B80u);
+        const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+        float(&a)[4] = acc[m][0][j];
+        a[0] = fmaf(p[0], s0, a[0]);
+        a[1] = fmaf(p[1], s1, a[1]);
+        if (v1) {
+          a[2] = fmaf(p[2], s0, a[2]);
+          a[3] = fmaf(p[3], s1, a[3]);
+        }
+      }
+  }
+}
+
+template <int M>
+__device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, int KG, int lane, int t,
+                                       const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  constexpr int D = 2;
+  Stage<M> st[D];
+#pragma unroll
+  for (int d = 0; d < D; ++d)
+    if (d < KG) load_stage<M>(st[d], blk, d, lane, t);
+  for (int g0 = 0; g0 < KG; g0 += D) {
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+      const int g = g0 + d;
+      if (g < KG) {
+        compute_stage<M>(acc, st[d], g, t, x0, x1, v0, v1);
+        if (g + D < KG) load_stage<M>(st[d], blk, g + D, lane, t);
+      }
+    }
+  }
+}""",
+)
+
+patch_k(
+    "nvfp4_experts.cu",
+    """template <int M>
+struct Half {
+  uint2 w[M];
+  uint4 s[M];
+  uint2 xa[2], xb[2];
+};
+
+__device__ __forceinline__ uint2 ld_nc2(const void* p) { return tf_common::ld_nc2(p); }
+
+template <int M>
+__device__ __forceinline__ void load_half(Half<M>& st, const uint4* blk, int g, int lane, int t, int jh,
+                                          const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  const uint4* b = blk + (size_t)g * (M * BLOCK4);
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    st.w[m] = ld_nc2(reinterpret_cast<const uint2*>(b + m * BLOCK4 + lane) + jh);
+    st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
+  }
+  const uint2 zero = make_uint2(0u, 0u);
+  const int k0 = g * 32 + 4 * t;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    st.xa[h] = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
+    st.xb[h] = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
+  }
+}
+
+// compute_stage's sums for tiles j = 2jh + jj: scale word 2h + jh, byte pair jj * 16.
+template <int M>
+__device__ __forceinline__ void compute_half(float (&acc)[M][2][4], const Half<M>& st, bool hi, int jh) {
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y, a1 = st.xb[h].x, a3 = st.xb[h].y;
+      const uint32_t sw = h == 0 ? (jh ? st.s[m].y : st.s[m].x) : (jh ? st.s[m].w : st.s[m].z);
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj) {
+        const uint32_t word = jj ? st.w[m].y : st.w[m].x;
+        float p[4] = {0.f, 0.f, 0.f, 0.f};
+        mma(p, a0, a1, a2, a3, fp4pair(word, 8 * h), fp4pair(word, 8 * h + 4));
+        const int sh = jj * 16;
+        const float s0 = e4m3f((sw >> sh) & 0xFFu), s1 = e4m3f((sw >> (sh + 8)) & 0xFFu);
+        float(&a)[4] = acc[m][jj];
+        a[0] = fmaf(p[0], s0, a[0]);
+        a[1] = fmaf(p[1], s1, a[1]);
+        if (hi) {
+          a[2] = fmaf(p[2], s0, a[2]);
+          a[3] = fmaf(p[3], s1, a[3]);
+        }
+      }
+    }
+}""",
+    """template <int M>
+struct Half {
+  uint2 w[M];
+  uint4 s[M];
+};
+
+__device__ __forceinline__ uint2 ld_nc2(const void* p) { return tf_common::ld_nc2(p); }
+
+template <int M>
+__device__ __forceinline__ void load_half(Half<M>& st, const uint4* blk, int g, int lane, int t, int jh) {
+  const uint4* b = blk + (size_t)g * (M * BLOCK4);
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    st.w[m] = ld_nc2(reinterpret_cast<const uint2*>(b + m * BLOCK4 + lane) + jh);
+    st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
+  }
+}
+
+// compute_stage's sums for tiles j = 2jh + jj: scale word 2h + jh, byte pair jj * 16.
+template <int M>
+__device__ __forceinline__ void compute_half(float (&acc)[M][2][4], const Half<M>& st, int g, int t, int jh,
+                                             const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
+  const uint2 zero = make_uint2(0u, 0u);
+  const int k0 = g * 32 + 4 * t;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const uint2 xa = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
+    const uint2 xb = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
+    const uint32_t a0 = xa.x, a2 = xa.y, a1 = xb.x, a3 = xb.y;
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const uint32_t sw = h == 0 ? (jh ? st.s[m].y : st.s[m].x) : (jh ? st.s[m].w : st.s[m].z);
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj) {
+        const uint32_t word = jj ? st.w[m].y : st.w[m].x;
+        float p[4];
+        qmm_frag::mma0(p, a0, a1, a2, a3, fp4pair(word, 8 * h), fp4pair(word, 8 * h + 4));
+        const uint32_t sp = tf_common::fp8pair_unit((sw >> (jj * 16)) & 0xFFFFu, 0x7B807B80u);
+        const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+        float(&a)[4] = acc[m][jj];
+        a[0] = fmaf(p[0], s0, a[0]);
+        a[1] = fmaf(p[1], s1, a[1]);
+        if (v1) {
+          a[2] = fmaf(p[2], s0, a[2]);
+          a[3] = fmaf(p[3], s1, a[3]);
+        }
+      }
+    }
+  }
+}""",
+)
+
+patch_k(
+    "nvfp4_experts.cu",
+    """      Half<M> st[D];
+#pragma unroll
+      for (int d = 0; d < D; ++d)
+        if (d < KG) load_half<M>(st[d], blk, d, lane, t, jh, x0, x1, v0, v1);
+      for (int g0 = 0; g0 < KG; g0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+          const int g = g0 + d;
+          if (g < KG) {
+            compute_half<M>(acc, st[d], v1, jh);
+            if (g + D < KG) load_half<M>(st[d], blk, g + D, lane, t, jh, x0, x1, v0, v1);
+          }
+        }
+      }""",
+    """      Half<M> st[D];
+#pragma unroll
+      for (int d = 0; d < D; ++d)
+        if (d < KG) load_half<M>(st[d], blk, d, lane, t, jh);
+      for (int g0 = 0; g0 < KG; g0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+          const int g = g0 + d;
+          if (g < KG) {
+            compute_half<M>(acc, st[d], g, t, jh, x0, x1, v0, v1);
+            if (g + D < KG) load_half<M>(st[d], blk, g + D, lane, t, jh);
+          }
+        }
+      }""",
+)
+
+patch_k(
+    "nvfp4_experts.cu",
+    """              const uint32_t sw = comp(sd[m], 2 * h + (j >> 1));
+              const int sh = (j & 1) * 16;
+              const float s0 = e4m3f((sw >> sh) & 0xFFu), s1 = e4m3f((sw >> (sh + 8)) & 0xFFu);""",
+    """              const uint32_t sw = comp(sd[m], 2 * h + (j >> 1));
+              const uint32_t sp = tf_common::fp8pair_unit((sw >> ((j & 1) * 16)) & 0xFFFFu, 0x7B807B80u);
+              const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);""",
 )
 PYCU
 
@@ -1090,23 +1858,23 @@ pub fn pack(gpa: std.mem.Allocator, driver: *const cuda.Driver, t: core.safetens
 }
 ZIG
 
-  # 3. 2.5-bit Lloyd-Max group-32 MTP proposal head sharing Engine's resident BF16 lm_head buffer
+  # 3. Fused 2.25-bit E4M3 group-32 MTP proposal head sharing Engine's resident BF16 lm_head buffer
   cat > "$fn_dir/cuda_mtp_w2.zig" <<'ZIG'
-//! 2.5-bit symmetric group-32 proposal head + GPU top-64 exact BF16 rescore sharing Engine's resident BF16 lm_head.
+//! Fused 2.25-bit symmetric group-32 E4M3 proposal head + single-block top-64 exact BF16 rescore directly to d.best.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
 const wt = @import("cuda_prompt_wt.zig");
-const mtp = @import("cuda_mtp.zig");
-const affine = @import("cuda_draft_affine.zig");
 
 const kg = wt.dims / 32;
+const kg2 = kg / 2;
 
 const PackCtx = struct {
     full_rows: []const u8,
     ids: []const u32,
-    codes: []u64,
+    codes: []u32,
     scales: []u16,
+    globals: []f32,
     v: usize,
     per: usize,
 
@@ -1118,6 +1886,9 @@ const PackCtx = struct {
             const lane = r % 32;
             const gid: usize = ctx.ids[r];
             const rb = ctx.full_rows[gid * wt.dims * 2 ..][0 .. wt.dims * 2];
+            var g_scales: [kg]f32 = undefined;
+            var g_words: [kg]u64 = undefined;
+            var rmax: f32 = 0.0;
             for (0..kg) |g| {
                 var w: [32]f32 = undefined;
                 var sq: f32 = 0;
@@ -1129,8 +1900,8 @@ const PackCtx = struct {
                 }
                 var s: f32 = @sqrt(sq / 32.0) * 0.9957;
                 if (s < 1e-12) {
-                    ctx.codes[(blk * kg + g) * 32 + lane] = 0;
-                    ctx.scales[(blk * kg + g) * 32 + lane] = 0;
+                    g_scales[g] = 0.0;
+                    g_words[g] = 0;
                     continue;
                 }
                 var q: [32]u2 = undefined;
@@ -1150,8 +1921,24 @@ const PackCtx = struct {
                 }
                 var word: u64 = 0;
                 for (0..32) |j| word |= @as(u64, q[j]) << @intCast(2 * j);
-                ctx.codes[(blk * kg + g) * 32 + lane] = word;
-                ctx.scales[(blk * kg + g) * 32 + lane] = affine.bf16(s);
+                g_scales[g] = s;
+                g_words[g] = word;
+                if (s > rmax) rmax = s;
+            }
+            const gsc: f32 = if (rmax > 0.0) rmax / 448.0 else 1.0;
+            const inv_gsc: f32 = 1.0 / gsc;
+            ctx.globals[blk * 32 + lane] = gsc;
+            for (0..kg2) |g2| {
+                const idx = (blk * kg2 + g2) * 32 + lane;
+                const w0 = g_words[g2 * 2];
+                const w1 = g_words[g2 * 2 + 1];
+                ctx.codes[idx * 4 + 0] = @truncate(w0);
+                ctx.codes[idx * 4 + 1] = @truncate(w0 >> 32);
+                ctx.codes[idx * 4 + 2] = @truncate(w1);
+                ctx.codes[idx * 4 + 3] = @truncate(w1 >> 32);
+                const s0 = core.exlr8.codec.e4m3FromF32(std.math.clamp(g_scales[g2 * 2] * inv_gsc, 0.0, 448.0));
+                const s1 = core.exlr8.codec.e4m3FromF32(std.math.clamp(g_scales[g2 * 2 + 1] * inv_gsc, 0.0, 448.0));
+                ctx.scales[idx] = @as(u16, s0) | (@as(u16, s1) << 8);
             }
         }
     }
@@ -1160,6 +1947,7 @@ const PackCtx = struct {
 pub const W2 = struct {
     codes: ?cuda.DeviceBuffer = null,
     scales: ?cuda.DeviceBuffer = null,
+    globals: ?cuda.DeviceBuffer = null,
     vocab_ids: ?cuda.DeviceBuffer = null,
     bf16_ptr: u64 = 0,
     scratch: ?cuda.DeviceBuffer = null,
@@ -1173,6 +1961,7 @@ pub const W2 = struct {
     pub fn deinit(self: *W2) void {
         if (self.scratch) |*b| b.free();
         if (self.vocab_ids) |*b| b.free();
+        if (self.globals) |*b| b.free();
         if (self.scales) |*b| b.free();
         if (self.codes) |*b| b.free();
         self.* = .{};
@@ -1186,16 +1975,27 @@ pub const W2 = struct {
         const ids = artifact.ids();
         const v = ids.len;
         const nb = (v + 31) / 32;
-        const total = nb * kg * 32;
-        const codes_host = try gpa.alloc(u64, total);
+        const total = nb * kg2 * 32;
+        const codes_host = try gpa.alloc(u32, total * 4);
         defer gpa.free(codes_host);
         @memset(codes_host, 0);
         const scales_host = try gpa.alloc(u16, total);
         defer gpa.free(scales_host);
         @memset(scales_host, 0);
+        const globals_host = try gpa.alloc(f32, nb * 32);
+        defer gpa.free(globals_host);
+        @memset(globals_host, 0.0);
 
         const n_threads: usize = 8;
-        const ctx: PackCtx = .{ .full_rows = tensor.bytes, .ids = ids, .codes = codes_host, .scales = scales_host, .v = v, .per = (v + n_threads - 1) / n_threads };
+        const ctx: PackCtx = .{
+            .full_rows = tensor.bytes,
+            .ids = ids,
+            .codes = codes_host,
+            .scales = scales_host,
+            .globals = globals_host,
+            .v = v,
+            .per = (v + n_threads - 1) / n_threads,
+        };
         var ths: [n_threads]?std.Thread = @splat(null);
         for (0..n_threads) |ti| ths[ti] = try std.Thread.spawn(.{}, PackCtx.worker, .{ &ctx, ti });
         for (&ths) |*th| if (th.*) |t| t.join();
@@ -1207,38 +2007,47 @@ pub const W2 = struct {
         errdefer codes_buf.free();
         var scales_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(scales_host));
         errdefer scales_buf.free();
-        var scratch_buf = try cuda.DeviceBuffer.alloc(driver, 4096);
+        var globals_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(globals_host));
+        errdefer globals_buf.free();
+        const n_blocks = (nb + 3) / 4;
+        var scratch_buf = try cuda.DeviceBuffer.alloc(driver, @max(n_blocks * 8, 8192));
         errdefer scratch_buf.free();
 
         return .{
             .codes = codes_buf,
             .scales = scales_buf,
+            .globals = globals_buf,
             .vocab_ids = ids_buf,
             .scratch = scratch_buf,
-            .gemv_fn = try module.function("fn_w2_gemv"),
-            .rescore_fn = try module.function("fn_w2_rescore"),
+            .gemv_fn = try module.function("fn_w2_gemv_fused"),
+            .rescore_fn = try module.function("fn_w2_rescore_best"),
         };
     }
 
-    pub fn project(self: *const W2, h: *const mtp.Head, stream: cuda.Stream, input: u64, out: u64, v: usize) !void {
+    pub fn projectFused(self: *const W2, stream: cuda.Stream, input: u64, dlogits: u64, best_out: u64, v: usize) !void {
         const nb = (v + 31) / 32;
+        const n_blocks = (nb + 3) / 4;
+        const sc = self.scratch.?.ptr;
         var a1: cuda.Args = .{};
         a1.add(input);
         a1.add(self.codes.?.ptr);
         a1.add(self.scales.?.ptr);
-        a1.add(out);
+        a1.add(self.globals.?.ptr);
+        a1.add(dlogits);
+        a1.add(sc);
         a1.add(@as(c_int, @intCast(v)));
-        try cuda.launch.launch(self.gemv_fn.?, .{ .grid = .{ .x = @intCast((nb + 3) / 4) }, .block = .{ .x = 128 } }, stream, &a1);
-        const sc = self.scratch.?.ptr;
-        try h.topk(stream, out, v, v, 1, 64, sc, sc + 256);
+        try cuda.launch.launch(self.gemv_fn.?, .{ .grid = .{ .x = @intCast(n_blocks) }, .block = .{ .x = 128 } }, stream, &a1);
+
         var a2: cuda.Args = .{};
         a2.add(input);
         a2.add(self.bf16_ptr);
         a2.add(self.vocab_ids.?.ptr);
-        a2.add(sc + 256);
-        a2.add(out);
+        a2.add(dlogits);
+        a2.add(sc);
+        a2.add(@as(c_int, @intCast(n_blocks)));
         a2.add(@as(c_int, @intCast(v)));
-        try cuda.launch.launch(self.rescore_fn.?, .{ .grid = .{ .x = 64 }, .block = .{ .x = 256 } }, stream, &a2);
+        a2.add(best_out);
+        try cuda.launch.launch(self.rescore_fn.?, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a2);
     }
 };
 ZIG
@@ -1540,28 +2349,78 @@ patch_exact(
     cdir, "qmmf.zig",
     """        .bf16 => bn * group * 2,
     };
-    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else 0;""",
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else 0;
+    const stage = (bm * group * 2 + w + s + 127) / 128 * 128;
+    const partials = (bm / 16) * 2 * 4 * threads * 4;
+    return @max(4 * stage, partials);""",
     """        .bf16 => bn * group * 2,
         .bf12 => (bn * group * 3) / 2,
     };
-    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else if (mode == .bf12) bn else 0;""",
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else if (mode == .bf12) bn else 0;
+    const stage = (bm * group * 2 + w + s + 127) / 128 * 128;
+    const partials = (bm / 16) * 2 * 4 * threads * 4;
+    const stages: u32 = if (mode == .bf12) 3 else 4;
+    return @max(stages * stage, partials);""",
 )
 patch_exact(
     cdir, "qmmf.zig",
-    """pub fn halfShared(mode: Mode) u32 {
+    """    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi4ELb{d}ELb{d}ELb{d}" ++
+        "EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+    const flags = .{ @intFromBool(wide), @intFromBool(cluster), @intFromBool(fused) };
+    return std.fmt.comptimePrint(name, .{ @backingInt(mode), bm, flags[0], flags[1], flags[2] });""",
+    """    const st: u32 = if (mode == .bf12) 3 else 4;
+    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi{d}ELb{d}ELb{d}ELb{d}" ++
+        "EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+    const flags = .{ @intFromBool(wide), @intFromBool(cluster), @intFromBool(fused) };
+    return std.fmt.comptimePrint(name, .{ @backingInt(mode), bm, st, flags[0], flags[1], flags[2] });""",
+)
+patch_exact(
+    cdir, "qmmf.zig",
+    """fn halfSymbol(comptime mode: Mode, comptime cluster: bool, comptime wide: bool) [:0]const u8 {
+    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi16ELi32ELi1ELi4ELi4ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+    return std.fmt.comptimePrint(name, .{ @backingInt(mode), @intFromBool(wide), @intFromBool(cluster) });
+}
+
+/// Dynamic shared bytes of the half tile: a stage holds half the weights (and scales) of the 64-column tile's.
+pub fn halfShared(mode: Mode) u32 {
     const w: u32 = if (mode == .bf16) 32 * group * 2 else 32 * group;
     const s: u32 = if (mode == .mxfp8) 32 * 2 else 0;
     const stage = (16 * group * 2 + w + s + 127) / 128 * 128;
     const partials = 1 * 1 * 4 * threads * 4;
     return @max(4 * stage, partials);
 }""",
-    """pub fn halfShared(mode: Mode) u32 {
+    """fn halfSymbol(comptime mode: Mode, comptime cluster: bool, comptime wide: bool) [:0]const u8 {
+    const st: u32 = if (mode == .bf12) 3 else 4;
+    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi16ELi32ELi1ELi4ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+    return std.fmt.comptimePrint(name, .{ @backingInt(mode), st, @intFromBool(wide), @intFromBool(cluster) });
+}
+
+fn halfFusedSymbol(comptime mode: Mode, comptime wide: bool) [:0]const u8 {
+    const st: u32 = if (mode == .bf12) 3 else 4;
+    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi16ELi32ELi1ELi4ELi{d}ELb{d}ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+    return std.fmt.comptimePrint(name, .{ @backingInt(mode), st, @intFromBool(wide) });
+}
+
+/// Dynamic shared bytes of the half tile: a stage holds half the weights (and scales) of the 64-column tile's.
+pub fn halfShared(mode: Mode) u32 {
     const w: u32 = if (mode == .bf16) 32 * group * 2 else if (mode == .bf12) (32 * group * 3) / 2 else 32 * group;
     const s: u32 = if (mode == .mxfp8) 32 * 2 else if (mode == .bf12) 32 else 0;
     const stage = (16 * group * 2 + w + s + 127) / 128 * 128;
     const partials = 1 * 1 * 4 * threads * 4;
-    return @max(4 * stage, partials);
+    const stages: u32 = if (mode == .bf12) 3 else 4;
+    return @max(stages * stage, partials);
 }""",
+)
+# 5a2. zig/src/cuda/experts.zig + experts_waves.zig: TF_NVFP4_DYNAMIC_GRID=1 uncapped 1-warp CTA hardware scheduling
+patch_exact(
+    cdir, "experts.zig",
+    "        const grid = @min((items * nb + e.warps - 1) / e.warps, e.resident[ei]);",
+    "        const dyn = e.warps == 1 and (if (std.c.getenv(\"TF_NVFP4_DYNAMIC_GRID\")) |v| std.mem.eql(u8, std.mem.span(v), \"1\") else false);\n        const grid = if (dyn) items * nb else @min((items * nb + e.warps - 1) / e.warps, e.resident[ei]);",
+)
+patch_exact(
+    cdir, "experts_waves.zig",
+    "    const fi = pick(gate, items, nb, e.resident[first + 2] * e.warps, classic) orelse return e.run(s, epi, in, l, p, out, items, skip);",
+    "    const dyn = e.warps == 1 and (if (std.c.getenv(\"TF_NVFP4_DYNAMIC_GRID\")) |v| std.mem.eql(u8, std.mem.span(v), \"1\") else false);\n    const fi = (if (dyn) (if (gate and 2 * items * nb <= e.resident[first + 2] * e.warps) @as(?usize, first + 2) else null) else pick(gate, items, nb, e.resident[first + 2] * e.warps, classic)) orelse return e.run(s, epi, in, l, p, out, items, skip);",
 )
 patch_exact(
     cdir, "qmmf.zig",
@@ -1628,6 +2487,7 @@ patch_exact(
     shared_down: [4]Function = undefined,
     shared_down_bf12: [4]Function = undefined,
     fuse_s: [3][2][2]Function = undefined, // by halfModeIndex, Out, bm=16/32 (PR #3475)
+    fuse_half: [3][2]Function = undefined, // by halfModeIndex, Out, bm=16 bn=32 fused split-K
     fuse_split_n: usize = 0,
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
     prompt_bf12: ?[2][2]Function = null, // Out, then plain / fused for BF12
@@ -1663,6 +2523,11 @@ patch_exact(
             const f = try mod.function(symbol(mode, bm, false, true, wide));
             try f.allowDynamicShared(sharedBytes(mode, bm));
             l.fuse_s[mi][oi][bi] = f;
+        };
+        inline for (.{ Mode.mxfp8, Mode.bf16, Mode.bf12 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| {
+            const f = try mod.function(halfFusedSymbol(mode, wide));
+            try f.allowDynamicShared(halfShared(mode));
+            l.fuse_half[mi][oi] = f;
         };
         l.half_below = try halfBelow();
         if (std.c.getenv("TF_FLASHNEXT_FUSED_SPLIT")) |v| {
@@ -1735,6 +2600,7 @@ patch_exact(
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
+        const half_fs = fs and p.bm == 16 and rows_t * ((w.n + bn - 1) / bn) < 48;
         const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
         const f = if (k32)
             l.prompt_k32.?[@backingInt(out)]
@@ -1742,13 +2608,15 @@ patch_exact(
             (if (w.mode == .bf12) l.prompt_bf12.?[@backingInt(out)][@intFromBool(p.fused)] else l.prompt.?[@backingInt(out)][@intFromBool(p.fused)])
         else if (half)
             l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)]
+        else if (half_fs)
+            l.fuse_half[hm.?][@backingInt(out)]
         else if (fs)
             (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)])
         else if (p.fused)
             set[6]
         else
             set[ti * 2 + @intFromBool(p.cluster)];
-        const cols: usize = if (prompt) 128 else if (half) 32 else bn;
+        const cols: usize = if (prompt) 128 else if (half or half_fs) 32 else bn;
         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
         var args: launch_.Args = .{};
         args.add(x);
@@ -1767,7 +2635,7 @@ patch_exact(
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
+            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half or half_fs) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
         }, s, &args);""",
 )
@@ -2154,7 +3022,7 @@ patch_exact(
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
-            var stop: mtp.Stop = .{ .c = confidence };
+            var stop: mtp.Stop = mtp.Stop.init(confidence);
             var j: usize = 0;
             while (j < @min(count, max_chain)) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
@@ -2183,11 +3051,131 @@ patch_exact(
     "            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);\n            for (step_ds[0..n_step]) |d| d.drafted += 1;\n            if (@hasField(@TypeOf(o), \"e\")) o.e.ngram.warmBatch(step_ds[0..n_step], step_nexts[0..n_step]);",
 )
 
-# 5f. cuda_mtp.zig + cuda_lanes_load.zig: hook W2 proposal head & share Engine's BF16 lm_head buffer
+# 5f. cuda_mtp.zig + cuda_lanes_draft.zig + cuda_mtp_draw.zig + cuda_draw_batch.zig + cuda_mtp_pieces.zig + cuda_draft_draw.zig + cuda_lanes_load.zig:
+#     raise max_chain 15 -> 31, hysteresis two-regime MoE Stop, zero-expf fn_row_argmax, hook fused 2.25-bit W2 directly to d.best
+patch_exact(
+    root, "cuda_mtp.zig",
+    "pub const max_chain: usize = 15;",
+    "pub const max_chain: usize = 31;",
+)
+patch_exact(
+    root, "cuda_lanes_draft.zig",
+    "const max_hist = 17;",
+    "const max_hist = 33;",
+)
+patch_exact(
+    root, "cuda_mtp.zig",
+    """pub const Stop = struct {
+    c: f64,
+    product: f64 = 1.0,
+
+    /// Whether draft j (0-based) with probability `p` is proposed, and whether the chain may go on.
+    pub fn take(s: *Stop, j: usize, p: f64) struct { propose: bool, more: bool } {
+        if (s.c > 0) {
+            const low = p < s.c;
+            if (low and j > 0) return .{ .propose = false, .more = false };
+            return .{ .propose = true, .more = !low };
+        }
+        if (s.c < 0) {
+            s.product *= p;
+            // below the line it ends the chain: no later product can reach it again
+            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
+        }
+        return .{ .propose = true, .more = true };
+    }
+};""",
+    """fn envF64(name: [*:0]const u8, default: f64) f64 {
+    const raw = std.c.getenv(name) orelse return default;
+    return std.fmt.parseFloat(f64, std.mem.span(raw)) catch default;
+}
+
+pub const Stop = struct {
+    c: f64,
+    product: f64 = 1.0,
+    ext_enter: f64 = 0.0,
+    ext_stay: f64 = 0.0,
+    ext_tok: f64 = 0.0,
+
+    pub fn init(c: f64) Stop {
+        return .{
+            .c = c,
+            .ext_enter = envF64("TF_FLASHNEXT_EXT_ENTER", 0.0),
+            .ext_stay = envF64("TF_FLASHNEXT_EXT_STAY", 0.0),
+            .ext_tok = envF64("TF_FLASHNEXT_EXT_TOK", 0.0),
+        };
+    }
+
+    /// Whether draft j (0-based) with probability `p` is proposed, and whether the chain may go on.
+    pub fn take(s: *Stop, j: usize, p: f64) struct { propose: bool, more: bool } {
+        if (s.c > 0) {
+            const low = p < s.c;
+            if (low and j > 0) return .{ .propose = false, .more = false };
+            return .{ .propose = true, .more = !low };
+        }
+        if (s.c < 0) {
+            s.product *= p;
+            if (j >= 15 and (s.ext_stay > 0 or s.ext_tok > 0)) {
+                if (s.product < s.ext_stay or p < s.ext_tok) return .{ .propose = false, .more = false };
+                return .{ .propose = true, .more = true };
+            }
+            // below the line it ends the chain: no later product can reach it again
+            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
+            if (j == 14 and s.ext_enter > 0 and s.product < s.ext_enter) return .{ .propose = true, .more = false };
+        }
+        return .{ .propose = true, .more = true };
+    }
+};""",
+)
 patch_exact(
     root, "cuda_mtp.zig",
     "    topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)",
-    "    topk_fn: cuda.Function,\n    w2: @import(\"cuda_mtp_w2.zig\").W2 = .{},",
+    "    topk_fn: cuda.Function,\n    argmax_fn: cuda.Function,\n    w2: @import(\"cuda_mtp_w2.zig\").W2 = .{},",
+)
+patch_exact(
+    root, "cuda_mtp.zig",
+    "        h.best_fn = try h.module.function(\"fn_row_best\");\n        h.topk_fn = try h.module.function(\"fn_row_topk\");",
+    "        h.best_fn = try h.module.function(\"fn_row_best\");\n        h.topk_fn = try h.module.function(\"fn_row_topk\");\n        h.argmax_fn = try h.module.function(\"fn_row_argmax\");",
+)
+patch_exact(
+    root, "cuda_mtp.zig",
+    """    /// fn_row_best over `rows` rows of `v` scores `ld` apart: [rows, 4] fp32 at `out` (best, log-sum-exp, id bits).
+    pub fn best(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(scores);
+        a.add(cint(v));
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(out);
+        try cuda.launch.launch(h.best_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
+    }""",
+    """    /// fn_row_best over `rows` rows of `v` scores `ld` apart: [rows, 4] fp32 at `out` (best, log-sum-exp, id bits).
+    pub fn best(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(scores);
+        a.add(cint(v));
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(out);
+        try cuda.launch.launch(h.best_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
+    }
+
+    /// fn_row_argmax over `rows` rows of `v` scores `ld` apart: greedy verify reduction without expf().
+    pub fn argmax(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(scores);
+        a.add(cint(v));
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(out);
+        try cuda.launch.launch(h.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
+    }""",
+)
+patch_exact(
+    root, "cuda_mtp_draw.zig",
+    "    if (masks.len == 0 and (!mtp.isSampled(sm) or !usable(sm.?))) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);",
+    "    if (masks.len == 0 and !mtp.isSampled(sm)) try h.argmax(st, d.logits.ptr, vocab, vocab, n, d.best.ptr) else if (masks.len == 0 and !usable(sm.?)) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);",
+)
+patch_exact(
+    root, "cuda_draw_batch.zig",
+    "        if (greedy) try h.best(st, scores, vocab, vocab, rows, b.device.ptr);",
+    "        if (greedy) try h.argmax(st, scores, vocab, vocab, rows, b.device.ptr);",
 )
 patch_exact(
     root, "cuda_mtp.zig",
@@ -2200,9 +3188,14 @@ patch_exact(
     "    pub fn deinit(h: *Head) void {\n        h.w2.deinit();\n        h.draw_batch.deinit(h.gpa);",
 )
 patch_exact(
-    root, "cuda_mtp.zig",
-    "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (h.draft.native) |weight| {",
-    "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (rows == 1 and h.w2.ready()) return h.w2.project(h, pass.stream, input, out, h.ids.len);\n        if (h.draft.native) |weight| {",
+    root, "cuda_mtp_pieces.zig",
+    "            try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
+    "            if (hh.w2.ready()) try hh.w2.projectFused(pp.stream, ps.mixed, r.d.dlogits.ptr, r.d.best.ptr, hh.ids.len) else try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
+)
+patch_exact(
+    root, "cuda_draft_draw.zig",
+    "    try h.best(st, d.dlogits.ptr, n, n, 1, d.best.ptr);",
+    "    if (!h.w2.ready()) try h.best(st, d.dlogits.ptr, n, n, 1, d.best.ptr);",
 )
 patch_exact(
     root, "cuda_lanes_load.zig",
@@ -2258,7 +3251,7 @@ patch_exact(
             a2.add(out);
             a2.add(@as(c_int, vocab));
             a2.add(@as(c_int, k_top));
-            try cuda.launch.launch(self.k.head_rescore, .{ .grid = .{ .x = @intCast((k_top + 3) / 4), .y = @intCast(n) }, .block = .{ .x = 128 } }, self.stream, &a2);
+            try cuda.launch.launch(self.k.head_rescore, .{ .grid = .{ .x = @intCast((k_top + 15) / 16), .y = @intCast(n) }, .block = .{ .x = 256 } }, self.stream, &a2);
         };
         return;
     }""",
@@ -2460,6 +3453,10 @@ PY
     export TF_FLASHNEXT_HEAD_NVFP4="1"
     export TF_FLASHNEXT_TRUNK_BF12="1"
     export TF_FLASHNEXT_FUSED_SPLIT="1"
+    export TF_NVFP4_DECODE_WARPS="1"
+    export TF_NVFP4_DYNAMIC_GRID="1"
+    export TF_FLASHNEXT_ATTN_LANES="1"
+    export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
@@ -2470,8 +3467,11 @@ PY
       PAR="$GUARD_PARALLEL"
       THINK="--thinking"
     else
-      export TF_FLASHNEXT_DRAFTS_GREEDY="14"
+      export TF_FLASHNEXT_DRAFTS_GREEDY="28"
       export TF_FLASHNEXT_CONFIDENCE="-0.12"
+      export TF_FLASHNEXT_EXT_ENTER="0.45"
+      export TF_FLASHNEXT_EXT_STAY="0.25"
+      export TF_FLASHNEXT_EXT_TOK="0.82"
       CTX="$SPEED_CONTEXT"
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
