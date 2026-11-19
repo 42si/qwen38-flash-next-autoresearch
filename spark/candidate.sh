@@ -13,8 +13,8 @@ WORKDIR="${QFN_WORKDIR:-$HOME/qfn-autoresearch}"
 PORT="${QFN_PORT:-29771}"
 
 ENGINE_NAME="TensorFold"
-ENGINE_VERSION="1.2.9"
-ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
+ENGINE_VERSION="1.2.10"
+ENGINE_COMMIT="2a674b552498739e783a31c2573fc9ccf4d8cc0d"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -40,6 +40,7 @@ EOF
       mkdir -p "$ENGINE_DIR"
       ARCHIVE="$ENGINE_DIR/tensorfold-${ENGINE_VERSION}-linux-aarch64.tar.gz"
       curl -fsSL "https://github.com/ashhart/TensorFold/releases/download/v${ENGINE_VERSION}/tensorfold-${ENGINE_VERSION}-linux-aarch64.tar.gz" -o "$ARCHIVE"
+      echo "c335c44f81d55847a5f81d74a94ac3d09f81bd6688247cff972cf1f63fc18105  $ARCHIVE" | sha256sum -c -
       tar -xzf "$ARCHIVE" -C "$ENGINE_DIR"
       chmod +x "$ENGINE_BIN"
     fi
