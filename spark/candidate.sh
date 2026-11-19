@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl-t26"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp-while-fusehc-shgu-hbest-s2-t37"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -49,7 +49,6 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
     float4* __restrict__ stats,
     int V) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
     __shared__ float sx[2560];
@@ -64,7 +63,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
         const float* xg = sx + tid * 32;
         #pragma unroll
         for (int j = 0; j < 32; ++j) s += xg[j];
-        sg_sum[tid] = 1.5f * s;
+        sg_sum[tid] = 2.75f * s;
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -75,30 +74,44 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
         const uint4* wp = W + static_cast<size_t>(blk) * 40 * 32 + lane;
         const uint16_t* sp = S + static_cast<size_t>(blk) * 40 * 32 + lane;
         float acc = 0.0f;
+        uint4 w4 = __ldg(wp);
+        uint32_t s2 = __ldg(sp);
+        auto q2f = [](uint32_t word, int j) -> float {
+            const uint32_t bits = (j <= 10) ? ((word << (21 - 2 * j)) & 0x00600000u) : ((word >> (2 * j - 21)) & 0x00600000u);
+            return __uint_as_float(0x40000000u | bits);
+        };
         for (int g2 = 0; g2 < 40; ++g2) {
-            const uint4 w4 = __ldg(wp + g2 * 32);
-            const uint32_t s2 = __ldg(sp + g2 * 32);
+            uint4 nw4;
+            uint32_t ns2;
+            if (g2 + 1 < 40) {
+                nw4 = __ldg(wp + (g2 + 1) * 32);
+                ns2 = __ldg(sp + (g2 + 1) * 32);
+            }
             const uint32_t sx2 = (s2 & 0xFFu) | ((s2 & 0xFF00u) << 8);
             const uint32_t ts = ((sx2 & 0x007F007Fu) << 4) | ((sx2 & 0x00800080u) << 8);
             uint32_t bf2;
             asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(bf2) : "r"(ts), "r"(0x7B807B80u), "r"(0x80008000u));
-            const float sc0 = __uint_as_float((bf2 & 0xFFFFu) << 16);
-            const float sc1 = __uint_as_float(bf2 & 0xFFFF0000u);
+            const float sc0 = 2.0f * __uint_as_float((bf2 & 0xFFFFu) << 16);
+            const float sc1 = 2.0f * __uint_as_float(bf2 & 0xFFFF0000u);
             const int g0 = g2 * 2;
             const float* xg0 = sx + g0 * 32;
             float dot0 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[j], static_cast<float>((w4.x >> (2 * j)) & 3u), dot0);
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[j], q2f(w4.x, j), dot0);
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[16 + j], static_cast<float>((w4.y >> (2 * j)) & 3u), dot0);
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[16 + j], q2f(w4.y, j), dot0);
             acc = fmaf(sc0, dot0 - sg_sum[g0], acc);
             const float* xg1 = sx + (g0 + 1) * 32;
             float dot1 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[j], static_cast<float>((w4.z >> (2 * j)) & 3u), dot1);
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[j], q2f(w4.z, j), dot1);
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[16 + j], static_cast<float>((w4.w >> (2 * j)) & 3u), dot1);
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[16 + j], q2f(w4.w, j), dot1);
             acc = fmaf(sc1, dot1 - sg_sum[g0 + 1], acc);
+            if (g2 + 1 < 40) {
+                w4 = nw4;
+                s2 = ns2;
+            }
         }
         acc *= __ldg(G + row);
         if (row < V) {
@@ -107,6 +120,9 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
             fv = __bfloat162float(bv);
         }
     }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
     float wm = fv;
     int wc = (row < V) ? row : 0x7fffffff;
     for (int o = 16; o; o >>= 1) {
@@ -147,8 +163,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best(
     int V,
     float* __restrict__ best_out) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     __shared__ float sx[320 * 9];
@@ -454,8 +470,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_row_argmax(
     long long ld,
     float* __restrict__ out) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     using namespace fn_mtp;
     const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -519,6 +535,157 @@ extern "C" __global__ void __launch_bounds__(1024) fn_row_argmax(
         }
     }
 }
+
+// Trial 36: Zero-sync device-side MTP chain controller for CU_GRAPH_COND_TYPE_WHILE.
+// Runs the entire greedy MTP draft loop on GPU with 1 graph launch + 1 sync per round.
+struct MtpChainCtl {
+    double c;
+    double ext_enter;
+    double ext_stay;
+    double ext_tok;
+    int start_pos;
+    int max_steps;
+    int vocab_n;
+    int pad;
+};
+
+struct MtpChainOut {
+    double product;
+    double probs[16];
+    uint32_t tokens[16];
+    int n;
+    int drafted;
+    int err;
+    int pad;
+};
+
+__device__ __forceinline__ void mtp_stop_take(
+    const MtpChainCtl* ctl, double* product, int j, double p, bool& propose, bool& more) {
+    const double c = ctl->c;
+    if (c > 0.0) {
+        const bool low = (p < c);
+        if (low && j > 0) {
+            propose = false;
+            more = false;
+            return;
+        }
+        propose = true;
+        more = !low;
+        return;
+    }
+    if (c < 0.0) {
+        const double prod = (*product) * p;
+        *product = prod;
+        if (j >= 15 && (ctl->ext_stay > 0.0 || ctl->ext_tok > 0.0)) {
+            if (prod < ctl->ext_stay || p < ctl->ext_tok) {
+                propose = false;
+                more = false;
+                return;
+            }
+            propose = true;
+            more = true;
+            return;
+        }
+        if (prod < -c) {
+            propose = (j == 0);
+            more = false;
+            return;
+        }
+        if (j == 14 && ctl->ext_enter > 0.0 && prod < ctl->ext_enter) {
+            propose = true;
+            more = false;
+            return;
+        }
+    }
+    propose = true;
+    more = true;
+}
+
+extern "C" __global__ void __launch_bounds__(32) fn_mtp_chain_init(
+    const float* __restrict__ best,
+    const uint32_t* __restrict__ vocab_ids,
+    int* __restrict__ s_ids,
+    int* __restrict__ s_pos,
+    const MtpChainCtl* __restrict__ ctl,
+    MtpChainOut* __restrict__ out,
+    unsigned long long cond_handle) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    out->product = 1.0;
+    out->n = 0;
+    out->drafted = 0;
+    out->err = 0;
+    out->pad = 0;
+    const float b0 = best[0];
+    const float b1 = best[1];
+    const int col = __float_as_int(best[2]);
+    if (!isfinite(b0) || !isfinite(b1) || col < 0 || col >= ctl->vocab_n) {
+        out->err = 1;
+        cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, 0u);
+        return;
+    }
+    const uint32_t tok = vocab_ids[col];
+    const double prob = exp(static_cast<double>(b0) - static_cast<double>(b1));
+    bool propose = false, more = false;
+    mtp_stop_take(ctl, &out->product, 0, prob, propose, more);
+    if (propose) {
+        out->tokens[0] = tok;
+        out->probs[0] = prob;
+        out->n = 1;
+    }
+    const bool go = propose && more && (1 < ctl->max_steps);
+    if (go) {
+        s_ids[0] = static_cast<int>(tok);
+        s_pos[0] = ctl->start_pos;
+        s_pos[1] = 0;
+        s_pos[2] = 0;
+        s_pos[3] = 0;
+    }
+    cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, go ? 1u : 0u);
+}
+
+extern "C" __global__ void __launch_bounds__(32) fn_mtp_chain_step(
+    const float* __restrict__ best,
+    const uint32_t* __restrict__ vocab_ids,
+    int* __restrict__ s_ids,
+    int* __restrict__ s_pos,
+    const MtpChainCtl* __restrict__ ctl,
+    MtpChainOut* __restrict__ out,
+    unsigned long long cond_handle) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const int drafted = out->drafted + 1;
+    out->drafted = drafted;
+    const float b0 = best[0];
+    const float b1 = best[1];
+    const int col = __float_as_int(best[2]);
+    if (!isfinite(b0) || !isfinite(b1) || col < 0 || col >= ctl->vocab_n) {
+        out->err = 1;
+        cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, 0u);
+        return;
+    }
+    const uint32_t tok = vocab_ids[col];
+    const double prob = exp(static_cast<double>(b0) - static_cast<double>(b1));
+    bool propose = false, more = false;
+    mtp_stop_take(ctl, &out->product, drafted, prob, propose, more);
+    if (!propose) {
+        cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, 0u);
+        return;
+    }
+    const int idx = out->n;
+    if (idx < 16) {
+        out->tokens[idx] = tok;
+        out->probs[idx] = prob;
+        out->n = idx + 1;
+    }
+    const bool go = more && (drafted + 1 < ctl->max_steps);
+    if (go) {
+        s_ids[0] = static_cast<int>(tok);
+        s_pos[0] = ctl->start_pos + drafted;
+        s_pos[1] = 0;
+        s_pos[2] = 0;
+        s_pos[3] = 0;
+    }
+    cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, go ? 1u : 0u);
+}
 CU
 
   # 1b. Append NVFP4 head quantizer + fused top-128 & floor + exact BF16 rescore kernels to flashnext_batch.cu
@@ -571,10 +738,11 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     int V,
     long long ld,
     int K,
-    int* __restrict__ out_c) {
+    int* __restrict__ out_c,
+    int skip_fill) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int r = blockIdx.x, t = threadIdx.x, nt = blockDim.x;
     unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
@@ -828,6 +996,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
             else if (ok == kth && rank < need) { oc[high + rank] = i; ++rank; }
         }
     }
+    if (skip_fill) return;
     __syncthreads();
     if (aligned8) {
         const uint4 fill4 = make_uint4(0xC680C680u, 0xC680C680u, 0xC680C680u, 0xC680C680u);
@@ -839,6 +1008,111 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(1024) fn_head_rescore_best(
+    const __nv_bfloat16* X,
+    const __nv_bfloat16* __restrict__ W_bf16,
+    const int* cols,
+    float* __restrict__ best_out,
+    int V,
+    int K) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.y;
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    if (cols[static_cast<long long>(r) * K] < 0) {
+        if (t == 0) {
+            best_out[r * 4 + 0] = CUDART_NAN_F;
+            best_out[r * 4 + 1] = CUDART_NAN_F;
+            best_out[r * 4 + 2] = __int_as_float(-1);
+            best_out[r * 4 + 3] = 0.0f;
+        }
+#if __CUDA_ARCH__ >= 900
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+        return;
+    }
+    __shared__ float sx[320 * 9];
+    const __nv_bfloat16* xr = X + static_cast<size_t>(r) * 2560;
+    for (int idx = t; idx < 2560; idx += 1024) {
+        sx[(idx >> 3) * 9 + (idx & 7)] = __bfloat162float(xr[idx]);
+    }
+    __syncthreads();
+    float bv = -CUDART_INF_F;
+    int bc = 0x7fffffff;
+    int bad = 0;
+    for (int j = warp; j < K; j += 32) {
+        const int c = cols[static_cast<long long>(r) * K + j];
+        if (c < 0 || c >= V) continue;
+        const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = lane; i < 320; i += 32) {
+            const uint4 wv = __ldg(wp4 + i);
+            const float* xp = sx + i * 9;
+            const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
+            sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
+            sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+            sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+        }
+        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) {
+            const __nv_bfloat16 bfv = __float2bfloat16_rn(sum);
+            const unsigned short u = *reinterpret_cast<const unsigned short*>(&bfv);
+            bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
+            const float fv = __uint_as_float(static_cast<uint32_t>(u) << 16);
+            if (fv > bv || (fv == bv && c < bc)) {
+                bv = fv;
+                bc = c;
+            }
+        }
+    }
+    __shared__ float sv[32];
+    __shared__ int sc[32];
+    __shared__ int sb[32];
+    if (lane == 0) {
+        sv[warp] = bv;
+        sc[warp] = bc;
+        sb[warp] = bad;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = sv[lane];
+        int c = sc[lane];
+        int b = sb[lane];
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+            const int oc = __shfl_xor_sync(0xffffffffu, c, o);
+            b |= __shfl_xor_sync(0xffffffffu, b, o);
+            if (ov > v || (ov == v && oc < c)) {
+                v = ov;
+                c = oc;
+            }
+        }
+        if (lane == 0) {
+            if (b || c < 0 || c >= V) {
+                best_out[r * 4 + 0] = CUDART_NAN_F;
+                best_out[r * 4 + 1] = CUDART_NAN_F;
+                best_out[r * 4 + 2] = __int_as_float(-1);
+                best_out[r * 4 + 3] = 0.0f;
+            } else {
+                best_out[r * 4 + 0] = v;
+                best_out[r * 4 + 1] = v;
+                best_out[r * 4 + 2] = __int_as_float(c);
+                best_out[r * 4 + 3] = 0.0f;
+            }
+        }
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
 extern "C" __global__ void __launch_bounds__(256) fn_head_rescore(
     const __nv_bfloat16* X,
     const __nv_bfloat16* __restrict__ W_bf16,
@@ -847,8 +1121,8 @@ extern "C" __global__ void __launch_bounds__(256) fn_head_rescore(
     int V,
     int K) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int r = blockIdx.y;
     if (cols[static_cast<long long>(r) * K] < 0) return;
@@ -881,6 +1155,45 @@ extern "C" __global__ void __launch_bounds__(256) fn_head_rescore(
     }
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if (lane == 0) out[static_cast<size_t>(r) * V + c] = __float2bfloat16_rn(sum);
+}
+
+// SM121 paced hardware TMA L2 prefetch (cp.async.bulk.prefetch.L2.global + globaltimer pacing, cf. TensorFold l2pace.cu).
+// Reads constant weights into L2 only and writes nothing, so model bits are 100% unchanged.
+extern "C" __global__ void __launch_bounds__(32) fn_l2_prefetch2_paced(
+    const uint8_t* p0,
+    unsigned long long b0,
+    const uint8_t* p1,
+    unsigned long long b1,
+    unsigned long long ns_per_piece) {
+#if __CUDA_ARCH__ >= 900
+    if (threadIdx.x != 0) return;
+    constexpr unsigned int CHUNK = 32768u;
+    const unsigned long long c = blockIdx.x, g = gridDim.x;
+    unsigned long long t0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    unsigned long long k = 0;
+    auto pf = [&](const uint8_t* p, unsigned long long bytes) {
+        if (!p || !bytes) return;
+        for (unsigned long long off = 0; off < bytes; off += CHUNK, ++k) {
+            if (k % g != c) continue;
+            if (ns_per_piece > 0) {
+                const unsigned long long due = t0 + k * ns_per_piece;
+                while (true) {
+                    unsigned long long now;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+                    if (now >= due) break;
+                    const unsigned long long left = due - now;
+                    __nanosleep(static_cast<unsigned int>(left > 2000ull ? 1000u : (left > 64ull ? left / 2ull : 32u)));
+                }
+            }
+            const unsigned long long left = bytes - off;
+            const unsigned int sz = static_cast<unsigned int>((left < CHUNK ? left : CHUNK) & ~15ull);
+            if (sz) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p + off), "r"(sz) : "memory");
+        }
+    };
+    pf(p0, b0);
+    pf(p1, b1);
+#endif
 }
 CU
 
@@ -979,6 +1292,7 @@ patch_k(
         const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
         void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 BF12_INST(16, 64, 1, 4, 3, false, false, false)
+BF12_INST(16, 64, 1, 4, 2, false, false, false)
 BF12_INST(16, 64, 1, 4, 3, false, true, false)
 BF12_INST(16, 64, 1, 4, 3, false, false, true)
 BF12_INST(32, 64, 1, 4, 3, false, false, false)
@@ -988,6 +1302,7 @@ BF12_INST(64, 64, 1, 4, 3, false, false, false)
 BF12_INST(64, 64, 1, 4, 3, false, true, false)
 BF12_INST(64, 64, 1, 4, 3, false, false, true)
 BF12_INST(16, 64, 1, 4, 3, true, false, false)
+BF12_INST(16, 64, 1, 4, 2, true, false, false)
 BF12_INST(16, 64, 1, 4, 3, true, true, false)
 BF12_INST(16, 64, 1, 4, 3, true, false, true)
 BF12_INST(32, 64, 1, 4, 3, true, false, false)
@@ -1370,7 +1685,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
         int group, int ldy) {
-    qmm_frag::grid_launch();
 #define TF_QMMF_STRIDED
 #define TF_QMMF_WFIRST
 #include "qmmf_body.cuh"
@@ -1384,7 +1698,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
         int group) {
-    if constexpr (BN <= 64) qmm_frag::grid_launch();
 #define TF_QMMF_WFIRST
 #include "qmmf_body.cuh"
 #undef TF_QMMF_WFIRST
@@ -1400,8 +1713,8 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
     """template <bool F32>
 __global__ void reduce_kernel(const float* part, void* __restrict__ out, long long total, int SK,
                               float scale) {
-    qmm_frag::grid_launch();
     qmm_frag::grid_wait();
+    qmm_frag::grid_launch();
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;""",
 )
 qmmf_p = kdir / "qmmf.cu"
@@ -1477,7 +1790,20 @@ patch_k(
     }""",
 )
 
-# nvfp4_experts.cu: coherent dynamic reads (X/items/counts/members) + PDL enter on decode kernels (keep ld_nc on W/scale)
+patch_k(
+    "qmmf_body.cuh",
+    """    wait<0>();
+    __syncthreads();
+    if constexpr (FUSE) {""",
+    """    wait<0>();
+    __syncthreads();
+#ifdef TF_QMMF_WFIRST
+    if constexpr (BN <= 64) qmm_frag::grid_launch();
+#endif
+    if constexpr (FUSE) {""",
+)
+
+# nvfp4_experts.cu: coherent dynamic reads + non-cascading PDL (keep pipelined Stage<M>/Half<M> intact)
 nvp = kdir / "nvfp4_experts.cu"
 nvtxt = nvp.read_text(encoding="utf-8")
 for old_s, new_s in [
@@ -1491,7 +1817,8 @@ for old_s, new_s in [
     nvtxt = nvtxt.replace(old_s, new_s)
 
 for old_s, new_s in [
-    ("""__device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, const __nv_bfloat16* __restrict__ X,
+    ("""template <int M, int EPI>
+__device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, const __nv_bfloat16* __restrict__ X,
                                           int x_stride, int slots, const uint4* __restrict__ W,
                                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                                           const int* __restrict__ members, void* __restrict__ out, int N, float limit,
@@ -1503,8 +1830,41 @@ for old_s, new_s in [
   for (int r0 = 0; r0 < cnt; r0 += 16) {
     const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
     const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
-    const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;""",
-     """__device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, const __nv_bfloat16* X,
+    const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
+    const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
+    const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
+    const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;
+    float acc[M][1][NTW][4];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+    k_loop<M>(acc, blk, KG, lane, t, x0, x1, v0, v1);
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const float g = __ldg(scale + e * M + m);
+#pragma unroll
+      for (int j = 0; j < NTW; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[m][0][j][q] *= g;
+    }
+    epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
+  }
+}""",
+     """template <int M, int WARPS>
+struct SprBox {
+  static __device__ __forceinline__ int* ptr(int warp) {
+    __shared__ int s[WARPS][18];
+    return s[warp];
+  }
+};
+template <int WARPS>
+struct SprBox<1, WARPS> {
+  static __device__ __forceinline__ int* ptr(int) { return nullptr; }
+};
+
+template <int M, int EPI>
+__device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int* spr, const __nv_bfloat16* X,
                                           int x_stride, int slots, const uint4* __restrict__ W,
                                           const float* __restrict__ scale, int KG, int NB, const int* items,
                                           const int* members, void* __restrict__ out, int N, float limit,
@@ -1512,39 +1872,96 @@ for old_s, new_s in [
   const int it = unit / NB, cb = unit - it * NB;
   const int e = items[3 * it], first = items[3 * it + 1], cnt = items[3 * it + 2];
   if (e == skip) return;
+  if constexpr (M == 2) {
+    if (lane == 0) { spr[16] = e; spr[17] = cb; }
+  }
   const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4);
   for (int r0 = 0; r0 < cnt; r0 += 16) {
     const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
     const int pr0 = v0 ? members[first + r0 + gq] : 0;
-    const int pr1 = v1 ? members[first + r0 + gq + 8] : 0;"""),
+    const int pr1 = v1 ? members[first + r0 + gq + 8] : 0;
+    if constexpr (M == 2) {
+      __syncwarp();
+      if (t == 0) { spr[gq] = pr0; spr[8 + gq] = pr1; }
+      __syncwarp();
+    }
+    const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
+    const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
+    const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;
+    float acc[M][1][NTW][4];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+    k_loop<M>(acc, blk, KG, lane, t, x0, x1, v0, v1);
+    int e_ep = e, cb_ep = cb, pr0_ep = pr0, pr1_ep = pr1;
+    if constexpr (M == 2) {
+      e_ep = spr[16];
+      cb_ep = spr[17];
+      pr0_ep = spr[gq];
+      pr1_ep = spr[8 + gq];
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const float g = __ldg(scale + e_ep * M + m);
+#pragma unroll
+      for (int j = 0; j < NTW; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[m][0][j][q] *= g;
+    }
+    epilogue<EPI, M, 1>(acc, 0, out, N, cb_ep * COLS + 2 * t, pr0_ep, pr1_ep, v0, v1, limit);
+  }
+}"""),
     ("""    nvfp4_expert_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                         const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                         const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
                         float limit, int skip) {
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = __ldg(counts) * NB;""",
+  const int units = __ldg(counts) * NB;
+  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+}""",
      """    nvfp4_expert_kernel(const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
                         const float* __restrict__ scale, int KG, int NB, const int* items,
                         const int* counts, const int* members, void* __restrict__ out, int N,
                         float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
-  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = (*counts) * NB;"""),
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  int* spr = SprBox<M, WARPS>::ptr(warp);
+  const int units = (*counts) * NB;
+  for (int unit = blockIdx.x * WARPS + warp; unit < units; unit += gridDim.x * WARPS)
+    unit_full<M, EPI>(unit, lane, gq, t, spr, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+  qmm_frag::grid_launch();
+}"""),
     ("""    nvfp4_expert_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                        const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                        const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
                        float limit, int skip) {
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = __ldg(counts) * NB;""",
+  const int units = __ldg(counts) * NB;
+  if (units == 0) return;  // no items: no wave to divide by
+  const int warps = gridDim.x * WARPS, waves = (units + warps - 1) / warps;
+  const int run = (units + waves - 1) / waves, w = blockIdx.x * WARPS + (threadIdx.x >> 5);
+  if (w >= run) return;
+  for (int unit = w; unit < units; unit += run)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+}""",
      """    nvfp4_expert_waves(const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
                        const float* __restrict__ scale, int KG, int NB, const int* items,
                        const int* counts, const int* members, void* __restrict__ out, int N,
                        float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
-  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = (*counts) * NB;"""),
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  int* spr = SprBox<M, WARPS>::ptr(warp);
+  const int units = (*counts) * NB;
+  if (units == 0) { qmm_frag::grid_launch(); return; }
+  const int warps = gridDim.x * WARPS, waves = (units + warps - 1) / warps;
+  const int run = (units + waves - 1) / waves, w = blockIdx.x * WARPS + warp;
+  if (w >= run) { qmm_frag::grid_launch(); return; }
+  for (int unit = w; unit < units; unit += run)
+    unit_full<M, EPI>(unit, lane, gq, t, spr, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+  qmm_frag::grid_launch();
+}"""),
     ("""    nvfp4_expert_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
@@ -1565,7 +1982,6 @@ for old_s, new_s in [
                       const float* __restrict__ scale, int KG, int NB, const int* items,
                       const int* counts, const int* members, void* __restrict__ out, int N,
                       float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
   constexpr int D = 2;
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
@@ -1579,6 +1995,15 @@ for old_s, new_s in [
       const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
       const int pr0 = v0 ? members[first + r0 + gq] : 0;
       const int pr1 = v1 ? members[first + r0 + gq + 8] : 0;"""),
+    ("""      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
+    }
+  }
+}""",
+     """      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
+    }
+  }
+  qmm_frag::grid_launch();
+}"""),
 ]:
     if nvtxt.count(old_s) != 1:
         raise RuntimeError(f"Expected 1 match in nvfp4_experts.cu, got {nvtxt.count(old_s)}")
@@ -1590,8 +2015,637 @@ nvtxt = nvtxt.replace(
 )
 nvp.write_text(nvtxt, encoding="utf-8")
 
-# Instrument remaining decode .cu/.cuh kernels with unconditional PDL enter() and coherent const inputs
-PDL_SNIP = "\n#if __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n    asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n#endif\n"
+# experts.cu: 4-bucket descending-cnt place_items (cnt>8 first, then 3..8, 2, 1), O(1) atomic scatter, e<E bounds
+patch_k(
+    "experts.cu",
+    """__device__ int place_items(int c, int E, int T, int* __restrict__ items, int* __restrict__ counts) {
+  __shared__ int wsum[3][32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int tiles = (c + T - 1) / T;
+  int a = c, b = tiles, u = c > 0;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int ua = __shfl_up_sync(0xffffffffu, a, o), ub = __shfl_up_sync(0xffffffffu, b, o);
+    const int uu = __shfl_up_sync(0xffffffffu, u, o);
+    if (lane >= o) {
+      a += ua;
+      b += ub;
+      u += uu;
+    }
+  }
+  if (lane == 31) {
+    wsum[0][warp] = a;
+    wsum[1][warp] = b;
+    wsum[2][warp] = u;
+  }
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (int s = 0; s < 3; ++s) {
+      int v = wsum[s][lane];
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int w = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += w;
+      }
+      wsum[s][lane] = v;
+    }
+  }
+  __syncthreads();
+  const int off = (warp ? wsum[0][warp - 1] : 0) + a - c;
+  const int ioff = (warp ? wsum[1][warp - 1] : 0) + b - tiles;
+  if (tid == 0) {
+    counts[0] = wsum[1][31];
+    counts[1] = wsum[2][31];
+  }
+  if (tid < E)
+    for (int j = 0; j < tiles; ++j) {
+      int* it = items + 3 * (ioff + j);
+      it[0] = tid;
+      it[1] = off + T * j;
+      it[2] = min(T, c - T * j);
+    }
+  return off;
+}
+
+__global__ void __launch_bounds__(PLAN_THREADS)
+    plan_kernel(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
+                int* __restrict__ items, int* __restrict__ counts) {
+  __shared__ int pk[PSMALL];
+  __shared__ int cnt[EMAX];
+  __shared__ int off[EMAX];
+  const int tid = threadIdx.x;
+  for (int e = tid; e < EMAX; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = picks[p];
+    pk[p] = e;
+    atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  const int o = place_items(tid < E ? cnt[tid] : 0, E, T, items, counts);
+  if (tid < E) off[tid] = o;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = pk[p];
+    int rank = 0;
+    for (int q = 0; q < p; ++q) rank += pk[q] == e;
+    members[off[e] + rank] = p;
+  }
+}
+
+// plan_kernel over the first *rows rows' pairs (per a row): a captured bucket's padding rows get no items.
+__global__ void __launch_bounds__(PLAN_THREADS)
+    plan_rows(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
+              int* __restrict__ items, int* __restrict__ counts, const int* __restrict__ rows, int per) {
+  P = min(P, *rows * per);
+  __shared__ int pk[PSMALL];
+  __shared__ int cnt[EMAX];
+  __shared__ int off[EMAX];
+  const int tid = threadIdx.x;
+  for (int e = tid; e < EMAX; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = picks[p];
+    pk[p] = e;
+    atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  const int o = place_items(tid < E ? cnt[tid] : 0, E, T, items, counts);
+  if (tid < E) off[tid] = o;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = pk[p];
+    int rank = 0;
+    for (int q = 0; q < p; ++q) rank += pk[q] == e;
+    members[off[e] + rank] = p;
+  }
+}
+
+__device__ __forceinline__ void rank_pairs(const int* __restrict__ picks, int P, int E, int* __restrict__ rank,
+                                           int* __restrict__ hist) {
+  __shared__ int cnt[EMAX];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  for (int e = tid; e < E; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  const int p = blockIdx.x * PLAN_THREADS + tid;
+  const bool ok = p < P;
+  const int e = ok ? picks[p] : -1 - lane;""",
+    """__device__ int place_items(int c, int E, int T, int* __restrict__ items, int* __restrict__ counts) {
+  __shared__ int wsum[6][32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int tiles = (c + T - 1) / T;
+  const int rem = c > 0 ? (c - T * (tiles - 1)) : 0;
+  const int b0 = (c > 0 && T > 8) ? ((tiles - 1) + (rem > 8 ? 1 : 0)) : 0;
+  const int b1 = (c > 0 && T > 8 && rem >= 3 && rem <= 8) ? 1 : ((c > 0 && T <= 8) ? tiles : 0);
+  const int b2 = (c > 0 && T > 8 && rem == 2) ? 1 : 0;
+  const int b3 = (c > 0 && T > 8 && rem == 1) ? 1 : 0;
+  int a0 = c, a1 = c > 0, a2 = b0, a3 = b1, a4 = b2, a5 = b3;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int u0 = __shfl_up_sync(0xffffffffu, a0, o), u1 = __shfl_up_sync(0xffffffffu, a1, o);
+    const int u2 = __shfl_up_sync(0xffffffffu, a2, o), u3 = __shfl_up_sync(0xffffffffu, a3, o);
+    const int u4 = __shfl_up_sync(0xffffffffu, a4, o), u5 = __shfl_up_sync(0xffffffffu, a5, o);
+    if (lane >= o) { a0 += u0; a1 += u1; a2 += u2; a3 += u3; a4 += u4; a5 += u5; }
+  }
+  if (lane == 31) {
+    wsum[0][warp] = a0; wsum[1][warp] = a1; wsum[2][warp] = a2;
+    wsum[3][warp] = a3; wsum[4][warp] = a4; wsum[5][warp] = a5;
+  }
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (int s = 0; s < 6; ++s) {
+      int v = wsum[s][lane];
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int w = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += w;
+      }
+      wsum[s][lane] = v;
+    }
+  }
+  __syncthreads();
+  const int off = (warp ? wsum[0][warp - 1] : 0) + a0 - c;
+  const int ioff0 = (warp ? wsum[2][warp - 1] : 0) + a2 - b0;
+  const int ioff1 = (warp ? wsum[3][warp - 1] : 0) + a3 - b1;
+  const int ioff2 = (warp ? wsum[4][warp - 1] : 0) + a4 - b2;
+  const int ioff3 = (warp ? wsum[5][warp - 1] : 0) + a5 - b3;
+  const int tot0 = wsum[2][31], tot1 = wsum[3][31], tot2 = wsum[4][31], tot3 = wsum[5][31];
+  if (tid == 0) {
+    counts[0] = tot0 + tot1 + tot2 + tot3;
+    counts[1] = wsum[1][31];
+  }
+  if (tid < E && c > 0) {
+    if (T > 8) {
+      for (int j = 0; j < b0; ++j) {
+        int* it = items + 3 * (ioff0 + j);
+        it[0] = tid; it[1] = off + T * j; it[2] = min(T, c - T * j);
+      }
+      if (b1) {
+        int* it = items + 3 * (tot0 + ioff1);
+        it[0] = tid; it[1] = off + T * (tiles - 1); it[2] = rem;
+      }
+      if (b2) {
+        int* it = items + 3 * (tot0 + tot1 + ioff2);
+        it[0] = tid; it[1] = off + T * (tiles - 1); it[2] = 2;
+      }
+      if (b3) {
+        int* it = items + 3 * (tot0 + tot1 + tot2 + ioff3);
+        it[0] = tid; it[1] = off + T * (tiles - 1); it[2] = 1;
+      }
+    } else {
+      for (int j = 0; j < tiles; ++j) {
+        int* it = items + 3 * (ioff1 + j);
+        it[0] = tid; it[1] = off + T * j; it[2] = min(T, c - T * j);
+      }
+    }
+  }
+  return off;
+}
+
+__global__ void __launch_bounds__(PLAN_THREADS)
+    plan_kernel(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
+                int* __restrict__ items, int* __restrict__ counts) {
+  __shared__ int pk[PSMALL];
+  __shared__ int cnt[EMAX];
+  __shared__ int off[EMAX];
+  const int tid = threadIdx.x;
+  for (int e = tid; e < E; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = picks[p];
+    pk[p] = e;
+    if (e >= 0 && e < E) atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  const int o = place_items(tid < E ? cnt[tid] : 0, E, T, items, counts);
+  if (tid < E) off[tid] = o;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = pk[p];
+    if (e >= 0 && e < E) {
+      const int pos = atomicAdd(&off[e], 1);
+      members[pos] = p;
+    }
+  }
+}
+
+// plan_kernel over the first *rows rows' pairs (per a row): a captured bucket's padding rows get no items.
+__global__ void __launch_bounds__(PLAN_THREADS)
+    plan_rows(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
+              int* __restrict__ items, int* __restrict__ counts, const int* __restrict__ rows, int per) {
+  P = min(P, *rows * per);
+  __shared__ int pk[PSMALL];
+  __shared__ int cnt[EMAX];
+  __shared__ int off[EMAX];
+  const int tid = threadIdx.x;
+  for (int e = tid; e < E; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = picks[p];
+    pk[p] = e;
+    if (e >= 0 && e < E) atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  const int o = place_items(tid < E ? cnt[tid] : 0, E, T, items, counts);
+  if (tid < E) off[tid] = o;
+  __syncthreads();
+  for (int p = tid; p < P; p += PLAN_THREADS) {
+    const int e = pk[p];
+    if (e >= 0 && e < E) {
+      const int pos = atomicAdd(&off[e], 1);
+      members[pos] = p;
+    }
+  }
+}
+
+__device__ __forceinline__ void rank_pairs(const int* __restrict__ picks, int P, int E, int* __restrict__ rank,
+                                           int* __restrict__ hist) {
+  __shared__ int cnt[EMAX];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  for (int e = tid; e < E; e += PLAN_THREADS) cnt[e] = 0;
+  __syncthreads();
+  const int p = blockIdx.x * PLAN_THREADS + tid;
+  const int raw = p < P ? picks[p] : -1;
+  const bool ok = p < P && raw >= 0 && raw < E;
+  const int e = ok ? raw : -1 - lane;""",
+)
+patch_k(
+    "experts.cu",
+    """__global__ void plan_scatter(const int* __restrict__ picks, int P, int E, const int* __restrict__ rank,
+                             const int* __restrict__ hist, int* __restrict__ members) {
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p < P) members[hist[(size_t)(p / PLAN_THREADS) * E + picks[p]] + rank[p]] = p;
+}
+
+// plan_scatter over the first *rows rows' pairs (per a row).
+__global__ void plan_scatter_rows(const int* __restrict__ picks, int P, int E, const int* __restrict__ rank,
+                                  const int* __restrict__ hist, int* __restrict__ members, const int* __restrict__ rows,
+                                  int per) {
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p < min(P, *rows * per)) members[hist[(size_t)(p / PLAN_THREADS) * E + picks[p]] + rank[p]] = p;
+}""",
+    """__global__ void plan_scatter(const int* __restrict__ picks, int P, int E, const int* __restrict__ rank,
+                             const int* __restrict__ hist, int* __restrict__ members) {
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p < P) {
+    const int e = picks[p];
+    if (e >= 0 && e < E) members[hist[(size_t)(p / PLAN_THREADS) * E + e] + rank[p]] = p;
+  }
+}
+
+// plan_scatter over the first *rows rows' pairs (per a row).
+__global__ void plan_scatter_rows(const int* __restrict__ picks, int P, int E, const int* __restrict__ rank,
+                                  const int* __restrict__ hist, int* __restrict__ members, const int* __restrict__ rows,
+                                  int per) {
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p < min(P, *rows * per)) {
+    const int e = picks[p];
+    if (e >= 0 && e < E) members[hist[(size_t)(p / PLAN_THREADS) * E + e] + rank[p]] = p;
+  }
+}""",
+)
+
+# route_rows.cu + router_mma.cuh: keep fast 4-warp <4,3,256> tf_route_logits_few (18.6us) + 1-warp zero-barrier tf_route_topk
+patch_k(
+    "common/router_mma.cuh",
+    "__device__ __forceinline__ void logits(const __nv_bfloat16* __restrict__ X, int x_ld, const __nv_bfloat16* __restrict__ W,",
+    "__device__ __forceinline__ void logits(const __nv_bfloat16* X, int x_ld, const __nv_bfloat16* __restrict__ W,",
+)
+patch_k(
+    "route_rows.cu",
+    """extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __restrict__ L, int NL, int NE, int TOPK,
+                                                               int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
+                                                               int shared) {
+    __shared__ float sv[2][NT / 32];
+    __shared__ int si[2][NT / 32];
+    const int r = blockIdx.x;
+    const float* row = L + static_cast<long long>(r) * NL;""",
+    """extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __restrict__ L, int NL, int NE, int TOPK,
+                                                               int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
+                                                               int shared) {
+    const int r = blockIdx.x;
+    const float* row = L + static_cast<long long>(r) * NL;
+    if (blockDim.x == 32 && NE <= 512 && TOPK <= 32) {
+        const int lane = threadIdx.x;
+        float wv[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int i = lane + j * 32;
+            wv[j] = i < NE ? row[i] : -INFINITY;
+        }
+        float top = 0.0f, total = 0.0f, mine = 0.0f;
+        int pick = 0;
+        for (int k = 0; k < TOPK; ++k) {
+            float bv = -INFINITY;
+            int bi = 0x7fffffff;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int i = lane + j * 32;
+                if (wv[j] > bv || (wv[j] == bv && i < bi)) {
+                    bv = wv[j];
+                    bi = i;
+                }
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (k == 0) top = bv;
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (lane + j * 32 == bi) wv[j] = -INFINITY;
+            const float ex = tf_exp(__fsub_rn(bv, top));
+            total = __fadd_rn(total, ex);
+            if (lane == k) {
+                mine = ex;
+                pick = bi;
+            }
+        }
+        if (lane < TOPK) {
+            PICK[static_cast<long long>(r) * SLOTS + lane] = pick;
+            WTS[static_cast<long long>(r) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
+        }
+        if (shared && lane == 0) {
+            PICK[static_cast<long long>(r) * SLOTS + TOPK] = NE;
+            WTS[static_cast<long long>(r) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(row[NE])));
+        }
+        return;
+    }
+    __shared__ float sv[2][NT / 32];
+    __shared__ int si[2][NT / 32];""",
+)
+
+# 4x-parallel (row, stream) fused hc_writeback_norm in flashnext_hc.cu (grid=(rows, 4): 64 CTAs on 48 SMs, 4x fewer regs)
+patch_k(
+    "flashnext_hc.cu",
+    """    constexpr int D = NC * 256;
+    __shared__ float red[NC][8][S];
+    __shared__ float rinv[S];
+    const int r = blockIdx.x, warp = threadIdx.x >> 5;
+    float hv[NC][S];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int d = c * 256 + threadIdx.x;
+        float branch = 0.0f;
+        if constexpr (MODE == 4) {
+            float acc = BR[static_cast<long long>(r) * D + d];
+            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+            branch = rbf(acc);
+        } else if constexpr (MODE == 2) {
+            float acc = 0.0f;
+            for (int k = 0; k <= TOPK; ++k) {
+                const long long at = static_cast<long long>(r) * SLOTS + k;
+                acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+            }
+            branch = rbf(acc);
+        }
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const long long at = static_cast<long long>(r) * S * D + static_cast<long long>(s) * D + d;
+            float v = bf(H[at]);
+            if constexpr (MODE != 0) {
+                v = rbf(__fmaf_rn(branch, bf(INJ[r * S + s]), v));
+                HOUT[at] = __float2bfloat16_rn(v);
+            }
+            hv[c][s] = v;
+            const float ss = warp_sum(__fmul_rn(v, v));
+            if ((threadIdx.x & 31) == 0) red[c][warp][s] = ss;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < S) {
+        float all = 0.0f;
+        for (int c = 0; c < NC; ++c) {
+            float total = 0.0f;
+            for (int w = 0; w < 8; ++w) total = __fadd_rn(total, red[c][w][threadIdx.x]);
+            PSS[(static_cast<long long>(r) * NC + c) * S + threadIdx.x] = total;
+            all = __fadd_rn(all, total);
+        }
+        rinv[threadIdx.x] = tf_common::rms_scale(all, D, eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const int col = s * D + c * 256 + threadIdx.x;
+            NORM[static_cast<long long>(r) * S * D + col] =
+                __float2bfloat16_rn(__fmul_rn(__fmul_rn(hv[c][s], rinv[s]), SCALE[col]));
+        }""",
+    """    constexpr int D = NC * 256;
+    __shared__ float red[NC][8];
+    __shared__ float rinv_s;
+    const int r = blockIdx.x, s = blockIdx.y, warp = threadIdx.x >> 5;
+    float inj_s = 0.0f;
+    if constexpr (MODE != 0) inj_s = bf(INJ[r * S + s]);
+    float hv[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int d = c * 256 + threadIdx.x;
+        float branch = 0.0f;
+        if constexpr (MODE == 4) {
+            float acc = BR[static_cast<long long>(r) * D + d];
+            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+            branch = rbf(acc);
+        } else if constexpr (MODE == 2) {
+            float acc = 0.0f;
+            for (int k = 0; k <= TOPK; ++k) {
+                const long long at = static_cast<long long>(r) * SLOTS + k;
+                acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+            }
+            branch = rbf(acc);
+        }
+        const long long at = static_cast<long long>(r) * S * D + static_cast<long long>(s) * D + d;
+        float v = bf(H[at]);
+        if constexpr (MODE != 0) {
+            v = rbf(__fmaf_rn(branch, inj_s, v));
+            HOUT[at] = __float2bfloat16_rn(v);
+        }
+        hv[c] = v;
+        const float ss = warp_sum(__fmul_rn(v, v));
+        if ((threadIdx.x & 31) == 0) red[c][warp] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float all = 0.0f;
+        for (int c = 0; c < NC; ++c) {
+            float total = 0.0f;
+            for (int w = 0; w < 8; ++w) total = __fadd_rn(total, red[c][w]);
+            PSS[(static_cast<long long>(r) * NC + c) * S + s] = total;
+            all = __fadd_rn(all, total);
+        }
+        rinv_s = tf_common::rms_scale(all, D, eps);
+    }
+    __syncthreads();
+    const float rv = rinv_s;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int col = s * D + c * 256 + threadIdx.x;
+        NORM[static_cast<long long>(r) * S * D + col] =
+            __float2bfloat16_rn(__fmul_rn(__fmul_rn(hv[c], rv), SCALE[col]));
+    }""",
+)
+
+# Fast SK<=16 zero-SMEM zero-barrier fn_hc_reduce_act_s1 + fused shared_gu reduce/cat SwiGLU + skip dead XSM in fn_hc_dense_mix8
+patch_k(
+    "flashnext_hc.cu",
+    """extern "C" __global__ void __launch_bounds__(1024) fn_hc_reduce_act(const float* __restrict__ PART, __nv_bfloat16* __restrict__ ACT,""",
+    """extern "C" __global__ void __launch_bounds__(384) fn_hc_reduce_act_s1(const float* PART, __nv_bfloat16* __restrict__ ACT,
+                                                                        float* __restrict__ XS, __nv_bfloat16* __restrict__ INJ,
+                                                                        int SK, int M, int S, int LOW, int HAS_INJ, int NDN) {
+    (void)XS;
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.x, i = threadIdx.x;
+    if (i < LOW + (HAS_INJ ? S : 0)) {
+        const long long stride = static_cast<long long>(M) * NDN;
+        const long long base = static_cast<long long>(r) * NDN + i;
+        float acc = PART[base];
+        for (int s = 1; s < SK; ++s) acc = __fadd_rn(acc, PART[base + static_cast<long long>(s) * stride]);
+        const float v = rbf(__fdiv_rn(rbf(acc), static_cast<float>(S)));
+        if (i < LOW) {
+            ACT[static_cast<long long>(r) * LOW + i] = __float2bfloat16_rn(bsilu(v));
+        } else {
+            INJ[static_cast<long long>(r) * S + (i - LOW)] = __float2bfloat16_rn(__fmul_rn(2.0f, bsig(v)));
+        }
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_shared_reduce_swiglu(const float* PART, __nv_bfloat16* __restrict__ ACT,
+                                                                          int M, int W, int SK) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.x, j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j < W) {
+        const int n2 = 2 * W;
+        const long long stride = static_cast<long long>(M) * n2;
+        const long long bg = static_cast<long long>(r) * n2 + j;
+        const long long bu = bg + W;
+        float sg = PART[bg];
+        float su = PART[bu];
+        for (int s = 1; s < SK; ++s) {
+            sg = __fadd_rn(sg, PART[bg + static_cast<long long>(s) * stride]);
+            su = __fadd_rn(su, PART[bu + static_cast<long long>(s) * stride]);
+        }
+        ACT[static_cast<long long>(r) * W + j] = __float2bfloat16_rn(__fmul_rn(bsilu(rbf(sg)), rbf(su)));
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_shared_swiglu_cat(const __nv_bfloat16* GU, __nv_bfloat16* __restrict__ ACT,
+                                                                       int W) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.x, j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j < W) {
+        const long long bg = static_cast<long long>(r) * (2 * W) + j;
+        ACT[static_cast<long long>(r) * W + j] = __float2bfloat16_rn(__fmul_rn(bsilu(bf(GU[bg])), bf(GU[bg + W])));
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(1024) fn_hc_reduce_act(const float* __restrict__ PART, __nv_bfloat16* __restrict__ ACT,""",
+)
+patch_k(
+    "flashnext_hc_dense.cuh",
+    """    MIXED[static_cast<long long>(r) * D + d] = __float2bfloat16_rn(mixed);
+    row[warp][lane] = mixed;""",
+    """    MIXED[static_cast<long long>(r) * D + d] = __float2bfloat16_rn(mixed);
+    if (XSM == nullptr) return;
+    row[warp][lane] = mixed;""",
+)
+
+# Zero-spill fn_shift_window (taps<=3 in scalar regs, eliminating STACK:32) + skip dead xs in fn_gdn_norm & fn_attn_gate
+patch_k(
+    "flashnext_batch.cu",
+    """static __device__ __forceinline__ void shift_window(__nv_bfloat16* __restrict__ win, const __nv_bfloat16* __restrict__ rows,
+                                                   long long stride, int n, int taps, int c) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    __nv_bfloat16 next[16];
+    for (int j = 0; j < taps; ++j) {
+        const int src = j + n;                       // row src of [window (taps rows); new rows]
+        next[j] = src < taps ? win[static_cast<long long>(src) * c + ch]
+                             : rows[static_cast<long long>(src - taps) * stride + ch];
+    }
+    for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
+}""",
+    """static __device__ __noinline__ void shift_window_slow(__nv_bfloat16* __restrict__ win, const __nv_bfloat16* rows,
+                                                      long long stride, int n, int taps, int c, int ch) {
+    __nv_bfloat16 next[16];
+    for (int j = 0; j < taps; ++j) {
+        const int src = j + n;
+        next[j] = src < taps ? win[static_cast<long long>(src) * c + ch]
+                             : rows[static_cast<long long>(src - taps) * stride + ch];
+    }
+    for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
+}
+
+static __device__ __forceinline__ void shift_window(__nv_bfloat16* __restrict__ win, const __nv_bfloat16* rows,
+                                                   long long stride, int n, int taps, int c) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    if (taps == 3) {
+        const __nv_bfloat16 n0 = n < 3 ? win[static_cast<long long>(n) * c + ch] : rows[static_cast<long long>(n - 3) * stride + ch];
+        const __nv_bfloat16 n1 = n + 1 < 3 ? win[static_cast<long long>(n + 1) * c + ch] : rows[static_cast<long long>(n - 2) * stride + ch];
+        const __nv_bfloat16 n2 = n + 2 < 3 ? win[static_cast<long long>(n + 2) * c + ch] : rows[static_cast<long long>(n - 1) * stride + ch];
+        win[ch] = n0;
+        win[static_cast<long long>(c) + ch] = n1;
+        win[static_cast<long long>(2) * c + ch] = n2;
+        return;
+    }
+    if (taps == 2) {
+        const __nv_bfloat16 n0 = n < 2 ? win[static_cast<long long>(n) * c + ch] : rows[static_cast<long long>(n - 2) * stride + ch];
+        const __nv_bfloat16 n1 = n + 1 < 2 ? win[static_cast<long long>(n + 1) * c + ch] : rows[static_cast<long long>(n - 1) * stride + ch];
+        win[ch] = n0;
+        win[static_cast<long long>(c) + ch] = n1;
+        return;
+    }
+    shift_window_slow(win, rows, stride, n, taps, c, ch);
+}""",
+)
+patch_k(
+    "flashnext_batch.cu",
+    """    out[(size_t)r * NV * DV + hv * DV + t] = __float2bfloat16_rn(o);
+    const float gs = warp_sum(o);
+    if (lane == 0) xs[(size_t)r * (NV * DV / 32) + hv * (DV / 32) + warp] = gs;""",
+    """    out[(size_t)r * NV * DV + hv * DV + t] = __float2bfloat16_rn(o);
+    if (xs != nullptr) {
+        const float gs = warp_sum(o);
+        if (lane == 0) xs[(size_t)r * (NV * DV / 32) + hv * (DV / 32) + warp] = gs;
+    }""",
+)
+patch_k(
+    "flashnext_attn.cu",
+    """    OUT[static_cast<long long>(r) * NQ * HD + h * HD + d] = __float2bfloat16_rn(out);
+    const float sum = warp_sum(out);
+    if ((d & 31) == 0) XS[static_cast<long long>(r) * (NQ * HD / 32) + h * (HD / 32) + d / 32] = sum;""",
+    """    OUT[static_cast<long long>(r) * NQ * HD + h * HD + d] = __float2bfloat16_rn(out);
+    if (XS != nullptr) {
+        const float sum = warp_sum(out);
+        if ((d & 31) == 0) XS[static_cast<long long>(r) * (NQ * HD / 32) + h * (HD / 32) + d / 32] = sum;
+    }""",
+)
+
+# Instrument remaining decode .cu/.cuh kernels with non-cascading PDL (wait FIRST, then launch_dependents)
+PDL_SNIP = "\n#if __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n    asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n#endif\n"
 
 def instrument_pdl(rel: str, expect_min: int = 0, only_prefix: str | None = None, stop_marker: str | None = None) -> int:
     p = kdir / rel
@@ -1663,6 +2717,21 @@ def instrument_pdl(rel: str, expect_min: int = 0, only_prefix: str | None = None
 
 instrument_pdl("experts.cu", expect_min=7, only_prefix="plan_")
 instrument_pdl("route_rows.cu", expect_min=4)
+patch_k(
+    "route_rows.cu",
+    """    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif
+
+    tf_router_mma::logits<4, 3, 256>(X, x_ld, W, OUT, M, D, E);""",
+    """    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+#endif
+
+    tf_router_mma::logits<4, 3, 256>(X, x_ld, W, OUT, M, D, E);
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif""",
+)
 instrument_pdl("norms.cu", expect_min=10)
 instrument_pdl("norms_strided.cuh", expect_min=0)
 instrument_pdl("norms_tail.cuh", expect_min=0)
@@ -1672,8 +2741,84 @@ instrument_pdl("embed_affine.cuh", expect_min=0)
 instrument_pdl("flashnext_hc.cu", expect_min=14)
 # Keep static weight CW __restrict__ intact for Zig's build-time hybrid_ple_source.zig adapter
 patch_k("flashnext_hc.cu", "const __nv_bfloat16* CW,", "const __nv_bfloat16* __restrict__ CW,")
+# Move griddepcontrol.launch_dependents to epilogue on heavy HC writeback-norm wrappers and PLE gate to avoid SM-hogging PDL cascades
+for _hc_call in (
+    "hc_writeback_norm<0, 10, 4>(H, nullptr, PSS, nullptr, nullptr, nullptr, nullptr, SCALE, NORM, 0, eps, 0, 1, 1);",
+    "hc_writeback_norm<2, 10, 4>(H, HOUT, PSS, nullptr, INJ, Y, WTS, SCALE, NORM, 0, eps, TOPK, SLOTS, 1);",
+    "hc_writeback_norm<4, 10, 4>(H, HOUT, PSS, BR, INJ, nullptr, nullptr, SCALE, NORM, RS, eps, 0, 1, WORLD);",
+):
+    patch_k(
+        "flashnext_hc.cu",
+        f"""    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif
+
+    {_hc_call}""",
+        f"""    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+#endif
+
+    {_hc_call}
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif""",
+    )
+patch_k(
+    "flashnext_hc.cu",
+    """extern "C" __global__ void __launch_bounds__(512) fn_ple_gate(const __nv_bfloat16* KEYS, const __nv_bfloat16* VALS,
+                                                              const __nv_bfloat16* H, const float* NK,
+                                                              const float* NQ, __nv_bfloat16* __restrict__ GATED,
+                                                              float* __restrict__ PSS, float eps, int D, int S) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif""",
+    """extern "C" __global__ void __launch_bounds__(512) fn_ple_gate(const __nv_bfloat16* KEYS, const __nv_bfloat16* VALS,
+                                                              const __nv_bfloat16* H, const float* NK,
+                                                              const float* NQ, __nv_bfloat16* __restrict__ GATED,
+                                                              float* __restrict__ PSS, float eps, int D, int S) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+#endif""",
+)
+patch_k(
+    "flashnext_hc.cu",
+    """        gss = block_sum_serial(gss, scratch);
+        if (threadIdx.x == 0) PSS[static_cast<long long>(r) * S + s] = gss;
+    }
+}""",
+    """        gss = block_sum_serial(gss, scratch);
+        if (threadIdx.x == 0) PSS[static_cast<long long>(r) * S + s] = gss;
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif
+}""",
+)
 instrument_pdl("flashnext_hc_dense.cuh", expect_min=4)
 instrument_pdl("flashnext_batch.cu", expect_min=14, stop_marker="extern \"C\" __global__ void __launch_bounds__(256) fn_bf16_to_nvfp4(")
+# Move griddepcontrol.launch_dependents to epilogue on heavy GDN recurrent kernels so fn_gdn_norm (432 CTAs) does not steal SMs from fn_gdn_rows_late (384 CTAs)
+for _gdn_call in (
+    "gdn_rows<16, 48>(qn, kn, v, gb, state, state, rows, ys_out);",
+    "gdn_rows<16, 48>(qn, kn, v, gb, state_in, state_out, rows, ys_out);",
+    "gdn_rows_late(qn, log, ctl, log_rows, store_above, state_in, state_out, rows, ys_out);",
+    "gdn_rows<8, 24>(qn, kn, v, gb, state, state, rows, ys_out);",
+    "gdn_rows<8, 24>(qn, kn, v, gb, state_in, state_out, rows, ys_out);",
+):
+    patch_k(
+        "flashnext_batch.cu",
+        f"""    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif
+
+    {_gdn_call}""",
+        f"""    asm volatile("griddepcontrol.wait;\\n" ::: "memory");
+#endif
+
+    {_gdn_call}
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
+#endif""",
+    )
 instrument_pdl("flashnext_gdn_lanes.cuh", expect_min=4)
 instrument_pdl("flashnext_gdn_fused.cuh", expect_min=2)
 instrument_pdl("flashnext_gdn_tpr.cuh", expect_min=2)
@@ -1751,6 +2896,148 @@ pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const
     defer gpa.free(scales);
     encode(bf16, n, k, codes, scales);
     return projection.mxfp8(gpa, driver, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / group, 1, 1, 1 }, .bytes = scales });
+}
+ZIG
+
+  # 2a2. MTP BF16 -> native SM121 NVFP4 encoder (90.0 MB -> 49.1 MB = -40.9 MB/step = -614 MB/round, 100% bit-exact target!)
+  cat > "$fn_dir/cuda_mtp_nvfp4.zig" <<'ZIG'
+//! Re-codes clean high-SNR (20.5-26.0 dB) MTP dense BF16 projections to native SM121 NVFP4 at load.
+const std = @import("std");
+const core = @import("core");
+const cuda = @import("cuda");
+const projection = @import("cuda_projection.zig");
+
+pub fn mode() []const u8 {
+    const raw = std.c.getenv("TF_FLASHNEXT_MTP_NVFP4") orelse return "0";
+    return std.mem.span(raw);
+}
+
+pub fn wantProj(prefix: []const u8) bool {
+    const m = mode();
+    if (std.mem.eql(u8, m, "all")) return std.mem.startsWith(u8, prefix, "language_model.mtp.");
+    if (std.mem.eql(u8, m, "safe")) {
+        return std.mem.eql(u8, prefix, "language_model.mtp.fc_hidden") or
+            (std.mem.startsWith(u8, prefix, "language_model.mtp.layers.0.") and
+                (std.mem.endsWith(u8, prefix, ".o_proj") or std.mem.indexOf(u8, prefix, ".shared_expert.") != null));
+    }
+    if (std.mem.eql(u8, m, "core")) {
+        return std.mem.startsWith(u8, prefix, "language_model.mtp.layers.0.") and
+            (std.mem.endsWith(u8, prefix, ".o_proj") or std.mem.indexOf(u8, prefix, ".shared_expert.") != null);
+    }
+    return false;
+}
+
+pub fn wantHcDown(prefix: []const u8) bool {
+    if (!std.mem.eql(u8, mode(), "all")) return false;
+    // Keep hyper_connection_mixer.down (crest=76.4, 3.38 MB) in MXFP8; attn_hc/mlp_hc.down (crest=14) go to NVFP4.
+    return std.mem.startsWith(u8, prefix, "language_model.mtp.layers.0.");
+}
+
+pub fn wantHcUp(prefix: []const u8) bool {
+    if (!std.mem.eql(u8, mode(), "all")) return false;
+    return std.mem.startsWith(u8, prefix, "language_model.mtp.");
+}
+
+inline fn bf16ToF32(bytes: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16);
+}
+
+inline fn e2m1(v: f32) u8 {
+    const sign: u8 = if (std.math.signbit(v)) 8 else 0;
+    const a = @abs(v);
+    const mag: u8 = if (a < 0.25) 0 else if (a <= 0.75) 1 else if (a < 1.25) 2 else if (a <= 1.75) 3 else if (a < 2.5) 4 else if (a <= 3.5) 5 else if (a < 5.0) 6 else 7;
+    return sign | mag;
+}
+
+const QuantJob = struct {
+    bf16: []const u8,
+    codes: []u8,
+    scales: []u8,
+    global_scale: f32,
+    groups: usize,
+    per: usize,
+
+    fn worker(ctx: *const QuantJob, tid: usize) void {
+        const lo = @min(ctx.groups, tid * ctx.per);
+        const hi = @min(ctx.groups, lo + ctx.per);
+        const inv_g6 = 1.0 / (ctx.global_scale * 6.0);
+        for (lo..hi) |g| {
+            const base = g * 16;
+            var w: [16]f32 = undefined;
+            var mmax: f32 = 0;
+            for (0..16) |j| {
+                const f = bf16ToF32(ctx.bf16, base + j);
+                w[j] = f;
+                mmax = @max(mmax, @abs(f));
+            }
+            const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(mmax * inv_g6, 0.0, 448.0));
+            ctx.scales[g] = sc_code;
+            const sc_val = core.exlr8.codec.e4m3Value(sc_code) * ctx.global_scale;
+            const dst = ctx.codes[g * 8 ..][0..8];
+            if (sc_val == 0) {
+                @memset(dst, 0);
+            } else {
+                const inv = 1.0 / sc_val;
+                for (0..8) |p| {
+                    dst[p] = e2m1(w[2 * p] * inv) | (e2m1(w[2 * p + 1] * inv) << 4);
+                }
+            }
+        }
+    }
+};
+
+pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const u8, n: usize, k: usize) !projection.Projection {
+    if (k % 64 != 0 or bf16.len != n * k * 2) return error.UnexpectedTensor;
+    const count = n * k;
+    var top_bits: u16 = 0;
+    for (0..count) |i| {
+        const u = std.mem.readInt(u16, bf16[i * 2 ..][0..2], .little) & 0x7fff;
+        if (u <= 0x7f80 and u > top_bits) top_bits = u;
+    }
+    const max_abs: f32 = @bitCast(@as(u32, top_bits) << 16);
+    const global_scale: f32 = if (max_abs > 0) max_abs / (6.0 * 448.0) else 1.0;
+
+    const groups = count / 16;
+    const raw_codes = try gpa.alloc(u8, count / 2);
+    defer gpa.free(raw_codes);
+    const raw_scales = try gpa.alloc(u8, groups);
+    defer gpa.free(raw_scales);
+
+    const n_th: usize = if (groups >= 4096) 8 else 1;
+    const job: QuantJob = .{
+        .bf16 = bf16,
+        .codes = raw_codes,
+        .scales = raw_scales,
+        .global_scale = global_scale,
+        .groups = groups,
+        .per = (groups + n_th - 1) / n_th,
+    };
+    if (n_th == 1) {
+        QuantJob.worker(&job, 0);
+    } else {
+        var ths: [8]?std.Thread = @splat(null);
+        for (0..n_th) |ti| ths[ti] = std.Thread.spawn(.{}, QuantJob.worker, .{ &job, ti }) catch null;
+        for (0..n_th) |ti| {
+            if (ths[ti]) |t| t.join() else QuantJob.worker(&job, ti);
+        }
+    }
+
+    const npad = cuda.nvfp4.padded(n);
+    const packed_w = try gpa.alloc(u32, (npad / 64) * (k / 64) * 512);
+    defer gpa.free(packed_w);
+    const packed_s = try gpa.alloc(u8, npad * (k / 16));
+    defer gpa.free(packed_s);
+    cuda.nvfp4.packWords(packed_w, raw_codes, n, k);
+    cuda.nvfp4.packScales(packed_s, raw_scales, n, k);
+
+    var p = projection.Projection.empty(driver);
+    p.w = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(packed_w));
+    errdefer p.w.free();
+    p.s = try cuda.DeviceBuffer.fromHost(driver, packed_s);
+    p.n = n;
+    p.k = k;
+    p.native = cuda.nvfp4.weight(p.w.ptr, p.s.ptr, global_scale, n, k);
+    return p;
 }
 ZIG
 
@@ -2130,10 +3417,13 @@ const Pass2Ctx = struct {
 pub fn pack(gpa: std.mem.Allocator, driver: *const cuda.Driver, t: core.safetensors.Tensor) !projection.Projection {
     if (t.rank != 2 or t.dtype != .bf16 or t.dim(0) == 0 or t.dim(1) == 0 or t.dim(1) % 64 != 0)
         return error.UnexpectedTensor;
-    const n = t.dim(0);
-    const k = t.dim(1);
+    return packRaw(gpa, driver, t.bytes, t.dim(0), t.dim(1));
+}
+
+pub fn packRaw(gpa: std.mem.Allocator, driver: *const cuda.Driver, src_bytes: []const u8, n: usize, k: usize) !projection.Projection {
+    if (n == 0 or k == 0 or k % 64 != 0) return error.UnexpectedTensor;
     const count = try std.math.mul(usize, n, k);
-    if (t.bytes.len != try std.math.mul(usize, count, 2)) return error.UnexpectedTensor;
+    if (src_bytes.len != try std.math.mul(usize, count, 2)) return error.UnexpectedTensor;
 
     const npad = cuda.nvfp4.padded(n);
     const n_tiles = npad / 64;
@@ -2149,7 +3439,7 @@ pub fn pack(gpa: std.mem.Allocator, driver: *const cuda.Driver, t: core.safetens
 
     const n_th: usize = if (n_tiles >= 8) 8 else n_tiles;
     const p1: Pass1Ctx = .{
-        .src = t.bytes,
+        .src = src_bytes,
         .n = n,
         .k = k,
         .kg = kg,
@@ -2193,7 +3483,7 @@ pub fn pack(gpa: std.mem.Allocator, driver: *const cuda.Driver, t: core.safetens
     if (total_esc > 0) {
         const ents = s_words[dir_idx + total_tiles + 1 ..][0..total_esc];
         const p2: Pass2Ctx = .{
-            .src = t.bytes,
+            .src = src_bytes,
             .n = n,
             .k = k,
             .kg = kg,
@@ -2855,6 +4145,7 @@ patch_exact(
     half_below: usize = half_below_default,
     shared_down: [4]Function = undefined,
     shared_down_bf12: [4]Function = undefined,
+    bf12_s2: [2]Function = undefined, // Out (bf16/f32), BM=16 BN=64 STAGES=2 plain (5 CTAs/SM for short-K per<=12)
     fuse_s: [3][2][2]Function = undefined, // by halfModeIndex, Out, bm=16/32 (PR #3475)
     fuse_split_n: usize = 0,
     pdl: bool = false,
@@ -2893,6 +4184,12 @@ patch_exact(
             try f.allowDynamicShared(sharedBytes(mode, bm));
             l.fuse_s[mi][oi][bi] = f;
         };
+        inline for (.{ false, true }, 0..) |wide, oi| {
+            const sym = std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi5ELi16ELi64ELi1ELi4ELi2ELb{d}ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(wide)});
+            const f = try mod.function(sym);
+            try f.allowDynamicShared(2 * 8320);
+            l.bf12_s2[oi] = f;
+        };
         l.half_below = try halfBelow();
         if (std.c.getenv("TF_FLASHNEXT_FUSED_SPLIT")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "1")) l.fuse_split_n = 2048;
@@ -2930,7 +4227,13 @@ patch_exact(
 )
 patch_exact(
     cdir, "qmmf.zig",
-    """        const prompt = l.usesPrompt(m, w);
+    """    /// matmul() writing y as `out` says: bf16, or fp32.
+    pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+        const p = planFor(m, w, l.clusters);
+        if (p.reduce and part == 0) return error.MissingLanePart;
+        const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
+        const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
+        const prompt = l.usesPrompt(m, w);
         const k32 = prompt and p.sk == 1 and l.prompt_k32 != null;
         const bm: usize = if (prompt) 128 else p.bm;
         const rows_t = (m + bm - 1) / bm;
@@ -2958,14 +4261,44 @@ patch_exact(
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
             .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster) .{ .x = 1, .y = 1, .z = p.sk } else null,
-        }, s, &args);""",
-    """        const prompt = l.usesPrompt(m, w);
+        }, s, &args);
+        if (p.reduce) {
+            const total: usize = m * w.n;
+            var r: launch_.Args = .{};
+            r.add(part);
+            r.add(y);
+            r.add(@as(i64, @intCast(total)));
+            r.add(@as(i32, @intCast(p.sk)));
+            r.add(w.scale);
+            try launch_.launch(l.reduce[@backingInt(out)], .{
+                .grid = .{ .x = @intCast((total + 255) / 256), .y = 1, .z = 1 },
+                .block = .{ .x = 256, .y = 1, .z = 1 },
+            }, s, &r);
+        }
+    }""",
+    """    /// matmul() writing y as `out` says: bf16, or fp32.
+    pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+        _ = try l.matmulOutImpl(s, x, ldx, m, w, y, out, part, true, false);
+    }
+
+    /// Launch matmul leaving split-K FP32 partials in `part` (skipping reduce_kernel) and returning slice count (1 if already reduced in `y`).
+    pub fn matmulRawPart(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64, allow_cluster: bool) !usize {
+        return l.matmulOutImpl(s, x, ldx, m, w, y, out, part, allow_cluster, true);
+    }
+
+    fn matmulOutImpl(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64, allow_cluster: bool, skip_reduce: bool) !usize {
+        const p = planFor(m, w, l.clusters and allow_cluster);
+        if (p.reduce and part == 0) return error.MissingLanePart;
+        const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
+        const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
+        const prompt = allow_cluster and l.usesPrompt(m, w);
         const k32 = prompt and w.mode == .bf16 and p.sk == 1 and l.prompt_k32 != null;
         const bm: usize = if (prompt) 128 else p.bm;
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
         const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
+        const use_s2 = w.mode == .bf12 and !prompt and !half and !fs and !p.fused and !p.cluster and p.bm == 16 and (w.k / group) / p.sk <= 12;
         const f = if (k32)
             l.prompt_k32.?[@backingInt(out)]
         else if (prompt)
@@ -2976,6 +4309,8 @@ patch_exact(
             (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)])
         else if (p.fused)
             set[6]
+        else if (use_s2)
+            l.bf12_s2[@backingInt(out)]
         else
             set[ti * 2 + @intFromBool(p.cluster)];
         const cols: usize = if (prompt) 128 else if (half) 32 else bn;
@@ -2997,22 +4332,27 @@ patch_exact(
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
+            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else if (use_s2) 2 * 8320 else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
             .pdl = l.pdl and !prompt,
-        }, s, &args);""",
-)
-patch_exact(
-    cdir, "qmmf.zig",
-    """            try launch_.launch(l.reduce[@backingInt(out)], .{
-                .grid = .{ .x = @intCast((total + 255) / 256), .y = 1, .z = 1 },
-                .block = .{ .x = 256, .y = 1, .z = 1 },
-            }, s, &r);""",
-    """            try launch_.launch(l.reduce[@backingInt(out)], .{
+        }, s, &args);
+        if (p.reduce) {
+            if (skip_reduce) return p.sk;
+            const total: usize = m * w.n;
+            var r: launch_.Args = .{};
+            r.add(part);
+            r.add(y);
+            r.add(@as(i64, @intCast(total)));
+            r.add(@as(i32, @intCast(p.sk)));
+            r.add(w.scale);
+            try launch_.launch(l.reduce[@backingInt(out)], .{
                 .grid = .{ .x = @intCast((total + 255) / 256), .y = 1, .z = 1 },
                 .block = .{ .x = 256, .y = 1, .z = 1 },
                 .pdl = l.pdl,
-            }, s, &r);""",
+            }, s, &r);
+        }
+        return 1;
+    }""",
 )
 
 patch_exact(
@@ -3091,15 +4431,17 @@ patch_exact(
     if (t.rank != 2 or t.dtype != .bf16 or t.dim(0) == 0 or t.dim(1) == 0 or t.dim(1) % 64 != 0)""",
 )
 
-# 5c. cuda_projection_load.zig + cuda_prompt_wt.zig: MTP BF16 projections and MTP HC mixers -> MXFP8
+# 5c. cuda_projection_load.zig + cuda_prompt_wt.zig: MTP BF16 projections and MTP HC mixers -> NVFP4 (TF_FLASHNEXT_MTP_NVFP4) or MXFP8
 for storage, original in (
     ("t.bytes", "            return projection.dense(a, d, t);"),
     ("bytes", "        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });"),
 ):
     indent = original[:len(original) - len(original.lstrip())]
+    fp4_check = f'if (@import("cuda_mtp_nvfp4.zig").wantProj(prefix))'
+    fp4_proj = f'return @import("cuda_mtp_nvfp4.zig").project(a, d, {storage}, n, k);'
     check = 'if (std.mem.startsWith(u8, prefix, "language_model.mtp."))'
     project = f'return @import("cuda_mtp_mxfp8.zig").project(a, d, {storage}, n, k);'
-    patch_exact(root, "cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
+    patch_exact(root, "cuda_projection_load.zig", original, f"{indent}{fp4_check}\n{indent}    {fp4_proj}\n{indent}{check}\n{indent}    {project}\n{original}")
 
 patch_exact(
     root, "cuda_prompt_wt.zig",
@@ -3109,14 +4451,20 @@ patch_exact(
     if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
     var uq = try projection.dense(gpa, driver, up);""",
     """    const mtp_mx = std.mem.startsWith(u8, prefix, "language_model.mtp.");
-    var dq = if (mtp_mx)
+    const mtp_fp4_down = @import("cuda_mtp_nvfp4.zig").wantHcDown(prefix);
+    const mtp_fp4_up = @import("cuda_mtp_nvfp4.zig").wantHcUp(prefix);
+    var dq = if (mtp_fp4_down)
+        try @import("cuda_mtp_nvfp4.zig").project(gpa, driver, data, n, wide)
+    else if (mtp_mx)
         try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, data, n, wide)
     else
         try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
     errdefer dq.free();
     const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
     if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
-    var uq = if (mtp_mx)
+    var uq = if (mtp_fp4_up)
+        try @import("cuda_mtp_nvfp4.zig").project(gpa, driver, up.bytes, wide, low)
+    else if (mtp_mx)
         try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, up.bytes, wide, low)
     else
         try projection.dense(gpa, driver, up);""",
@@ -3394,13 +4742,163 @@ patch_exact(
                 }
             }
         }""",
-    """        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+    """        const MtpChainCtl = extern struct {
+            c: f64,
+            ext_enter: f64,
+            ext_stay: f64,
+            ext_tok: f64,
+            start_pos: i32,
+            max_steps: i32,
+            vocab_n: i32,
+            pad: i32,
+        };
+
+        const MtpChainOut = extern struct {
+            product: f64,
+            probs: [16]f64,
+            tokens: [16]u32,
+            n: i32,
+            drafted: i32,
+            err: i32,
+            pad: i32,
+        };
+
+        fn whileEnabled() bool {
+            const raw = std.c.getenv("TF_FLASHNEXT_MTP_WHILE") orelse return true;
+            return !std.mem.eql(u8, std.mem.span(raw), "0");
+        }
+
+        fn buildWhileGraph(o: Self, d: *Draft, s: *parts.Scratch, score_rows: u64, vocab_ids_ptr: u64) !cuda.graph.Exec {
+            const e = o.e;
+            const h = o.h;
+            const st = o.stream();
+            var ctx: cuda.abi.Context = null;
+            try st.d.check(st.d.api.cuCtxGetCurrent(&ctx), "cuCtxGetCurrent");
+            var root_g = try cuda.graph.Graph.init(st.d);
+            defer root_g.deinit();
+            const handle = try root_g.createConditionalHandle(ctx, 0, cuda.abi.graph_cond_assign_default);
+            var ia: cuda.Args = .{};
+            ia.add(d.best.ptr);
+            ia.add(vocab_ids_ptr);
+            ia.add(s.ids);
+            ia.add(s.pos);
+            ia.add(h.while_ctl_dev.ptr);
+            ia.add(h.while_out_dev.ptr);
+            ia.add(handle);
+            const init_node = try root_g.addKernel(&.{}, h.chain_init_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, &ia);
+            const while_res = try root_g.addWhileNode(&.{init_node}, handle, ctx);
+
+            var p: batch.Pass(Tri) = .{
+                .gpa = e.gpa,
+                .io = e.io,
+                .stream = st,
+                .tri = o.tri,
+                .k = &e.batch_k,
+                .s = s,
+                .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .layers = (&h.layer)[0..1], .mixer = h.mixer, .head = h.draft, .ngram = &e.ngram },
+                .seq = .{ .media = d.media, .conv = &.{}, .state = &.{}, .kc = (&d.kc)[0..1], .vc = (&d.vc)[0..1], .ikc = (&d.ikc)[0..1], .pooled = (&d.pooled)[0..1], .pg = d.pg, .tail = d.kc, .history = &d.unused_history, .cap = d.cap, .scores = score_rows },
+                .hooks = .{ .logits = .none },
+                .rows = 1,
+                .pos0 = d.len,
+            };
+            const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = d.out.ptr, .m = 1, .last = true, .score = true };
+
+            try cuda.graph.beginCaptureToGraph(st, while_res.body, .thread_local);
+            const cap_err: ?anyerror = blk: {
+                one.run() catch |err| break :blk err;
+                var sa: cuda.Args = .{};
+                sa.add(d.best.ptr);
+                sa.add(vocab_ids_ptr);
+                sa.add(s.ids);
+                sa.add(s.pos);
+                sa.add(h.while_ctl_dev.ptr);
+                sa.add(h.while_out_dev.ptr);
+                sa.add(handle);
+                cuda.launch.launch(h.chain_step_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 }, .pdl = false }, st, &sa) catch |err| break :blk err;
+                break :blk null;
+            };
+            if (cap_err) |err| {
+                cuda.graph.endCaptureToGraph(st) catch {};
+                return err;
+            }
+            try cuda.graph.endCaptureToGraph(st);
+
+            var exec = try root_g.instantiate();
+            errdefer exec.deinit();
+            try exec.upload(st);
+            return exec;
+        }
+
+        fn draftWhile(o: Self, d: *Draft, max_steps: usize, confidence: f64, out: *Chain) !bool {
+            const wg = @import("cuda_window_graph.zig");
+            const e = o.e;
+            if (e.graphs.head_while.off) return false;
+            const h = o.h;
+            const st = o.stream();
+            const s = try e.reserve(plan.reserveRows(1));
+            const piece = @max(@as(usize, 1), @min(piece_rows, s.cap / 2));
+            const score_rows = try e.reserveScores(d.cap, piece);
+            const vocab_ids_ptr = h.w2.vocab_ids.?.ptr;
+            const key = wg.HeadWhileKey.init(d, s, score_rows, vocab_ids_ptr, h.while_ctl_dev.ptr, h.while_out_dev.ptr);
+            const exec_ptr = e.graphs.head_while.find(key) orelse blk: {
+                const exec = o.buildWhileGraph(d, s, score_rows, vocab_ids_ptr) catch |err| {
+                    std.log.warn("head_while graphs off: capture failed ({s}), falling back to CPU loop", .{@errorName(err)});
+                    e.graphs.head_while.off = true;
+                    return false;
+                };
+                break :blk e.graphs.head_while.put(key, exec);
+            };
+
+            const stop_cfg = mtp.Stop.init(confidence);
+            const ctl: MtpChainCtl = .{
+                .c = stop_cfg.c,
+                .ext_enter = stop_cfg.ext_enter,
+                .ext_stay = stop_cfg.ext_stay,
+                .ext_tok = stop_cfg.ext_tok,
+                .start_pos = @intCast(d.len),
+                .max_steps = @intCast(max_steps),
+                .vocab_n = @intCast(h.ids.len),
+                .pad = 0,
+            };
+            @memcpy(h.while_ctl_host.bytes[0..@sizeOf(MtpChainCtl)], std.mem.asBytes(&ctl));
+            {
+                errdefer st.synchronize() catch {};
+                try st.d.check(st.d.api.cuMemcpyHtoDAsync_v2(h.while_ctl_dev.ptr, h.while_ctl_host.bytes.ptr, @sizeOf(MtpChainCtl), st.handle), "cuMemcpyHtoDAsync");
+                try exec_ptr.launchOn(st);
+                try st.d.check(st.d.api.cuMemcpyDtoHAsync_v2(h.while_out_host.bytes.ptr, h.while_out_dev.ptr, @sizeOf(MtpChainOut), st.handle), "cuMemcpyDtoHAsync");
+                try st.synchronize();
+            }
+
+            const out_host = std.mem.bytesToValue(MtpChainOut, h.while_out_host.bytes[0..@sizeOf(MtpChainOut)]);
+            if (out_host.drafted < 0 or out_host.drafted > max_chain) return error.ProposalNonfinite;
+            const drafted: usize = @intCast(out_host.drafted);
+            d.len += drafted;
+            d.drafted += drafted;
+            if (out_host.err != 0 or out_host.n < 0 or out_host.n > max_chain) return error.ProposalNonfinite;
+            const n: usize = @intCast(out_host.n);
+            out.n = n;
+            for (0..n) |i| {
+                out.tokens[i] = out_host.tokens[i];
+                out.probs[i] = out_host.probs[i];
+            }
+            for (0..drafted) |i| {
+                if (i < n) o.e.ngram.warmToken(&d.draft_hist, out.tokens[i]);
+            }
+            return true;
+        }
+
+        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
+            const max_steps = @min(count, max_chain);
+            const wg = @import("cuda_window_graph.zig");
+            if (whileEnabled() and !mtp.isSampled(sm) and o.h.w2.ready() and o.main == null and d.media == null and o.e.collective == null and max_steps > 1 and wg.enabled() and d.len + max_steps - 1 <= d.cap and std.meta.eql(wg.Geometry.at(d.len + 1, d.cap), wg.Geometry.at(d.len + max_steps - 1, d.cap))) {
+                if (try o.draftWhile(d, max_steps, confidence, out)) return;
+            }
             var stop: mtp.Stop = mtp.Stop.init(confidence);
             var j: usize = 0;
-            while (j < @min(count, max_chain)) : (j += 1) {
+            while (j < max_steps) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
                 const t = stop.take(j, got.prob);
                 if (!t.propose) break;
@@ -3432,7 +4930,91 @@ patch_exact(
 patch_exact(
     root, "cuda_batch_hc.zig",
     "    return n >= 64 and hc_w.down.native != null",
-    "    return n >= 48 and hc_w.down.native != null",
+    "    return n >= 8 and hc_w.down.native != null",
+)
+patch_exact(
+    root, "cuda_batch_hc.zig",
+    """    const act = s.act + r0 * low * 2;
+    const xs_act = s.xs_act + r0 * (low / 32) * 4;
+    const down = hc_w.down.native orelse return error.UnexpectedTensor;
+    const up = hc_w.up.native orelse return error.UnexpectedTensor;
+    if (n * hc_w.n_down * 4 > s.hc_part_bytes) return error.UnexpectedTensor; // one slice within hc_part (hcPartRows)
+    try pass.k.nativeMatmul(pass.stream, norm, wide, n, down, s.hc_part, s.native_part, .f32);
+    const inj_ptr = if (hc_w.has_inj == 1) inj else act;
+    try pass.tri.hcReduceAct(s.hc_part, act, xs_act, inj_ptr, 1, n, streams, low, hc_w.n_down, hc_w.has_inj);
+    try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
+    try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n, dims, streams);""",
+    """    const act = s.act + r0 * low * 2;
+    const down = hc_w.down.native orelse return error.UnexpectedTensor;
+    const up = hc_w.up.native orelse return error.UnexpectedTensor;
+    if (n * hc_w.n_down * 4 > s.hc_part_bytes) return error.UnexpectedTensor; // one slice within hc_part (hcPartRows)
+    const hc_sk = try pass.k.native_lane.matmulRawPart(pass.stream, norm, wide, n, down, s.hc_part, .f32, s.native_part, true);
+    const part_src = if (hc_sk > 1) s.native_part else s.hc_part;
+    const inj_ptr = if (hc_w.has_inj == 1) inj else act;
+    try pass.tri.hcReduceAct(part_src, act, 0, inj_ptr, hc_sk, n, streams, low, hc_w.n_down, hc_w.has_inj);
+    try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
+    const xsm_ptr: u64 = if (hc_w.has_inj == 1) 0 else s.xsm + r0 * (dims / 32) * 4;
+    try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, xsm_ptr, n, dims, streams);""",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    "    shared_swiglu: cuda.Function,\n    shared_scatter: cuda.Function,\n    down: cuda.Function,\n    reduce_act: cuda.Function,",
+    "    shared_swiglu: cuda.Function,\n    shared_reduce_swiglu: cuda.Function,\n    shared_swiglu_cat: cuda.Function,\n    shared_scatter: cuda.Function,\n    down: cuda.Function,\n    reduce_act: cuda.Function,\n    reduce_act_s1: cuda.Function,",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    "            .shared_swiglu = try g.hc.function(\"fn_shared_swiglu\"),\n            .shared_scatter = try g.hc.function(\"fn_shared_scatter\"),\n            .down = try g.hc.function(\"fn_hc_down\"),\n            .reduce_act = try g.hc.function(\"fn_hc_reduce_act\"),",
+    "            .shared_swiglu = try g.hc.function(\"fn_shared_swiglu\"),\n            .shared_reduce_swiglu = try g.hc.function(\"fn_shared_reduce_swiglu\"),\n            .shared_swiglu_cat = try g.hc.function(\"fn_shared_swiglu_cat\"),\n            .shared_scatter = try g.hc.function(\"fn_shared_scatter\"),\n            .down = try g.hc.function(\"fn_hc_down\"),\n            .reduce_act = try g.hc.function(\"fn_hc_reduce_act\"),\n            .reduce_act_s1 = try g.hc.function(\"fn_hc_reduce_act_s1\"),",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    """    pub fn sharedSwiGLU(g: *const Glue, s: cuda.Stream, gate: u64, up: u64, act: u64, rows: usize, width: usize) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ gate, up, act });
+        ints(&a, &.{width});
+        try go(g.f.shared_swiglu, s, .{ rows, cdiv(width, 256), 1 }, 256, 0, &a);
+    }""",
+    """    pub fn sharedSwiGLU(g: *const Glue, s: cuda.Stream, gate: u64, up: u64, act: u64, rows: usize, width: usize) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ gate, up, act });
+        ints(&a, &.{width});
+        try go(g.f.shared_swiglu, s, .{ rows, cdiv(width, 256), 1 }, 256, 0, &a);
+    }
+
+    pub fn sharedReduceSwiGLU(g: *const Glue, s: cuda.Stream, part: u64, act: u64, rows: usize, width: usize, sk: usize) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ part, act });
+        ints(&a, &.{ rows, width, sk });
+        try go(g.f.shared_reduce_swiglu, s, .{ rows, cdiv(width, 256), 1 }, 256, 0, &a);
+    }
+
+    pub fn sharedSwiGLUCat(g: *const Glue, s: cuda.Stream, gu: u64, act: u64, rows: usize, width: usize) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ gu, act });
+        ints(&a, &.{width});
+        try go(g.f.shared_swiglu_cat, s, .{ rows, cdiv(width, 256), 1 }, 256, 0, &a);
+    }""",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    "        try go(g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);",
+    "        try go(if (sk <= 16 and xs == 0 and cols <= 384) g.f.reduce_act_s1 else g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    "        const grid: [3]usize = .{ rows, 1, 1 };",
+    "        const grid: [3]usize = .{ rows, 4, 1 };",
+)
+# Issue #3681: keep clusters for sk<=4 only; run sk=8 (out_proj/o_proj/hc_down) as full-GPU plain split-K + PDL reduce
+patch_exact(
+    cdir, "qmmf.zig",
+    "    const cluster = !fused and sk > 1 and sk <= 8 and clusters;",
+    "    const cluster = !fused and sk > 1 and sk <= 4 and clusters;",
+)
+patch_exact(
+    root, "cuda_prompt.zig",
+    ".lane_reduce = !e.batch_k.native_lane.clusters };",
+    ".lane_reduce = true };",
 )
 patch_exact(
     root, "cuda_mtp.zig",
@@ -3500,12 +5082,12 @@ pub const Stop = struct {
 patch_exact(
     root, "cuda_mtp.zig",
     "    topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)",
-    "    topk_fn: cuda.Function,\n    argmax_fn: cuda.Function,\n    w2: @import(\"cuda_mtp_w2.zig\").W2 = .{},",
+    "    topk_fn: cuda.Function,\n    argmax_fn: cuda.Function,\n    chain_init_fn: cuda.Function,\n    chain_step_fn: cuda.Function,\n    while_ctl_dev: cuda.DeviceBuffer,\n    while_out_dev: cuda.DeviceBuffer,\n    while_ctl_host: cuda.HostBuffer,\n    while_out_host: cuda.HostBuffer,\n    w2: @import(\"cuda_mtp_w2.zig\").W2 = .{},",
 )
 patch_exact(
     root, "cuda_mtp.zig",
     "        h.best_fn = try h.module.function(\"fn_row_best\");\n        h.topk_fn = try h.module.function(\"fn_row_topk\");",
-    "        h.best_fn = try h.module.function(\"fn_row_best\");\n        h.topk_fn = try h.module.function(\"fn_row_topk\");\n        h.argmax_fn = try h.module.function(\"fn_row_argmax\");",
+    "        h.best_fn = try h.module.function(\"fn_row_best\");\n        h.topk_fn = try h.module.function(\"fn_row_topk\");\n        h.argmax_fn = try h.module.function(\"fn_row_argmax\");\n        h.chain_init_fn = try h.module.function(\"fn_mtp_chain_init\");\n        h.chain_step_fn = try h.module.function(\"fn_mtp_chain_step\");",
 )
 patch_exact(
     root, "cuda_mtp.zig",
@@ -3551,12 +5133,12 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp.zig",
     "        h.draw_batch = try @import(\"cuda_draw_batch.zig\").Batch.init(gpa, driver, batch_on, h.ids.len);\n        return h;",
-    "        h.draw_batch = try @import(\"cuda_draw_batch.zig\").Batch.init(gpa, driver, batch_on, h.ids.len);\n        errdefer h.draw_batch.deinit(gpa);\n        h.w2 = try @import(\"cuda_mtp_w2.zig\").W2.init(gpa, driver, &store, &h.artifact, &h.module);\n        return h;",
+    "        h.draw_batch = try @import(\"cuda_draw_batch.zig\").Batch.init(gpa, driver, batch_on, h.ids.len);\n        errdefer h.draw_batch.deinit(gpa);\n        h.w2 = try @import(\"cuda_mtp_w2.zig\").W2.init(gpa, driver, &store, &h.artifact, &h.module);\n        errdefer h.w2.deinit();\n        h.while_ctl_dev = try cuda.DeviceBuffer.alloc(driver, 64);\n        errdefer h.while_ctl_dev.free();\n        h.while_out_dev = try cuda.DeviceBuffer.alloc(driver, 256);\n        errdefer h.while_out_dev.free();\n        h.while_ctl_host = try cuda.HostBuffer.alloc(driver, 64);\n        errdefer h.while_ctl_host.free();\n        h.while_out_host = try cuda.HostBuffer.alloc(driver, 256);\n        return h;",
 )
 patch_exact(
     root, "cuda_mtp.zig",
     "    pub fn deinit(h: *Head) void {\n        h.draw_batch.deinit(h.gpa);",
-    "    pub fn deinit(h: *Head) void {\n        h.w2.deinit();\n        h.draw_batch.deinit(h.gpa);",
+    "    pub fn deinit(h: *Head) void {\n        h.while_out_host.free();\n        h.while_ctl_host.free();\n        h.while_out_dev.free();\n        h.while_ctl_dev.free();\n        h.w2.deinit();\n        h.draw_batch.deinit(h.gpa);",
 )
 patch_exact(
     root, "cuda_mtp_pieces.zig",
@@ -3629,12 +5211,12 @@ patch_exact(
 patch_exact(
     root, "cuda_batch_kernels.zig",
     "    select: cuda.Function,\n    select_lanes: cuda.Function,",
-    "    select: cuda.Function,\n    select_lanes: cuda.Function,\n    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,",
+    "    select: cuda.Function,\n    select_lanes: cuda.Function,\n    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,",
 )
 patch_exact(
     root, "cuda_batch_kernels.zig",
     "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        return k;",
-    "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        k.head_topk_floor = try k.batch.function(\"fn_head_topk_floor\");\n        k.head_rescore = try k.batch.function(\"fn_head_rescore\");\n        return k;",
+    "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        k.head_topk_floor = try k.batch.function(\"fn_head_topk_floor\");\n        k.head_rescore = try k.batch.function(\"fn_head_rescore\");\n        k.head_rescore_best = try k.batch.function(\"fn_head_rescore_best\");\n        return k;",
 )
 patch_exact(
     root, "cuda_batch_head.zig",
@@ -3647,27 +5229,87 @@ patch_exact(
         if (self.m.head.b.ptr != 0) if (self.m.head.native) |nw| if (nw.mode == .fp4) {
             const k_top: usize = 64;
             if (n * k_top * 4 > s.cap * (wt.experts_n + 1) * 4) return error.UnexpectedTensor;
+            const direct = self.hooks.best_out != 0;
             var a1: cuda.Args = .{};
             a1.add(out);
             a1.add(@as(c_int, vocab));
             a1.add(@as(c_longlong, vocab));
             a1.add(@as(c_int, k_top));
             a1.add(s.router_l);
+            a1.add(@as(c_int, if (direct) 1 else 0));
             try cuda.launch.launch(self.k.head_topk_floor, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 }, .pdl = true }, self.stream, &a1);
             var a2: cuda.Args = .{};
             a2.add(s.mixed);
             a2.add(self.m.head.b.ptr);
             a2.add(s.router_l);
-            a2.add(out);
-            a2.add(@as(c_int, vocab));
-            a2.add(@as(c_int, k_top));
-            try cuda.launch.launch(self.k.head_rescore, .{ .grid = .{ .x = @intCast((k_top + 7) / 8), .y = @intCast(n) }, .block = .{ .x = 256 }, .pdl = true }, self.stream, &a2);
+            if (direct) {
+                a2.add(self.hooks.best_out);
+                a2.add(@as(c_int, vocab));
+                a2.add(@as(c_int, k_top));
+                try cuda.launch.launch(self.k.head_rescore_best, .{ .grid = .{ .x = 1, .y = @intCast(n) }, .block = .{ .x = 1024 }, .pdl = true }, self.stream, &a2);
+            } else {
+                a2.add(out);
+                a2.add(@as(c_int, vocab));
+                a2.add(@as(c_int, k_top));
+                try cuda.launch.launch(self.k.head_rescore, .{ .grid = .{ .x = @intCast((k_top + 7) / 8), .y = @intCast(n) }, .block = .{ .x = 256 }, .pdl = true }, self.stream, &a2);
+            }
         };
         return;
     }""",
 )
 
-# 5i. cuda_window_graph.zig: 4-way LRU cache per shape slot to eliminate state-swap & streams/out re-recording
+# 5i. cuda_window_graph.zig + cuda_lanes.zig: sound cross-request graph reuse (hash all real pointers/pg instead of seq.gen/d.gen),
+#     512-slot 8-way LRU cache, immediate capture on single-stream Key/HeadKey/RollbackKey, and 1024-token pooled cap bucketing.
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "const max_graphs = 128;",
+    "const max_graphs = 512;",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "        h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams });",
+    "        h.values(&[_]u64{ seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.best_out, hooks.streams });",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "        h.values(&[_]u64{ d.gen, d.cap, d.kc.ptr, input, d.out.ptr, d.dlogits.ptr, s.h, s.cap, score_rows });",
+    "        h.values(&[_]u64{ d.cap, d.kc.ptr, d.vc.ptr, d.ikc.ptr, d.pooled.ptr, d.pg.pt, @as(u64, @bitCast(d.pg.ps)), @as(u64, @as(u32, @bitCast(d.pg.ptok))), input, d.out.ptr, d.dlogits.ptr, d.best.ptr, s.h, s.cap, score_rows });",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "            h.values(&[_]u64{ l.seq.gen, pieces(l.seq), l.seq.cap, l.streams, l.logits });",
+    "            h.values(&[_]u64{ pieces(l.seq), l.seq.cap, l.streams, l.logits });",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "            h.values(&[_]u64{ d.gen, d.kc.ptr, d.cap, input, d.out.ptr, d.dlogits.ptr });",
+    "            h.values(&[_]u64{ d.kc.ptr, d.vc.ptr, d.ikc.ptr, d.pooled.ptr, d.pg.pt, @as(u64, @bitCast(d.pg.ps)), @as(u64, @as(u32, @bitCast(d.pg.ptok))), d.cap, input, d.out.ptr, d.dlogits.ptr, d.best.ptr });",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    "        h.values(&[_]u64{ seq.gen, d.gen, seq.tail.ptr, d.saved.ptr, s.h, s.cap });",
+    "        h.values(&[_]u64{ seq.tail.ptr, d.saved.ptr, s.h, s.cap });",
+)
+patch_exact(
+    root, "cuda_lanes.zig",
+    """                // a window's rows past the reply's last token (its drafts) still need cache slots
+                const cap = @min(ids.len + s.max_new + (if (drafting) mtp.max_rows else 0), prompt.max_tokens);
+                const from = self.kv.choose();""",
+    """                // a window's rows past the reply's last token (its drafts) still need cache slots
+                const raw_cap = @min(ids.len + s.max_new + (if (drafting) mtp.max_rows else 0), prompt.max_tokens);
+                const from = self.kv.choose();
+                const cap = blk: {
+                    if (from == .pool) {
+                        if (self.kv.pool) |pool| {
+                            const lim = @min(self.context + (if (drafting) mtp.max_rows else 0), prompt.max_tokens);
+                            const aligned = @min(((raw_cap + 1023) / 1024) * 1024, lim);
+                            if (aligned >= raw_cap and pool.fits(aligned)) break :blk aligned;
+                        }
+                    }
+                    break :blk raw_cap;
+                };""",
+)
+
 old_cache = """pub fn Cache(comptime K: type) type {
     return struct {
         const Self = @This();
@@ -3721,7 +5363,8 @@ old_cache = """pub fn Cache(comptime K: type) type {
 new_cache = """pub fn Cache(comptime K: type) type {
     return struct {
         const Self = @This();
-        const ways = 4;
+        const ways = 8;
+        const skip_seen = (K == Key or K == HeadKey or K == RollbackKey);
         const Entry = struct { key: K, exec: cuda.graph.Exec, stamp: u64 };
         const Bucket = struct { items: [ways]?Entry = @splat(null) };
         map: std.AutoHashMapUnmanaged(K, Bucket) = .empty,
@@ -3777,7 +5420,7 @@ new_cache = """pub fn Cache(comptime K: type) type {
                 return b.items[lru].?.exec.launchOn(stream);
             }
             if (c.map.count() >= max_graphs or c.seen.count() >= 4 * max_graphs) c.clear(gpa);
-            if (!c.seen.contains(slot)) {
+            if (!skip_seen and !c.seen.contains(slot)) {
                 try c.seen.put(gpa, slot, {});
                 return pass.run();
             }
@@ -3793,7 +5436,112 @@ new_cache = """pub fn Cache(comptime K: type) type {
 
 patch_exact(root, "cuda_window_graph.zig", old_cache, new_cache)
 
-# 5j. Enable SM121 PDL across nvfp4_experts, grouped router, route_rows, norms, embed_rows, glue, batch, and mtp launches
+# 5j. Trial 29: shared-expert skip in plan_kernel, paced SM121 TMA L2 prefetch on main BF12 out_proj/o_proj only, 1-warp route_topk, and PDL launches
+patch_exact(
+    root, "cuda_moe_native.zig",
+    "    // the rank's experts and one skip id past them (the shared slot at world 1; every other rank's pick at --tp)\n    const e = owned.count + 1;",
+    "    // World-1 NVFP4 skips the shared expert slot (== owned.count) directly inside plan_kernel.\n    const e = if (native.world == 1 and owned.format == .nvfp4) owned.count else owned.count + 1;",
+)
+# 5l. Trial 37: Fused non-clustered shared_expert gate_up + zero-write greedy lm_head direct-argmax
+patch_exact(
+    root, "cuda_batch_kernels.zig",
+    "    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,",
+    "    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,\n    l2_prefetch2_paced: cuda.Function,\n    l2pf_mb: usize = 10,\n    l2pf_pace_gbps: usize = 165,",
+)
+patch_exact(
+    root, "cuda_batch_kernels.zig",
+    "        k.head_topk_floor = try k.batch.function(\"fn_head_topk_floor\");\n        k.head_rescore = try k.batch.function(\"fn_head_rescore\");\n        k.head_rescore_best = try k.batch.function(\"fn_head_rescore_best\");\n        return k;",
+    """        k.head_topk_floor = try k.batch.function("fn_head_topk_floor");
+        k.head_rescore = try k.batch.function("fn_head_rescore");
+        k.head_rescore_best = try k.batch.function("fn_head_rescore_best");
+        k.l2_prefetch2_paced = try k.batch.function("fn_l2_prefetch2_paced");
+        k.l2pf_mb = if (std.c.getenv("TF_FLASHNEXT_L2PF_MB")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 10) else 10;
+        k.l2pf_pace_gbps = if (std.c.getenv("TF_FLASHNEXT_L2PF_PACE_GBPS")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 165) else 165;
+        return k;""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """        pub fn gdnBlock(self: *Self, lw: *const Layer, layer: usize, li: usize, keep: LayerKeep) !void {
+            const s = self.s;
+            const n = self.rows;
+            const h = lw.heads;
+            const g = try self.k.gdnSet(h); // before any launch: the full kernels, or the _h8 twins for a rank's half
+            const pw = h.projWidth();
+            const cd = h.convDim();
+            _ = try self.lane(s.mixed, s.xsm, lw.proj, s.proj, s.dummy, n, 1);""",
+    """        fn l2PrefetchOut(self: *Self, lw: *const Layer) !bool {
+            if (self.hooks.prompt or self.k.l2pf_mb == 0) return false;
+            const w = lw.out.native orelse return false;
+            if (w.mode != .bf12) return false; // main target BF12 out_proj/o_proj only (skip short MTP attn)
+            const x = self.s.side orelse return false;
+            const budget: u64 = @as(u64, self.k.l2pf_mb) << 20;
+            const sb: u64 = @min(@as(u64, lw.out.s.len), budget);
+            const cb: u64 = @min(@as(u64, lw.out.w.len), budget -| sb);
+            if (sb == 0 and cb == 0) return false;
+            const ns_per: u64 = if (self.k.l2pf_pace_gbps > 0) @max(@as(u64, 1), (32768 + self.k.l2pf_pace_gbps / 2) / self.k.l2pf_pace_gbps) else 0;
+            try x.fork.record(self.stream);
+            try x.stream.wait(x.fork);
+            var a: cuda.Args = .{};
+            a.add(lw.out.s.ptr);
+            a.add(sb);
+            a.add(lw.out.w.ptr);
+            a.add(cb);
+            a.add(ns_per);
+            try cuda.launch.launch(self.k.l2_prefetch2_paced, .{ .grid = .{ .x = 2 }, .block = .{ .x = 32 }, .pdl = false }, x.stream, &a);
+            try x.join.record(x.stream);
+            return true;
+        }
+
+        pub fn gdnBlock(self: *Self, lw: *const Layer, layer: usize, li: usize, keep: LayerKeep) !void {
+            const s = self.s;
+            const n = self.rows;
+            const h = lw.heads;
+            const g = try self.k.gdnSet(h); // before any launch: the full kernels, or the _h8 twins for a rank's half
+            const pw = h.projWidth();
+            const cd = h.convDim();
+            _ = try self.lane(s.mixed, s.xsm, lw.proj, s.proj, s.dummy, n, 1);
+            const pf = try self.l2PrefetchOut(lw);""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """            if (!fused) try gdn_fused.norm(g.norm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, s.gxs, n, h);
+            if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, pw, n, gdn.taps - 1, cd);
+            self.out_slices = try split_lane.out(self, s.gout, s.gxs, lw);
+        }""",
+    """            if (!fused) try gdn_fused.norm(g.norm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, if (lw.out.native != null) @as(u64, 0) else s.gxs, n, h);
+            if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, pw, n, gdn.taps - 1, cd);
+            self.out_slices = try split_lane.out(self, s.gout, s.gxs, lw);
+            if (pf) try self.stream.wait(self.s.side.?.join);
+        }""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """            const pn = h.projN();
+            _ = try self.lane(s.mixed, s.xsm, lw.proj, pa, s.dummy, n, 1);""",
+    """            const pn = h.projN();
+            _ = try self.lane(s.mixed, s.xsm, lw.proj, pa, s.dummy, n, 1);
+            const pf = try self.l2PrefetchOut(lw);""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """            try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, pn, h.q, head_dim);
+            self.out_slices = try split_lane.out(self, gated, s.gxs_attn, lw);
+        }""",
+    """            try self.tri.attnGate(s.ao, pa, gated, if (lw.out.native != null) @as(u64, 0) else s.gxs_attn, n, pn, h.q, head_dim);
+            self.out_slices = try split_lane.out(self, gated, s.gxs_attn, lw);
+            if (pf) try self.stream.wait(self.s.side.?.join);
+        }""",
+)
+patch_exact(
+    root, "cuda_gdn_fused.zig",
+    "    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = heads.nv }, .block = .{ .x = gdn.dv } }, stream, &b);",
+    "    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = heads.nv }, .block = .{ .x = gdn.dv }, .pdl = true }, stream, &b);",
+)
+patch_exact(
+    cdir, "route_rows.zig",
+    "        try launch_.launch(g.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);",
+    "        try launch_.launch(g.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = @as(u32, if (experts <= 512 and top_k <= 32) 32 else 128) } }, s, &a);",
+)
 patch_exact(
     cdir, "experts.zig",
     "        try launch_.launch(e.fns[ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = @intCast(e.warps * 32), .y = 1, .z = 1 } }, s, &a);",
@@ -3813,6 +5561,376 @@ patch_exact(
     root, "cuda_glue.zig",
     "        const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = block }, .shared = shared };",
     "        const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = block }, .shared = shared, .pdl = true };",
+)
+
+# 5k. Trial 36: CUDA 13 conditional WHILE graph ABI + HeadWhileKey/WhileCache for zero-sync GPU MTP drafting
+patch_exact(
+    cdir, "abi.zig",
+    """pub const ExecUpdateResultInfo = extern struct {
+    result: ExecUpdateResult,
+    error_node: GraphNode,
+    error_from_node: GraphNode,
+};""",
+    """pub const ExecUpdateResultInfo = extern struct {
+    result: ExecUpdateResult,
+    error_node: GraphNode,
+    error_from_node: GraphNode,
+};
+
+pub const GraphConditionalHandle = u64;
+pub const graph_node_type_conditional: c_uint = 13;
+pub const graph_cond_type_while: c_uint = 1;
+pub const graph_cond_assign_default: c_uint = 1;
+
+pub const ConditionalNodeParams = extern struct {
+    handle: GraphConditionalHandle = 0,
+    @"type": c_uint = graph_cond_type_while,
+    size: c_uint = 1,
+    ph_graph_out: ?[*]Graph = null,
+    ctx: Context = null,
+};
+
+pub const GraphNodeParamsCond = extern struct {
+    @"type": c_uint = graph_node_type_conditional,
+    reserved0: [3]c_int = .{ 0, 0, 0 },
+    conditional: ConditionalNodeParams = .{},
+    pad: [25]c_longlong = @splat(0),
+    reserved2: c_longlong = 0,
+};""",
+)
+patch_exact(
+    cdir, "abi.zig",
+    "    cuStreamBeginCapture_v2: *const fn (Stream, CaptureMode) callconv(.c) R,\n    cuStreamEndCapture: *const fn (Stream, *Graph) callconv(.c) R,",
+    "    cuStreamBeginCapture_v2: *const fn (Stream, CaptureMode) callconv(.c) R,\n    cuStreamBeginCaptureToGraph: *const fn (Stream, Graph, ?[*]const GraphNode, ?*const anyopaque, usize, CaptureMode) callconv(.c) R,\n    cuStreamEndCapture: *const fn (Stream, *Graph) callconv(.c) R,",
+)
+patch_exact(
+    cdir, "abi.zig",
+    "    cuGraphCreate: *const fn (*Graph, c_uint) callconv(.c) R,\n    cuGraphDestroy: *const fn (Graph) callconv(.c) R,",
+    "    cuGraphCreate: *const fn (*Graph, c_uint) callconv(.c) R,\n    cuGraphDestroy: *const fn (Graph) callconv(.c) R,\n    cuGraphConditionalHandleCreate: *const fn (*GraphConditionalHandle, Graph, Context, c_uint, c_uint) callconv(.c) R,\n    cuGraphAddNode_v2: *const fn (*GraphNode, Graph, ?[*]const GraphNode, ?*const anyopaque, usize, *GraphNodeParamsCond) callconv(.c) R,",
+)
+patch_exact(
+    cdir, "abi.zig",
+    "    std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);",
+    "    std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);\n    std.debug.assert(@sizeOf(ConditionalNodeParams) == 32);\n    std.debug.assert(@sizeOf(GraphNodeParamsCond) == 256 and @offsetOf(GraphNodeParamsCond, \"conditional\") == 16);",
+)
+patch_exact(
+    cdir, "graph.zig",
+    """pub fn captureStatus(stream: Stream) Error!abi.CaptureStatus {
+    var s: abi.CaptureStatus = .none;
+    try stream.d.check(stream.d.api.cuStreamIsCapturing(stream.handle, &s), "cuStreamIsCapturing");
+    return s;
+}""",
+    """pub fn beginCaptureToGraph(stream: Stream, g: Graph, mode: abi.CaptureMode) Error!void {
+    const source = @import("copy_source.zig");
+    try source.captureBegin(stream, mode);
+    errdefer source.captureEnd(stream);
+    try stream.d.check(stream.d.api.cuStreamBeginCaptureToGraph(stream.handle, g.handle, null, null, 0, mode), "cuStreamBeginCaptureToGraph");
+}
+
+pub fn endCaptureToGraph(stream: Stream) Error!void {
+    const source = @import("copy_source.zig");
+    var g: abi.Graph = null;
+    errdefer if ((captureStatus(stream) catch .active) == .none) source.captureEnd(stream);
+    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    source.captureEnd(stream);
+}
+
+pub fn captureStatus(stream: Stream) Error!abi.CaptureStatus {
+    var s: abi.CaptureStatus = .none;
+    try stream.d.check(stream.d.api.cuStreamIsCapturing(stream.handle, &s), "cuStreamIsCapturing");
+    return s;
+}""",
+)
+patch_exact(
+    cdir, "graph.zig",
+    """    pub fn instantiate(self: Graph) Error!Exec {""",
+    """    pub const WhileNode = struct { node: Node, body: Graph };
+
+    pub fn createConditionalHandle(self: Graph, ctx: abi.Context, default_val: c_uint, flags: c_uint) Error!abi.GraphConditionalHandle {
+        var h: abi.GraphConditionalHandle = 0;
+        try self.d.check(self.d.api.cuGraphConditionalHandleCreate(&h, self.handle, ctx, default_val, flags), "cuGraphConditionalHandleCreate");
+        return h;
+    }
+
+    pub fn addWhileNode(self: Graph, deps: []const Node, handle: abi.GraphConditionalHandle, ctx: abi.Context) Error!WhileNode {
+        var np: abi.GraphNodeParamsCond = .{
+            .conditional = .{
+                .handle = handle,
+                .@"type" = abi.graph_cond_type_while,
+                .size = 1,
+                .ph_graph_out = null,
+                .ctx = ctx,
+            },
+        };
+        var n: Node = null;
+        try self.d.check(self.d.api.cuGraphAddNode_v2(&n, self.handle, if (deps.len > 0) deps.ptr else null, null, deps.len, &np), "cuGraphAddNode_v2");
+        const arr = np.conditional.ph_graph_out orelse return error.CudaFailed;
+        return .{ .node = n, .body = .{ .d = self.d, .handle = arr[0] } };
+    }
+
+    pub fn instantiate(self: Graph) Error!Exec {""",
+)
+patch_exact(
+    root, "cuda_window_graph.zig",
+    """/// The engine's graph caches, one per kind of pass.
+pub const Graphs = struct {
+    window: Cache(Key) = .{},
+    head: Cache(HeadKey) = .{},
+    rollback: Cache(RollbackKey) = .{},
+    shared: Cache(SharedKey) = .{},
+    head_many: Cache(HeadManyKey) = .{},
+
+    pub fn clear(g: *Graphs, gpa: std.mem.Allocator) void {
+        g.window.clear(gpa);
+        g.head.clear(gpa);
+        g.rollback.clear(gpa);
+        g.shared.clear(gpa);
+        g.head_many.clear(gpa);
+    }
+};""",
+    """/// Key for a cached CUDA 13 CU_GRAPH_COND_TYPE_WHILE greedy MTP chain graph.
+pub const HeadWhileKey = struct {
+    shape: u64,
+    moving: u64,
+
+    pub fn init(d: anytype, s: *const parts.Scratch, score_rows: u64, vocab_ids_ptr: u64, ctl_ptr: u64, out_ptr: u64) HeadWhileKey {
+        var h: Hash = .{};
+        h.geometry(.at(d.len + 1, d.cap));
+        h.values(&[_]u64{
+            d.cap, d.kc.ptr, d.vc.ptr, d.ikc.ptr, d.pooled.ptr,
+            d.pg.pt, @as(u64, @bitCast(d.pg.ps)), @as(u64, @as(u32, @bitCast(d.pg.ptok))),
+            d.out.ptr, d.dlogits.ptr, d.best.ptr,
+            s.h, s.cap, s.ids, s.pos, score_rows,
+            vocab_ids_ptr, ctl_ptr, out_ptr,
+        });
+        return .{ .shape = h.shape.final(), .moving = h.moving.final() };
+    }
+};
+
+pub const WhileCache = struct {
+    const cap_entries = 64;
+    const Entry = struct { key: HeadWhileKey, exec: cuda.graph.Exec, stamp: u64 };
+    items: [cap_entries]?Entry = @splat(null),
+    tick: u64 = 0,
+    captures: u64 = 0,
+    replays: u64 = 0,
+    off: bool = false,
+
+    pub fn clear(c: *WhileCache) void {
+        for (&c.items) |*slot| {
+            if (slot.*) |*e| e.exec.deinit();
+            slot.* = null;
+        }
+    }
+
+    pub fn find(c: *WhileCache, key: HeadWhileKey) ?*cuda.graph.Exec {
+        c.tick +%= 1;
+        for (&c.items) |*slot| {
+            if (slot.*) |*e| {
+                if (std.meta.eql(e.key, key)) {
+                    e.stamp = c.tick;
+                    c.replays += 1;
+                    return &e.exec;
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn put(c: *WhileCache, key: HeadWhileKey, exec: cuda.graph.Exec) *cuda.graph.Exec {
+        c.tick +%= 1;
+        c.captures += 1;
+        for (&c.items) |*slot| {
+            if (slot.* == null) {
+                slot.* = .{ .key = key, .exec = exec, .stamp = c.tick };
+                return &slot.*.?.exec;
+            }
+        }
+        var lru: usize = 0;
+        for (1..cap_entries) |i| {
+            if (c.items[i].?.stamp < c.items[lru].?.stamp) lru = i;
+        }
+        c.items[lru].?.exec.deinit();
+        c.items[lru] = .{ .key = key, .exec = exec, .stamp = c.tick };
+        return &c.items[lru].?.exec;
+    }
+};
+
+/// The engine's graph caches, one per kind of pass.
+pub const Graphs = struct {
+    window: Cache(Key) = .{},
+    head: Cache(HeadKey) = .{},
+    head_while: WhileCache = .{},
+    rollback: Cache(RollbackKey) = .{},
+    shared: Cache(SharedKey) = .{},
+    head_many: Cache(HeadManyKey) = .{},
+
+    pub fn clear(g: *Graphs, gpa: std.mem.Allocator) void {
+        g.window.clear(gpa);
+        g.head.clear(gpa);
+        g.head_while.clear();
+        g.rollback.clear(gpa);
+        g.shared.clear(gpa);
+        g.head_many.clear(gpa);
+    }
+};""",
+)
+
+# 5m. Trial 37: Fused non-clustered shared_expert gate_up + zero-write greedy lm_head direct-argmax
+patch_exact(
+    root, "cuda_batch_state.zig",
+    "    logits_out: u64 = 0,\n    keep: ?*Keep = null,",
+    "    logits_out: u64 = 0,\n    best_out: u64 = 0,\n    keep: ?*Keep = null,",
+)
+patch_exact(
+    root, "cuda_batch_state.zig",
+    "        s.shared_gate = try s.add(gpa, d, cap * moe_w * 2);\n        s.shared_up = try s.add(gpa, d, cap * moe_w * 2);",
+    "        s.shared_gate = try s.add(gpa, d, cap * 2 * moe_w * 2);\n        s.shared_up = s.shared_gate + cap * moe_w * 2;",
+)
+patch_exact(
+    root, "cuda_mixed_experts.zig",
+    """pub const Owned = struct {
+    experts: routed.Owned,
+    shared: [3]wt.Q4,
+    rank: usize,
+    world: usize,
+    split_shared: bool = false,
+
+    pub fn free(self: *Owned) void {
+        self.experts.free();
+        for (&self.shared) |*p| p.free();
+    }
+};""",
+    """pub const Owned = struct {
+    experts: routed.Owned,
+    shared: [3]wt.Q4,
+    shared_gu: ?wt.Q4 = null,
+    rank: usize,
+    world: usize,
+    split_shared: bool = false,
+
+    pub fn free(self: *Owned) void {
+        self.experts.free();
+        if (self.shared_gu) |*g| g.free();
+        for (&self.shared) |*p| p.free();
+    }
+};""",
+)
+patch_exact(
+    root, "cuda_mixed_experts.zig",
+    """    var shared: [3]wt.Q4 = @splat(wt.Q4.empty(d));
+    errdefer for (&shared) |*p| p.free();
+    // The shared branch participates exactly once in the sum across ranks.
+    if (rank == 0 or split) {
+        var buf: [256]u8 = undefined;
+        for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |name, i| {
+            const n = if (i == 2) wt.dims else wt.moe_w;
+            const k = if (i == 2) wt.moe_w else wt.dims;
+            const key = try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ prefix, name });
+            shared[i] = if (split) try projections.loadCut(a, d, store, key, n, k, try routed.Cut.init(n, world, rank), .rows) else try projections.load(a, d, store, key, n, k);
+            if (shared[i].native == null) return error.UnsupportedQuantization;
+        }
+    }
+    return .{ .experts = e, .shared = shared, .rank = rank, .world = world, .split_shared = split };""",
+    """    var shared: [3]wt.Q4 = @splat(wt.Q4.empty(d));
+    errdefer for (&shared) |*p| p.free();
+    var shared_gu: ?wt.Q4 = null;
+    errdefer if (shared_gu) |*g| g.free();
+    // The shared branch participates exactly once in the sum across ranks.
+    if (rank == 0 or split) {
+        var buf: [256]u8 = undefined;
+        const bf12 = @import("cuda_bf12_pack.zig");
+        if (!split and rank == 0 and bf12.enabled()) {
+            const k0 = try std.fmt.bufPrint(&buf, "{s}.shared_expert.gate_proj.weight", .{prefix});
+            if (store.has(k0)) {
+                const t0 = try store.tensor(k0);
+                if (t0.is(.bf16, &.{ wt.moe_w, wt.dims })) {
+                    const half_bytes = wt.moe_w * wt.dims * 2;
+                    const raw_gu = try a.alloc(u8, half_bytes * 2);
+                    defer a.free(raw_gu);
+                    @memcpy(raw_gu[0..half_bytes], t0.bytes);
+                    const k1 = try std.fmt.bufPrint(&buf, "{s}.shared_expert.up_proj.weight", .{prefix});
+                    const t1 = try store.tensor(k1);
+                    if (t1.is(.bf16, &.{ wt.moe_w, wt.dims })) {
+                        @memcpy(raw_gu[half_bytes .. half_bytes * 2], t1.bytes);
+                        shared_gu = try bf12.packRaw(a, d, raw_gu, wt.moe_w * 2, wt.dims);
+                    }
+                }
+            }
+        }
+        for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |name, i| {
+            if (i < 2 and shared_gu != null) continue;
+            const n = if (i == 2) wt.dims else wt.moe_w;
+            const k = if (i == 2) wt.moe_w else wt.dims;
+            const key = try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ prefix, name });
+            shared[i] = if (split) try projections.loadCut(a, d, store, key, n, k, try routed.Cut.init(n, world, rank), .rows) else try projections.load(a, d, store, key, n, k);
+            if (shared[i].native == null) return error.UnsupportedQuantization;
+        }
+    }
+    return .{ .experts = e, .shared = shared, .shared_gu = shared_gu, .rank = rank, .world = world, .split_shared = split };""",
+)
+patch_exact(
+    root, "cuda_batch_side.zig",
+    """    try pass.k.nativeMatmul(st, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part, .bf16);
+    try pass.k.nativeMatmul(st, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part, .bf16);
+    try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);""",
+    """    if (native.shared_gu) |gu| {
+        const sk = try pass.k.native_lane.matmulRawPart(st, s.mixed, dims, n, gu.native.?, s.shared_gate, .bf16, s.native_part, false);
+        if (sk > 1) try glue.sharedReduceSwiGLU(st, s.native_part, s.shared_act, n, moe_w, sk) else try glue.sharedSwiGLUCat(st, s.shared_gate, s.shared_act, n, moe_w);
+    } else {
+        try pass.k.nativeMatmul(st, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part, .bf16);
+        try pass.k.nativeMatmul(st, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part, .bf16);
+        try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
+    }""",
+)
+patch_exact(
+    root, "cuda_shared_split.zig",
+    """    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+    try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, width);""",
+    """    if (native.shared_gu) |gu| {
+        const sk = try self.k.native_lane.matmulRawPart(self.stream, s.mixed, dims, n, gu.native.?, s.shared_gate, .bf16, s.native_part, false);
+        if (sk > 1) try glue.sharedReduceSwiGLU(self.stream, s.native_part, s.shared_act, n, width, sk) else try glue.sharedSwiGLUCat(self.stream, s.shared_gate, s.shared_act, n, width);
+    } else {
+        try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+        try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+        try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, width);
+    }""",
+)
+patch_exact(
+    root, "cuda_mtp_draft.zig",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,",
+)
+patch_exact(
+    root, "cuda_lanes_verify.zig",
+    "            for (seqs[0..n], ds[0..n], idss[0..n]) |q, d, ids| try self.ops().verify(q, d, ids);",
+    "            for (seqs[0..n], ds[0..n], idss[0..n], drafted[at..][0..n]) |q, d, ids, wi| {\n                d.best_direct = !mtp.isSampled(wins[wi].stream.sampling) and wins[wi].masks.len == 0;\n                try self.ops().verify(q, d, ids);\n            }",
+)
+patch_exact(
+    root, "cuda_mtp_ops.zig",
+    """            if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() });""",
+    """            const vhl = @import("cuda_batch_state.zig").verifyHostLogits();
+            const use_best = d.best_direct and !vhl and o.e.head_q.b.ptr != 0 and o.e.head_q.native != null and o.e.head_q.native.?.mode == .fp4;
+            d.best_direct = false;
+            d.best_ready = use_best;
+            if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .best_out = if (use_best) d.best.ptr else 0, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = vhl });""",
+)
+patch_exact(
+    root, "cuda_mtp_ops.zig",
+    """                const n = ids.len;
+                d.settle(seq);""",
+    """                const n = ids.len;
+                d.best_direct = false;
+                d.best_ready = false;
+                d.settle(seq);""",
+)
+patch_exact(
+    root, "cuda_mtp_draw.zig",
+    "    if (masks.len == 0 and !mtp.isSampled(sm)) try h.argmax(st, d.logits.ptr, vocab, vocab, n, d.best.ptr) else if (masks.len == 0 and !usable(sm.?)) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);",
+    "    const ready = d.best_ready;\n    d.best_ready = false;\n    if (masks.len == 0 and !mtp.isSampled(sm)) {\n        if (!ready) try h.argmax(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);\n    } else if (masks.len == 0 and !usable(sm.?)) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);",
 )
 
 import re as _re
@@ -3917,14 +6035,18 @@ PY
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
     export TF_FLASHNEXT_MTP_W2="1"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
+    export TF_FLASHNEXT_MTP_NVFP4="0"
     export TF_FLASHNEXT_HEAD_NVFP4="1"
     export TF_FLASHNEXT_TRUNK_BF12="1"
-    export TF_FLASHNEXT_FUSED_SPLIT="1"
+    export TF_FLASHNEXT_FUSED_SPLIT="0"
+    export TF_FLASHNEXT_L2PF_MB="0"
+    export TF_FLASHNEXT_L2PF_PACE_GBPS="165"
     export TF_NVFP4_DECODE_WARPS="1"
     export TF_NVFP4_DYNAMIC_GRID="1"
     export TF_FLASHNEXT_ATTN_LANES="1"
     export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
+    export TF_FLASHNEXT_MTP_WHILE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       export TF_FLASHNEXT_DRAFTS="6"
@@ -3936,6 +6058,8 @@ PY
     else
       export TF_FLASHNEXT_DRAFTS_GREEDY="15"
       export TF_FLASHNEXT_CONFIDENCE="-0.28"
+      export TF_FLASHNEXT_KV_PAGES="256"
+      export TF_FLASHNEXT_KV_PAGES_ALL="1"
       CTX="$SPEED_CONTEXT"
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
