@@ -157,21 +157,15 @@ fable_wk = sel.get("fable_wk") if sel.get("fable_wk") is not None else parse_tab
 
 gem_eff = min(gem_5h, gem_wk) if (gem_5h is not None and gem_wk is not None) else None
 
-# Choose implementation agent: Gemini 4 Neon High or GPT-6.2-Astra xhigh (both >= 30% required)
-# Alternate or pick higher effective quota so neither starves
-candidates = []
-if gem_eff is not None and gem_eff >= 30.0:
-    candidates.append((gem_eff, "agy", "gemini-4-neon-high", "high", "gemini-4-neon-high"))
-if codex_wk is not None and codex_wk >= 30.0:
-    candidates.append((codex_wk, "codex", "gpt-6.2-astra", "xhigh", "gpt-6.2-astra/xhigh"))
-
-candidates.sort(key=lambda x: x[0], reverse=True)
+# Implementation: Gemini 4 Neon xhigh first. Switch to GPT-6.2-Astra xhigh only when
+# Gemini 5h or weekly is insufficient (gem_eff is the min of the two; missing counts as insufficient).
 summary = f"Gemini4_5h={gem_5h}% Gemini4_Wk={gem_wk}% Codex_Wk={codex_wk}% Fable_Wk={fable_wk}%"
-if not candidates:
-    print(f"WAIT\tnone\tnone\tnone\tnone\t{summary}")
+if gem_eff is not None and gem_eff >= 30.0:
+    print(f"RUN\tagy\tgemini-4-neon-xhigh\txhigh\tgemini-4-neon-xhigh\t{summary}")
+elif codex_wk is not None and codex_wk >= 30.0:
+    print(f"RUN\tcodex\tgpt-6.2-astra\txhigh\tgpt-6.2-astra/xhigh\t{summary}")
 else:
-    _, cli, model, effort, label = candidates[0]
-    print(f"RUN\t{cli}\t{model}\t{effort}\t{label}\t{summary}")
+    print(f"WAIT\tnone\tnone\tnone\tnone\t{summary}")
 PY
 )"
 
