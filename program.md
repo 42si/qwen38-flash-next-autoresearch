@@ -44,6 +44,17 @@
 
 カーネル・スケジューラ・投機的デコードなどエンジン本体への改良も、`candidate.sh` の中にパッチとして書く（固定したコミットを取得し、パッチを当て、ビルドする手順を 1 ファイルに収める）。別のファイルを足さない。`bench/` に手を入れたくなったら、試行を止めずに `records/research-log.md` へ提案を書き、人の判断を待つ。
 
+### `bench/` をループ用ブランチへ同期するとき（基準の更新）
+
+`bench/` の変更（`loop.sh` や `FROZEN.sha256` など）は、試行の commit としてループ用ブランチの先頭に積まない。`run_trial.sh` は「直前の keep と候補の差分が `<site>/candidate.sh` だけ」かを見るので、先頭に積むと次の試行が偽の single-file rule violation で discard になり、`reset --hard` で同期も巻き戻る（2026-11-19、`92e764e` で発生）。次の手順で、基準そのものを更新する。
+
+1. `private/STOP-<site>` でループを止め、走っている試行が終わるのを待つ。
+2. `main` に `bench/` と `FROZEN.sha256` を commit・push し、両方の `shasum -a 256 -c bench/FROZEN.sha256` が通ることを確かめる。
+3. ループ用ブランチを直前の keep（`results.tsv` の最後の keep 行の commit）に戻し、その上に `bench/` だけの同期 commit を 1 つ積む。これが新しい基準 P'。`git diff --quiet P' main -- bench` で `main` と同じことを確かめる。
+4. `results.tsv` の最後の keep 行の `commit` だけを P' の先頭 8 桁に直して `main` に commit・push する。数値は変えない。
+5. 未測定の候補があれば P' の上に cherry-pick し、`git diff --name-only P' HEAD` が `<site>/candidate.sh` だけになることを確かめる。
+6. ループ用ブランチを push し、`STOP-<site>` を消してから、いつもの方法でループを再開する。
+
 ## 1 試行の流れ
 
 `bench/run_trial.sh <spark|colab>` が次を順に行う。エージェントは 2 と 3 だけを行い、残りはスクリプトに任せる。
