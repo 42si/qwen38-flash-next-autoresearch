@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4"
+BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4-bf13"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -315,50 +315,633 @@ extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
 }
 CU
 
-  # 2a. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0)
+  # 1c. Patch qmmf.cu + qmmf_body.cuh to add Mode::BF13 (lossless 13.125-bit BF16) + half-tiles + strided shared_down
+  python3 - "$SRC_DIR/zig/kernels/cuda" <<'PYCU'
+from pathlib import Path
+import sys
+
+kdir = Path(sys.argv[1])
+
+def patch_k(rel: str, old: str, new: str) -> None:
+    p = kdir / rel
+    txt = p.read_text(encoding="utf-8")
+    if txt.count(old) != 1:
+        raise RuntimeError(f"Expected 1 match in {rel}, got {txt.count(old)}")
+    p.write_text(txt.replace(old, new, 1), encoding="utf-8")
+
+patch_k(
+    "qmmf.cu",
+    "enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4 };",
+    """enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, BF13 = 5 };
+
+__device__ __forceinline__ uint32_t dec13_pair(
+        uint32_t ms, uint32_t perm, uint32_t dlo, int lshift,
+        uint32_t dhi_wide, int hshift, uint32_t emax_pair) {
+    const uint32_t x = __byte_perm(ms, 0u, perm);
+    const uint32_t d = ((dlo >> lshift) & 0x000F000Fu) | (((dhi_wide >> hshift) & 0x00010001u) << 4);
+    const uint32_t z = ((d + 0x00010001u) >> 5) & 0x00010001u;
+    const uint32_t mask = (0x00010001u - z) * 0xFFu;
+    const uint32_t exp_pair = (((emax_pair | (z << 8)) - d) & mask) << 7;
+    return ((x & 0x00800080u) << 8) | exp_pair | (x & 0x007F007Fu);
+}""",
+)
+patch_k(
+    "qmmf.cu",
+    """    static constexpr int W = MODE == FP4 ? BN * GS / 2 : MODE == BF16 ? BN * GS * 2 : BN * GS;
+    static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 ? BN * 2 : 0;""",
+    """    static constexpr int W = MODE == FP4 ? BN * GS / 2 : MODE == BF16 ? BN * GS * 2 : MODE == BF13 ? (BN / 8) * 832 : BN * GS;
+    static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 ? BN * 2 : MODE == BF13 ? BN : 0;""",
+)
+patch_k(
+    "qmmf_body.cuh",
+    "        constexpr int TILE_BYTES = MODE == FP4 ? 64 * GS / 2 : MODE == BF16 ? 64 * GS * 2 : 64 * GS;",
+    "        constexpr int TILE_BYTES = MODE == FP4 ? 64 * GS / 2 : MODE == BF16 ? 64 * GS * 2 : MODE == BF13 ? 6656 : 64 * GS;",
+)
+patch_k(
+    "qmmf_body.cuh",
+    """            if constexpr (MODE == FP4) {
+                const uint2 u = reinterpret_cast<const uint2*>(pw)[jj * 32 + lane];
+                wq[j] = make_uint4(u.x, u.y, 0u, 0u);
+            } else if constexpr (MODE != BF16) {
+                wq[j] = reinterpret_cast<const uint4*>(pw)[jj * 32 + lane];
+            }""",
+    """            if constexpr (MODE == FP4) {
+                const uint2 u = reinterpret_cast<const uint2*>(pw)[jj * 32 + lane];
+                wq[j] = make_uint4(u.x, u.y, 0u, 0u);
+            } else if constexpr (MODE == BF13) {
+                const unsigned char* pjj = pw + jj * 832;
+                const uint32_t em = static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) * 0x00010001u;
+                const uint32_t dlo01 = reinterpret_cast<const uint32_t*>(pjj + 512)[lane];
+                const uint32_t dlo23 = reinterpret_cast<const uint32_t*>(pjj + 640)[lane];
+                const uint32_t dhi_w = __byte_perm(static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(pjj + 768)[lane]), 0u, 0x4140u);
+                wq[j] = make_uint4(dlo01, dlo23, dhi_w, em);
+            } else if constexpr (MODE != BF16) {
+                wq[j] = reinterpret_cast<const uint4*>(pw)[jj * 32 + lane];
+            }""",
+)
+patch_k(
+    "qmmf_body.cuh",
+    """                } else {
+                    const uint32_t word = comp(wq[j], kt);
+                    b0 = fp8pair(word & 0xFFFFu);
+                    b1 = fp8pair(word >> 16);
+                }
+#pragma unroll
+                for (int i = 0; i < T::MT; ++i) {
+                    if constexpr (MODE == FP8 || MODE == BF16) mma(acc[i][j], a[i], b0, b1);""",
+    """                } else if constexpr (MODE == BF13) {
+                    const unsigned char* pjj = pw + (wn * T::NT + j) * 832;
+                    const uint32_t ms = reinterpret_cast<const uint32_t*>(pjj)[kt * 32 + lane];
+                    const uint32_t dlo = kt < 2 ? wq[j].x : wq[j].y;
+                    b0 = dec13_pair(ms, 0x4140u, dlo, (kt & 1) * 8, wq[j].z, kt * 2, wq[j].w);
+                    b1 = dec13_pair(ms, 0x4342u, dlo, (kt & 1) * 8 + 4, wq[j].z, kt * 2 + 1, wq[j].w);
+                } else {
+                    const uint32_t word = comp(wq[j], kt);
+                    b0 = fp8pair(word & 0xFFFFu);
+                    b1 = fp8pair(word >> 16);
+                }
+#pragma unroll
+                for (int i = 0; i < T::MT; ++i) {
+                    if constexpr (MODE == FP8 || MODE == BF16 || MODE == BF13) mma(acc[i][j], a[i], b0, b1);""",
+)
+PYCU
+
+  cat >> "$SRC_DIR/zig/kernels/cuda/qmmf.cu" <<'CU'
+
+namespace tf_qmmf {
+template __global__ void qmmf_kernel<BF13, 16, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 32, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 32, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, false, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 32, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 32, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 64, 64, 1, 4, 4, true, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+
+template __global__ void qmmf_kernel<BF13, 16, 32, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<BF13, 16, 32, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+
+template __global__ void qmmf_kernel<FP8G, 16, 32, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8G, 16, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8G, 16, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8G, 16, 32, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+
+#define TF_SHARED_DOWN_SCALED(MODE_T, NAME, BM, BN) \
+extern "C" __global__ void __launch_bounds__(128) NAME( \
+        const __nv_bfloat16* x, const unsigned char* w, const uint8_t* bs, float scale, float* out, \
+        int M, int N, int K, int npad, int ldx, int group, int ldy) { \
+    qmmf_body<MODE_T, BM, BN, 1, 4, 4, true, false, false>( \
+        x, w, bs, scale, out, nullptr, M, N, K, 1, npad, ldx, group, ldy); \
+}
+TF_SHARED_DOWN_SCALED(BF13, tf_qmmf_shared_bf13_16_half, 16, 32)
+TF_SHARED_DOWN_SCALED(BF13, tf_qmmf_shared_bf13_16, 16, 64)
+TF_SHARED_DOWN_SCALED(BF13, tf_qmmf_shared_bf13_32, 32, 64)
+TF_SHARED_DOWN_SCALED(BF13, tf_qmmf_shared_bf13_64, 64, 64)
+TF_SHARED_DOWN_SCALED(FP8G, tf_qmmf_shared_fp8g16_half, 16, 32)
+TF_SHARED_DOWN_SCALED(FP8G, tf_qmmf_shared_fp8g16, 16, 64)
+TF_SHARED_DOWN_SCALED(FP8G, tf_qmmf_shared_fp8g32, 32, 64)
+TF_SHARED_DOWN_SCALED(FP8G, tf_qmmf_shared_fp8g64, 64, 64)
+#undef TF_SHARED_DOWN_SCALED
+}
+CU
+
+  # 2a. Least-squares Group-64 exact-FP32-scale FP8G projection encoder for MTP & non-recurrent BF16 trunk
   cat > "$fn_dir/cuda_mtp_mxfp8.zig" <<'ZIG'
-//! Re-codes the MTP drafter's BF16 linears to group-32 UE8M0 MXFP8 at load; target verify stays untouched.
+//! Encodes MTP drafter and non-recurrent BF16 projections to group-64 exact-FP32-scale FP8G; recurrent GDN stays BF16.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
 const projection = @import("cuda_projection.zig");
 
-const top_code: f32 = 448.0;
-const group = 32;
+const group: usize = 64;
 
-fn value(bf16: []const u8, i: usize) f32 {
-    return @bitCast(@as(u32, std.mem.readInt(u16, bf16[i * 2 ..][0..2], .little)) << 16);
+pub fn useForLoad(prefix: []const u8) bool {
+    return std.mem.startsWith(u8, prefix, "language_model.mtp.");
 }
 
-fn exponentFor(top: f32) i32 {
-    if (!(top > 0) or !std.math.isFinite(top)) return 0;
-    var e: i32 = @intFromFloat(@ceil(@log2(top / top_code)));
-    while (std.math.ldexp(top, -e) > top_code) e += 1;
-    while (e > -126 and std.math.ldexp(top, -(e - 1)) <= top_code) e -= 1;
-    return std.math.clamp(e, -126, 127);
+pub fn useForStitched(prefix: []const u8) bool {
+    return std.mem.startsWith(u8, prefix, "language_model.mtp.");
 }
 
-pub fn encode(bf16: []const u8, n: usize, k: usize, codes: []u8, scales: []u8) void {
-    std.debug.assert(k % group == 0 and bf16.len == n * k * 2 and codes.len == n * k and scales.len == n * k / group);
-    for (0..n * k / group) |g| {
-        const base = g * group;
-        var top: f32 = 0;
-        for (0..group) |i| top = @max(top, @abs(value(bf16, base + i)));
-        const e = exponentFor(top);
-        scales[g] = @intCast(127 + e);
-        for (0..group) |i| codes[base + i] = core.exlr8.codec.e4m3FromF32(std.math.ldexp(value(bf16, base + i), -e));
+pub fn useForHc(prefix: []const u8) bool {
+    return std.mem.startsWith(u8, prefix, "language_model.mtp.");
+}
+
+const EncodeCtx = struct {
+    bf16: []const u8,
+    lut: *const [256]f32,
+    raw_codes: []u8,
+    packed_scales: []f32,
+    n: usize,
+    k: usize,
+    kg: usize,
+    per: usize,
+
+    fn worker(ctx: *const EncodeCtx, tid: usize) void {
+        const lo = @min(ctx.n, tid * ctx.per);
+        const hi = @min(ctx.n, lo + ctx.per);
+        for (lo..hi) |r| {
+            const t = r / 64;
+            const tr = r % 64;
+            const rb = ctx.bf16[r * ctx.k * 2 ..][0 .. ctx.k * 2];
+            for (0..ctx.kg) |g| {
+                var w: [group]f32 = undefined;
+                var max_abs: f32 = 0;
+                for (0..group) |j| {
+                    const bits = std.mem.readInt(u16, rb[(g * group + j) * 2 ..][0..2], .little);
+                    const f: f32 = @bitCast(@as(u32, bits) << 16);
+                    w[j] = f;
+                    const a = @abs(f);
+                    if (a > max_abs) max_abs = a;
+                }
+                const dst_c = ctx.raw_codes[r * ctx.k + g * group ..][0..group];
+                if (!(max_abs > 0) or !std.math.isFinite(max_abs)) {
+                    @memset(dst_c, 0);
+                    ctx.packed_scales[(t * ctx.kg + g) * 64 + tr] = 1.0;
+                    continue;
+                }
+                var sc: f32 = max_abs / 448.0;
+                {
+                    var num1: f32 = 0;
+                    var den1: f32 = 0;
+                    const inv1: f32 = 1.0 / sc;
+                    for (0..group) |j| {
+                        const c = core.exlr8.codec.e4m3FromF32(w[j] * inv1);
+                        const q = ctx.lut[c];
+                        num1 += w[j] * q;
+                        den1 += q * q;
+                    }
+                    if (den1 > 0) sc = num1 / den1;
+                }
+                var num2: f32 = 0;
+                var den2: f32 = 0;
+                const inv2: f32 = if (sc > 0) 1.0 / sc else 0.0;
+                for (0..group) |j| {
+                    const c = core.exlr8.codec.e4m3FromF32(w[j] * inv2);
+                    dst_c[j] = c;
+                    const q = ctx.lut[c];
+                    num2 += w[j] * q;
+                    den2 += q * q;
+                }
+                ctx.packed_scales[(t * ctx.kg + g) * 64 + tr] = if (den2 > 0) num2 / den2 else sc;
+            }
+        }
     }
-}
+};
+
+const PackCodesCtx = struct {
+    out: []u8,
+    codes: []const u8,
+    n: usize,
+    k: usize,
+    tiles: usize,
+    per: usize,
+
+    fn kin(lane: usize, byte: usize) usize {
+        const p = 16 * (byte / 4) + 4 * (lane % 4) + byte % 4;
+        return 16 * (p / 16) + 2 * ((p % 16) / 4) + p % 2 + 8 * ((p % 4) / 2);
+    }
+
+    fn worker(ctx: *const PackCodesCtx, tid: usize) void {
+        const lo = @min(ctx.tiles, tid * ctx.per);
+        const hi = @min(ctx.tiles, lo + ctx.per);
+        const kg = ctx.k / group;
+        for (lo..hi) |t| {
+            var i: usize = t * kg * 4096;
+            for (0..kg) |g| for (0..8) |a| for (0..32) |lane| for (0..2) |h| for (0..8) |b| {
+                const row = t * 64 + a * 8 + lane / 4;
+                const col = g * group + h * 32 + kin(lane, b);
+                ctx.out[i] = if (row < ctx.n) ctx.codes[row * ctx.k + col] else 0;
+                i += 1;
+            };
+        }
+    }
+};
 
 pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const u8, n: usize, k: usize) !projection.Projection {
-    if (k % 64 != 0 or bf16.len != n * k * 2) return error.UnexpectedTensor;
-    const codes = try gpa.alloc(u8, n * k);
-    defer gpa.free(codes);
-    const scales = try gpa.alloc(u8, n * k / group);
-    defer gpa.free(scales);
-    encode(bf16, n, k, codes, scales);
-    return projection.mxfp8(gpa, driver, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / group, 1, 1, 1 }, .bytes = scales });
+    if (n == 0 or k == 0 or k % group != 0 or bf16.len != n * k * 2) return error.UnexpectedTensor;
+    const npad = cuda.fp8.padded(n);
+    const kg = k / group;
+    const raw_codes = try gpa.alloc(u8, n * k);
+    defer gpa.free(raw_codes);
+    const packed_codes = try gpa.alloc(u8, npad * k);
+    defer gpa.free(packed_codes);
+    const packed_scales = try gpa.alloc(f32, npad * kg);
+    defer gpa.free(packed_scales);
+    @memset(packed_scales, 1.0);
+
+    var lut: [256]f32 = undefined;
+    for (0..256) |b| lut[b] = if ((b & 0x7f) == 0x7f) 0.0 else core.exlr8.codec.e4m3Value(@intCast(b));
+
+    const n_th: usize = if (n * kg >= 2048) 8 else 1;
+    const ectx: EncodeCtx = .{
+        .bf16 = bf16,
+        .lut = &lut,
+        .raw_codes = raw_codes,
+        .packed_scales = packed_scales,
+        .n = n,
+        .k = k,
+        .kg = kg,
+        .per = (n + n_th - 1) / n_th,
+    };
+    if (n_th == 1) {
+        EncodeCtx.worker(&ectx, 0);
+    } else {
+        var ths: [8]?std.Thread = @splat(null);
+        for (0..n_th) |ti| ths[ti] = std.Thread.spawn(.{}, EncodeCtx.worker, .{ &ectx, ti }) catch null;
+        for (0..n_th) |ti| {
+            if (ths[ti]) |t| t.join() else EncodeCtx.worker(&ectx, ti);
+        }
+    }
+
+    const tiles = npad / 64;
+    const p_th: usize = @min(8, @max(1, tiles));
+    const pctx: PackCodesCtx = .{
+        .out = packed_codes,
+        .codes = raw_codes,
+        .n = n,
+        .k = k,
+        .tiles = tiles,
+        .per = (tiles + p_th - 1) / p_th,
+    };
+    if (p_th == 1) {
+        PackCodesCtx.worker(&pctx, 0);
+    } else {
+        var ths2: [8]?std.Thread = @splat(null);
+        for (0..p_th) |ti| ths2[ti] = std.Thread.spawn(.{}, PackCodesCtx.worker, .{ &pctx, ti }) catch null;
+        for (0..p_th) |ti| {
+            if (ths2[ti]) |t| t.join() else PackCodesCtx.worker(&pctx, ti);
+        }
+    }
+
+    var p = projection.Projection.empty(driver);
+    p.w = try cuda.DeviceBuffer.fromHost(driver, packed_codes);
+    errdefer p.w.free();
+    p.s = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(packed_scales));
+    p.n = n;
+    p.k = k;
+    p.native = cuda.fp8.weight(p.w.ptr, p.s.ptr, n, k);
+    return p;
 }
+ZIG
+
+  # 2a2. Lossless 13.125-bit group-64 delta-exponent BF16 encoder for all target language_model.model.* BF16 projections
+  cat > "$fn_dir/cuda_bf13.zig" <<'ZIG'
+//! Lossless 13.125-bit group-64 delta-exponent BF16 packer (Mode.bf13); falls back to dense BF16 if any range overflows.
+const std = @import("std");
+const cuda = @import("cuda");
+const projection = @import("cuda_projection.zig");
+
+const group: usize = 64;
+
+pub fn enabled() bool {
+    const raw = std.c.getenv("TF_FLASHNEXT_BF13") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+pub fn useForTarget(prefix: []const u8) bool {
+    return enabled() and std.mem.startsWith(u8, prefix, "language_model.model.");
+}
+
+const ScanCtx = struct {
+    bf16: []const u8,
+    row_emax: []u8,
+    n: usize,
+    k: usize,
+    kg: usize,
+    per: usize,
+    bad: *std.atomic.Value(u32),
+
+    fn worker(ctx: *const ScanCtx, tid: usize) void {
+        const lo = @min(ctx.n, tid * ctx.per);
+        const hi = @min(ctx.n, lo + ctx.per);
+        for (lo..hi) |r| {
+            if (ctx.bad.load(.monotonic) != 0) return;
+            const rb = ctx.bf16[r * ctx.k * 2 ..][0 .. ctx.k * 2];
+            for (0..ctx.kg) |g| {
+                var emax: u8 = 0;
+                var emin: u8 = 255;
+                for (0..group) |j| {
+                    const u = std.mem.readInt(u16, rb[(g * group + j) * 2 ..][0..2], .little);
+                    if ((u & 0x7fff) == 0) continue;
+                    const exp: u8 = @intCast((u >> 7) & 0xff);
+                    if (exp == 0 or exp == 255) {
+                        ctx.bad.store(1, .monotonic);
+                        return;
+                    }
+                    if (exp > emax) emax = exp;
+                    if (exp < emin) emin = exp;
+                }
+                if (emin <= emax and emax - emin > 30) {
+                    ctx.bad.store(1, .monotonic);
+                    return;
+                }
+                ctx.row_emax[r * ctx.kg + g] = emax;
+            }
+        }
+    }
+};
+
+const PackCtx = struct {
+    bf16: []const u8,
+    row_emax: []const u8,
+    packed_codes: []u8,
+    packed_scales: []u8,
+    n: usize,
+    k: usize,
+    kg: usize,
+    tiles: usize,
+    per: usize,
+
+    fn worker(ctx: *const PackCtx, tid: usize) void {
+        const lo = @min(ctx.tiles, tid * ctx.per);
+        const hi = @min(ctx.tiles, lo + ctx.per);
+        for (lo..hi) |t| {
+            for (0..ctx.kg) |g| {
+                const tg = t * ctx.kg + g;
+                const sc_dst = ctx.packed_scales[tg * 64 ..][0..64];
+                for (0..64) |tr| {
+                    const row = t * 64 + tr;
+                    sc_dst[tr] = if (row < ctx.n) ctx.row_emax[row * ctx.kg + g] else 0;
+                }
+                for (0..8) |jj| {
+                    const pjj = ctx.packed_codes[(tg * 8 + jj) * 832 ..][0..832];
+                    for (0..32) |lane| {
+                        const row = t * 64 + jj * 8 + lane / 4;
+                        const emax: u32 = if (row < ctx.n) ctx.row_emax[row * ctx.kg + g] else 0;
+                        var dlo01: u32 = 0;
+                        var dlo23: u32 = 0;
+                        var raw_dhi: u16 = 0;
+                        for (0..4) |kt| {
+                            var ms: u32 = 0;
+                            for (0..4) |e| {
+                                const col = g * group + kt * 16 + 2 * (lane % 4) + (e & 1) + 8 * (e >> 1);
+                                const u: u16 = if (row < ctx.n) std.mem.readInt(u16, ctx.bf16[(row * ctx.k + col) * 2 ..][0..2], .little) else 0;
+                                const sign: u32 = (u >> 15) & 1;
+                                const is_zero = (u & 0x7fff) == 0;
+                                const b_ms: u32 = if (is_zero) (sign << 7) else (sign << 7) | @as(u32, u & 0x7f);
+                                const d: u32 = if (is_zero) 31 else emax - @as(u32, (u >> 7) & 0xff);
+                                ms |= b_ms << @intCast(8 * e);
+                                const p_idx: usize = e >> 1;
+                                const hi_half: usize = e & 1;
+                                const lshift: u5 = @intCast(((kt & 1) * 2 + p_idx) * 4 + hi_half * 16);
+                                if (kt < 2) {
+                                    dlo01 |= (d & 0xf) << lshift;
+                                } else {
+                                    dlo23 |= (d & 0xf) << lshift;
+                                }
+                                const hshift: u4 = @intCast((kt * 2 + p_idx) + hi_half * 8);
+                                raw_dhi |= @as(u16, @intCast((d >> 4) & 1)) << hshift;
+                            }
+                            std.mem.writeInt(u32, pjj[(kt * 32 + lane) * 4 ..][0..4], ms, .little);
+                        }
+                        std.mem.writeInt(u32, pjj[512 + lane * 4 ..][0..4], dlo01, .little);
+                        std.mem.writeInt(u32, pjj[640 + lane * 4 ..][0..4], dlo23, .little);
+                        std.mem.writeInt(u16, pjj[768 + lane * 2 ..][0..2], raw_dhi, .little);
+                    }
+                }
+            }
+        }
+    }
+};
+
+pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const u8, n: usize, k: usize) !projection.Projection {
+    if (n == 0 or k == 0 or k % group != 0 or bf16.len != n * k * 2) return error.UnexpectedTensor;
+    const kg = k / group;
+    const row_emax = try gpa.alloc(u8, n * kg);
+    defer gpa.free(row_emax);
+
+    var bad: std.atomic.Value(u32) = .init(0);
+    const s_th: usize = if (n * kg >= 2048) 8 else 1;
+    const sctx: ScanCtx = .{
+        .bf16 = bf16,
+        .row_emax = row_emax,
+        .n = n,
+        .k = k,
+        .kg = kg,
+        .per = (n + s_th - 1) / s_th,
+        .bad = &bad,
+    };
+    if (s_th == 1) {
+        ScanCtx.worker(&sctx, 0);
+    } else {
+        var ths: [8]?std.Thread = @splat(null);
+        for (0..s_th) |ti| ths[ti] = std.Thread.spawn(.{}, ScanCtx.worker, .{ &sctx, ti }) catch null;
+        for (0..s_th) |ti| {
+            if (ths[ti]) |t| t.join() else ScanCtx.worker(&sctx, ti);
+        }
+    }
+    if (bad.load(.monotonic) != 0) {
+        return projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bf16 });
+    }
+
+    const npad = cuda.nvfp4.padded(n);
+    const tiles = npad / 64;
+    const packed_codes = try gpa.alloc(u8, tiles * kg * 6656);
+    defer gpa.free(packed_codes);
+    const packed_scales = try gpa.alloc(u8, tiles * kg * 64);
+    defer gpa.free(packed_scales);
+
+    const p_th: usize = @min(8, @max(1, tiles));
+    const pctx: PackCtx = .{
+        .bf16 = bf16,
+        .row_emax = row_emax,
+        .packed_codes = packed_codes,
+        .packed_scales = packed_scales,
+        .n = n,
+        .k = k,
+        .kg = kg,
+        .tiles = tiles,
+        .per = (tiles + p_th - 1) / p_th,
+    };
+    if (p_th == 1) {
+        PackCtx.worker(&pctx, 0);
+    } else {
+        var ths2: [8]?std.Thread = @splat(null);
+        for (0..p_th) |ti| ths2[ti] = std.Thread.spawn(.{}, PackCtx.worker, .{ &pctx, ti }) catch null;
+        for (0..p_th) |ti| {
+            if (ths2[ti]) |t| t.join() else PackCtx.worker(&pctx, ti);
+        }
+    }
+
+    var p = projection.Projection.empty(driver);
+    p.w = try cuda.DeviceBuffer.fromHost(driver, packed_codes);
+    errdefer p.w.free();
+    p.s = try cuda.DeviceBuffer.fromHost(driver, packed_scales);
+    p.n = n;
+    p.k = k;
+    p.native = .{
+        .mode = .bf13,
+        .codes = p.w.ptr,
+        .scales = p.s.ptr,
+        .n = @intCast(n),
+        .k = @intCast(k),
+        .npad = @intCast(npad),
+    };
+    return p;
+}
+ZIG
+
+  # 2c. Thread-safe 32K-entry in-RAM PLE 3-gram row cache (pre-faulted at init, 64 striped spinlocks)
+  cat > "$fn_dir/cuda_ple_cache.zig" <<'ZIG'
+//! Exact in-RAM 4-way set-associative cache for immutable Layer-2 PLE 3-gram embeddings and group-32 sums.
+const std = @import("std");
+
+pub const row_w: usize = 2560;
+pub const xs_w: usize = row_w / 32;
+const n_sets: usize = 8192;
+const ways: usize = 4;
+const n_locks: usize = 64;
+
+const Lock = struct {
+    state: std.atomic.Value(u32) align(64) = .init(0),
+
+    fn acquire(self: *Lock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *Lock) void {
+        self.state.store(0, .release);
+    }
+};
+
+const Entry = struct {
+    h0: i64,
+    h1: i64,
+    tok: u32,
+    valid: u32,
+    emb: [row_w]u16,
+    xs: [xs_w]f32,
+};
+
+const Set = struct {
+    hand: u32,
+    items: [ways]Entry,
+};
+
+pub const Cache = struct {
+    sets: []Set,
+    locks: [n_locks]Lock = @splat(.{}),
+
+    pub fn create(gpa: std.mem.Allocator) !*Cache {
+        const sets = try gpa.alloc(Set, n_sets);
+        errdefer gpa.free(sets);
+        @memset(std.mem.sliceAsBytes(sets), 0);
+        const c = try gpa.create(Cache);
+        c.* = .{ .sets = sets };
+        return c;
+    }
+
+    pub fn destroy(self: *Cache, gpa: std.mem.Allocator) void {
+        gpa.free(self.sets);
+        gpa.destroy(self);
+    }
+
+    fn setIndex(h0: i64, h1: i64, tok: u32) usize {
+        var x: u64 = @bitCast(h0);
+        x = (x ^ (@as(u64, @bitCast(h1)) *% 0x9E3779B97F4A7C15)) *% 0xBF58476D1CE4E5B9;
+        x = (x ^ (@as(u64, tok) *% 0x94D049BB133111EB)) *% 0x9E3779B97F4A7C15;
+        return @intCast((x >> 51) & (n_sets - 1));
+    }
+
+    pub fn has(self: *Cache, h0: i64, h1: i64, tok: u32) bool {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) return true;
+        }
+        return false;
+    }
+
+    pub fn get(self: *Cache, h0: i64, h1: i64, tok: u32, emb_out: *[row_w]u16, xs_out: *[xs_w]f32) bool {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) {
+                @memcpy(emb_out, &e.emb);
+                @memcpy(xs_out, &e.xs);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn put(self: *Cache, h0: i64, h1: i64, tok: u32, emb_in: *const [row_w]u16, xs_in: *const [xs_w]f32) void {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) return;
+        }
+        const way: usize = @intCast(set.hand & (ways - 1));
+        set.hand +%= 1;
+        const dst = &set.items[way];
+        dst.h0 = h0;
+        dst.h1 = h1;
+        dst.tok = tok;
+        dst.valid = 1;
+        @memcpy(&dst.emb, emb_in);
+        @memcpy(&dst.xs, xs_in);
+    }
+};
 ZIG
 
   # 2b. Two-stage main lm_head loader: GPU NVFP4 coarse packed weight + shared resident BF16 rows in p.b
@@ -902,15 +1485,483 @@ def patch_exact(rel: str, old: str, new: str) -> None:
         raise RuntimeError(f"Expected exactly 1 match in {rel}, got {txt.count(old)}")
     p.write_text(txt.replace(old, new, 1), encoding="utf-8")
 
-# 5a. cuda_projection_load.zig: MTP BF16 projections -> MXFP8
-for storage, original in (
-    ("t.bytes", "            return projection.dense(a, d, t);"),
-    ("bytes", "        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });"),
-):
-    indent = original[:len(original) - len(original.lstrip())]
-    check = 'if (std.mem.startsWith(u8, prefix, "language_model.mtp."))'
-    project = f'return @import("cuda_mtp_mxfp8.zig").project(a, d, {storage}, n, k);'
-    patch_exact("cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
+# 5a. qmmf.zig + qmmf_shared.zig + cuda_projection_load.zig + cuda_prompt_wt.zig: Mode.bf13 + FP8G half/strided
+cuda_dir = root.parent.parent / "cuda"
+def patch_cuda(rel: str, old: str, new: str) -> None:
+    p = cuda_dir / rel
+    txt = p.read_text(encoding="utf-8")
+    if txt.count(old) != 1:
+        raise RuntimeError(f"Expected exactly 1 match in cuda/{rel}, got {txt.count(old)}")
+    p.write_text(txt.replace(old, new, 1), encoding="utf-8")
+
+patch_cuda(
+    "qmmf.zig",
+    """pub const Mode = enum(u3) { fp4 = 0, fp8 = 1, mxfp8 = 2, fp8g = 3, bf16 = 4 };
+
+const modes = [_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16 };""",
+    """pub const Mode = enum(u3) { fp4 = 0, fp8 = 1, mxfp8 = 2, fp8g = 3, bf16 = 4, bf13 = 5 };
+
+const modes = [_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16, .bf13 };""",
+)
+patch_cuda(
+    "qmmf.zig",
+    """    const w: u32 = switch (mode) {
+        .fp4 => bn * group / 2,
+        .fp8, .mxfp8, .fp8g => bn * group,
+        .bf16 => bn * group * 2,
+    };
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else 0;""",
+    """    const w: u32 = switch (mode) {
+        .fp4 => bn * group / 2,
+        .fp8, .mxfp8, .fp8g => bn * group,
+        .bf16 => bn * group * 2,
+        .bf13 => (bn / 8) * 832,
+    };
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else if (mode == .bf13) bn else 0;""",
+)
+patch_cuda(
+    "qmmf.zig",
+    """pub fn halfShared(mode: Mode) u32 {
+    const w: u32 = if (mode == .bf16) 32 * group * 2 else 32 * group;
+    const s: u32 = if (mode == .mxfp8) 32 * 2 else 0;""",
+    """pub fn halfShared(mode: Mode) u32 {
+    const w: u32 = switch (mode) {
+        .bf16 => 32 * group * 2,
+        .bf13 => (32 / 8) * 832,
+        .fp4 => 32 * group / 2,
+        else => 32 * group,
+    };
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) 32 * 4 else if (mode == .mxfp8) 32 * 2 else if (mode == .bf13) 32 else 0;""",
+)
+patch_cuda(
+    "qmmf.zig",
+    """pub fn halfModeIndex(mode: Mode) ?usize {
+    return switch (mode) {
+        .mxfp8 => 0,
+        .bf16 => 1,
+        else => null,
+    };
+}""",
+    """pub fn halfModeIndex(mode: Mode) ?usize {
+    return switch (mode) {
+        .mxfp8 => 0,
+        .bf16 => 1,
+        .bf13 => 2,
+        .fp8g => 3,
+        else => null,
+    };
+}""",
+)
+patch_cuda(
+    "qmmf.zig",
+    """    half: [2][2][2]Function, // by halfModeIndex, Out, then plain / cluster
+    half_below: usize = half_below_default,
+    shared_down: [4]Function = undefined,""",
+    """    half: [4][2][2]Function, // by halfModeIndex, Out, then plain / cluster
+    half_below: usize = half_below_default,
+    shared_down: [4]Function = undefined,
+    shared_down_bf13: [4]Function = undefined,
+    shared_down_fp8g: [4]Function = undefined,""",
+)
+patch_cuda(
+    "qmmf.zig",
+    """        inline for (.{ Mode.mxfp8, Mode.bf16 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ false, true }, 0..) |cl, ci| {
+            const f = try mod.function(halfSymbol(mode, cl, wide));
+            try f.allowDynamicShared(halfShared(mode));
+            l.half[mi][oi][ci] = f;
+        };
+        for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.bf16, 64));
+        }""",
+    """        inline for (.{ Mode.mxfp8, Mode.bf16, Mode.bf13, Mode.fp8g }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ false, true }, 0..) |cl, ci| {
+            const f = try mod.function(halfSymbol(mode, cl, wide));
+            try f.allowDynamicShared(halfShared(mode));
+            l.half[mi][oi][ci] = f;
+        };
+        for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.bf16, 64));
+        }
+        for (@import("qmmf_shared.zig").bf13_symbols, &l.shared_down_bf13) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.bf13, 64));
+        }
+        for (@import("qmmf_shared.zig").fp8g_symbols, &l.shared_down_fp8g) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.fp8g, 64));
+        }""",
+)
+patch_cuda(
+    "qmmf_shared.zig",
+    'pub const symbols = [4][:0]const u8{ "tf_qmmf_shared16_half", "tf_qmmf_shared16", "tf_qmmf_shared32", "tf_qmmf_shared64" };',
+    'pub const symbols = [4][:0]const u8{ "tf_qmmf_shared16_half", "tf_qmmf_shared16", "tf_qmmf_shared32", "tf_qmmf_shared64" };\npub const bf13_symbols = [4][:0]const u8{ "tf_qmmf_shared_bf13_16_half", "tf_qmmf_shared_bf13_16", "tf_qmmf_shared_bf13_32", "tf_qmmf_shared_bf13_64" };\npub const fp8g_symbols = [4][:0]const u8{ "tf_qmmf_shared_fp8g16_half", "tf_qmmf_shared_fp8g16", "tf_qmmf_shared_fp8g32", "tf_qmmf_shared_fp8g64" };',
+)
+patch_cuda(
+    "qmmf_shared.zig",
+    "    return w.mode == .bf16 and q.planFor(m, w, l.clusters).sk == 1;",
+    "    return (w.mode == .bf16 or w.mode == .bf13 or w.mode == .fp8g) and q.planFor(m, w, l.clusters).sk == 1;",
+)
+patch_cuda(
+    "qmmf_shared.zig",
+    """    var a: launch.Args = .{};
+    a.add(x);
+    a.add(w.codes);
+    a.add(w.scale);
+    a.add(y);
+    for ([_]usize{ m, w.n, w.k, w.npad, if (m == 1) w.k else ldx, band, ldy }) |v| a.add(@as(i32, @intCast(v)));
+    try launch.launch(l.shared_down[index], .{
+        .grid = .{ .x = @intCast(rows * ((w.n + cols - 1) / cols)) },
+        .block = .{ .x = 128 },
+        .shared = if (half) q.halfShared(.bf16) else q.sharedBytes(.bf16, @intCast(bm)),
+    }, s, &a);""",
+    """    if (w.mode == .bf13 or w.mode == .fp8g) {
+        var as: launch.Args = .{};
+        as.add(x);
+        as.add(w.codes);
+        as.add(w.scales);
+        as.add(w.scale);
+        as.add(y);
+        for ([_]usize{ m, w.n, w.k, w.npad, if (m == 1) w.k else ldx, band, ldy }) |v| as.add(@as(i32, @intCast(v)));
+        const f = if (w.mode == .bf13) l.shared_down_bf13[index] else l.shared_down_fp8g[index];
+        return launch.launch(f, .{
+            .grid = .{ .x = @intCast(rows * ((w.n + cols - 1) / cols)) },
+            .block = .{ .x = 128 },
+            .shared = if (half) q.halfShared(w.mode) else q.sharedBytes(w.mode, @intCast(bm)),
+        }, s, &as);
+    }
+    var a: launch.Args = .{};
+    a.add(x);
+    a.add(w.codes);
+    a.add(w.scale);
+    a.add(y);
+    for ([_]usize{ m, w.n, w.k, w.npad, if (m == 1) w.k else ldx, band, ldy }) |v| a.add(@as(i32, @intCast(v)));
+    try launch.launch(l.shared_down[index], .{
+        .grid = .{ .x = @intCast(rows * ((w.n + cols - 1) / cols)) },
+        .block = .{ .x = 128 },
+        .shared = if (half) q.halfShared(.bf16) else q.sharedBytes(.bf16, @intCast(bm)),
+    }, s, &a);""",
+)
+
+patch_exact(
+    "cuda_projection_load.zig",
+    "            return projection.dense(a, d, t);",
+    "            if (@import(\"cuda_mtp_mxfp8.zig\").useForLoad(prefix))\n                return @import(\"cuda_mtp_mxfp8.zig\").project(a, d, t.bytes, n, k);\n            if (@import(\"cuda_bf13.zig\").useForTarget(prefix))\n                return @import(\"cuda_bf13.zig\").project(a, d, t.bytes, n, k);\n            return projection.dense(a, d, t);",
+)
+patch_exact(
+    "cuda_projection_load.zig",
+    "        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });",
+    "        if (@import(\"cuda_mtp_mxfp8.zig\").useForStitched(prefix))\n            return @import(\"cuda_mtp_mxfp8.zig\").project(a, d, bytes, n, k);\n        if (@import(\"cuda_bf13.zig\").useForTarget(prefix))\n            return @import(\"cuda_bf13.zig\").project(a, d, bytes, n, k);\n        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });",
+)
+patch_exact(
+    "cuda_prompt_wt.zig",
+    """    var dq = try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
+    errdefer dq.free();
+    const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
+    if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
+    var uq = try projection.dense(gpa, driver, up);""",
+    """    var dq = if (@import("cuda_mtp_mxfp8.zig").useForHc(prefix))
+        try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, data, n, wide)
+    else if (@import("cuda_bf13.zig").useForTarget(prefix))
+        try @import("cuda_bf13.zig").project(gpa, driver, data, n, wide)
+    else
+        try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
+    errdefer dq.free();
+    const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
+    if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
+    var uq = if (@import("cuda_mtp_mxfp8.zig").useForHc(prefix))
+        try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, up.bytes, wide, low)
+    else if (@import("cuda_bf13.zig").useForTarget(prefix))
+        try @import("cuda_bf13.zig").project(gpa, driver, up.bytes, wide, low)
+    else
+        try projection.dense(gpa, driver, up);""",
+)
+
+# 5a2. cuda_mtp_pieces.zig: direct sk=1 output for native fc_e / fc_h
+patch_exact(
+    "cuda_mtp_pieces.zig",
+    """            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
+            try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
+            // the hidden branch: the four streams normed as one row, fc_hidden on each stream
+            try t.rmsnorm(r.input, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, m, wide, wide);
+            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
+            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);""",
+    """            if (hh.fc_e.native != null) {
+                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, m, 1);
+            } else {
+                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
+                try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
+            }
+            try t.rmsnorm(r.input, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, m, wide, wide);
+            if (hh.fc_h.native != null) {
+                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * m, 1);
+            } else {
+                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
+                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);
+            }""",
+)
+patch_exact(
+    "cuda_mtp_pieces.zig",
+    """            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
+            try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
+            // each lane's rows of main-model streams, side by side (the head reads them as one block of rows)
+            var row0: usize = 0;
+            for (r.group.rows, r.group.nexts) |rw, nx| {
+                try pp.copy(ps.ple_nrow + row0 * wide * 2, rw, nx.len * wide * 2);
+                row0 += nx.len;
+            }
+            try t.rmsnorm(ps.ple_nrow, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, tot, wide, wide);
+            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
+            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);""",
+    """            if (hh.fc_e.native != null) {
+                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, tot, 1);
+            } else {
+                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
+                try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
+            }
+            var row0: usize = 0;
+            for (r.group.rows, r.group.nexts) |rw, nx| {
+                try pp.copy(ps.ple_nrow + row0 * wide * 2, rw, nx.len * wide * 2);
+                row0 += nx.len;
+            }
+            try t.rmsnorm(ps.ple_nrow, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, tot, wide, wide);
+            if (hh.fc_h.native != null) {
+                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * tot, 1);
+            } else {
+                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
+                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);
+            }""",
+)
+
+# 5a3. cuda_ple.zig + cuda_mtp_draft.zig + cuda_mtp_ops.zig + cuda_lanes.zig + cuda_lanes_draft.zig: 32K PLE cache + async CPU pre-warm
+patch_exact(
+    "cuda_ple.zig",
+    "const ple_fp8 = @import(\"cuda_ple_fp8.zig\");",
+    "const ple_fp8 = @import(\"cuda_ple_fp8.zig\");\nconst ple_cache = @import(\"cuda_ple_cache.zig\");",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "    pool: ?*ple_pool.Pool = null, // the gather's parked workers (null: every row on the caller's thread)\n    warmer: ?std.Thread = null, // warm's read-ahead thread until joined (waitWarm, deinit)",
+    "    pool: ?*ple_pool.Pool = null,\n    warmer: ?std.Thread = null,\n    cache: ?*ple_cache.Cache = null,",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "        g.pool = try ple_pool.Pool.create(gpa, io);\n        return g;",
+    "        g.pool = try ple_pool.Pool.create(gpa, io);\n        if (g.width() == ple_cache.row_w and g.hash.n == 3) {\n            g.cache = try ple_cache.Cache.create(gpa);\n        }\n        return g;",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "    pub fn deinit(g: *Ngram) void {\n        g.waitWarm();\n        if (g.pool) |p| p.destroy();",
+    "    pub fn deinit(g: *Ngram) void {\n        g.waitWarm();\n        if (g.cache) |c| c.destroy(g.gpa);\n        if (g.pool) |p| p.destroy();",
+)
+patch_exact(
+    "cuda_ple.zig",
+    """    pub fn rows(g: *const Ngram, history: []i64, tokens: []const u32, out: []u16, xs: []f32) !void {
+        const heads = g.hash.heads;
+        const w = g.width();
+        if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;""",
+    """    pub fn warmToken(g: *const Ngram, hist: *[2]i64, tok: u32) void {
+        const cache = g.cache orelse return;
+        if (g.hash.n != 3 or g.width() != ple_cache.row_w) return;
+        if (cache.has(hist[0], hist[1], tok)) {
+            hist.* = .{ hist[1], tok };
+            return;
+        }
+        var emb: [ple_cache.row_w]u16 = undefined;
+        var xs_tmp: [ple_cache.xs_w]f32 = undefined;
+        g.rows(hist[0..], &.{tok}, &emb, &xs_tmp) catch {};
+    }
+
+    pub fn warmBatch(g: *const Ngram, ds: anytype, nexts: []const []const u32) void {
+        const cache = g.cache orelse return;
+        if (g.hash.n != 3 or g.width() != ple_cache.row_w or ds.len == 0 or ds.len != nexts.len) return;
+        const heads = g.hash.heads;
+        var miss_tok: [16]u32 = undefined;
+        var miss_h0: [16]i64 = undefined;
+        var miss_h1: [16]i64 = undefined;
+        var n_miss: usize = 0;
+        const lim = @min(ds.len, 16);
+        for (0..lim) |i| {
+            const nx = nexts[i];
+            if (nx.len == 0) continue;
+            const tok = nx[nx.len - 1];
+            const d = ds[i];
+            const h0 = d.draft_hist[0];
+            const h1 = d.draft_hist[1];
+            d.draft_hist = .{ h1, tok };
+            if (!cache.has(h0, h1, tok)) {
+                miss_tok[n_miss] = tok;
+                miss_h0[n_miss] = h0;
+                miss_h1[n_miss] = h1;
+                n_miss += 1;
+            }
+        }
+        if (n_miss == 0) return;
+        const miss_items = n_miss * heads;
+        const miss_ids = g.gpa.alloc(i64, miss_items) catch return;
+        defer g.gpa.free(miss_ids);
+        const miss_emb = g.gpa.alloc(u16, n_miss * ple_cache.row_w) catch return;
+        defer g.gpa.free(miss_emb);
+        for (0..n_miss) |m| {
+            const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
+            lastIds(g.hash, &mh, @intCast(miss_tok[m]), miss_ids[m * heads ..][0..heads]) catch return;
+        }
+        if (g.format != .mlx and miss_items > 1) {
+            @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb) catch return;
+        } else {
+            g.fill(miss_ids, miss_emb, 0, miss_items) catch return;
+        }
+        var xs_tmp: [ple_cache.xs_w]f32 = undefined;
+        for (0..n_miss) |m| {
+            const row: *[ple_cache.row_w]u16 = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
+            if (g.format == .mlx and g.scale != 1) {
+                for (row) |*v| {
+                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                    v.* = toBf16(f * g.scale);
+                }
+            }
+            sumGroups(row, &xs_tmp);
+            cache.put(miss_h0[m], miss_h1[m], miss_tok[m], row, &xs_tmp);
+        }
+    }
+
+    pub fn rows(g: *const Ngram, history: []i64, tokens: []const u32, out: []u16, xs: []f32) !void {
+        const heads = g.hash.heads;
+        const w = g.width();
+        if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;
+        if (g.cache) |cache| if (history.len == 2 and w == ple_cache.row_w and tokens.len > 0) {
+            var hist2: [2]i64 = .{ history[0], history[1] };
+            var stack_idx: [64]usize = undefined;
+            var stack_h0: [64]i64 = undefined;
+            var stack_h1: [64]i64 = undefined;
+            const dyn = tokens.len > stack_idx.len;
+            const miss_idx = if (dyn) try g.gpa.alloc(usize, tokens.len) else stack_idx[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_idx);
+            const miss_h0 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h0[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_h0);
+            const miss_h1 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h1[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_h1);
+            var n_miss: usize = 0;
+            for (tokens, 0..) |tok, t| {
+                const out_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                const xs_row: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                if (!cache.get(hist2[0], hist2[1], tok, out_row, xs_row)) {
+                    miss_idx[n_miss] = t;
+                    miss_h0[n_miss] = hist2[0];
+                    miss_h1[n_miss] = hist2[1];
+                    n_miss += 1;
+                }
+                hist2 = .{ hist2[1], tok };
+            }
+            if (n_miss > 0) {
+                const miss_items = n_miss * heads;
+                const miss_ids = try g.gpa.alloc(i64, miss_items);
+                defer g.gpa.free(miss_ids);
+                const miss_emb = try g.gpa.alloc(u16, n_miss * ple_cache.row_w);
+                defer g.gpa.free(miss_emb);
+                for (0..n_miss) |m| {
+                    const t = miss_idx[m];
+                    const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
+                    try lastIds(g.hash, &mh, @intCast(tokens[t]), miss_ids[m * heads ..][0..heads]);
+                }
+                const nt = @min(ple_pool.max_parts, miss_items / 4);
+                if (g.format != .mlx and miss_items > 1) {
+                    try @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb);
+                } else if (nt <= 1 or g.pool == null) {
+                    try g.fill(miss_ids, miss_emb, 0, miss_items);
+                } else {
+                    const split_m: Split = .{ .g = g, .ids = miss_ids, .out = miss_emb, .per = (miss_items + nt - 1) / nt };
+                    try g.pool.?.run(nt, .{ .ctx = &split_m, .run = Split.part });
+                }
+                for (0..n_miss) |m| {
+                    const t = miss_idx[m];
+                    const src_row = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
+                    if (g.format == .mlx and g.scale != 1) {
+                        for (src_row) |*v| {
+                            const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                            v.* = toBf16(f * g.scale);
+                        }
+                    }
+                    const dst_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                    const dst_xs: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                    @memcpy(dst_row, src_row);
+                    sumGroups(dst_row, dst_xs);
+                    cache.put(miss_h0[m], miss_h1[m], tokens[t], dst_row, dst_xs);
+                }
+            }
+            history[0] = hist2[0];
+            history[1] = hist2[1];
+            return;
+        };""",
+)
+patch_exact(
+    "cuda_mtp_draft.zig",
+    "    history: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
+)
+patch_exact(
+    "cuda_lanes.zig",
+    "                if (r.position != l.seq.fed + 1) return error.PositionMismatch;",
+    "                if (r.position != l.seq.fed + 1) return error.PositionMismatch;\n                d.draft_hist = l.seq.history;",
+)
+patch_exact(
+    "cuda_lanes_draft.zig",
+    "        if (r.position != l.seq.fed + 1) return error.PositionMismatch;",
+    "        if (r.position != l.seq.fed + 1) return error.PositionMismatch;\n        d.draft_hist = l.seq.history;",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    """        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+            out.n = 0;
+            try o.absorb(d, next, rows, count > 0);
+            var stop: mtp.Stop = .{ .c = confidence };
+            var j: usize = 0;
+            while (j < @min(count, max_chain)) : (j += 1) {
+                const got = try o.pick(d, position + j, sm);
+                const t = stop.take(j, got.prob);
+                if (!t.propose) break;
+                out.tokens[out.n] = got.token;
+                out.probs[out.n] = got.prob;
+                out.n += 1;
+                if (!t.more) break;
+                if (j + 1 < count) {
+                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    d.drafted += 1;
+                }
+            }
+        }""",
+    """        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+            out.n = 0;
+            try o.absorb(d, next, rows, count > 0);
+            if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
+            var stop: mtp.Stop = .{ .c = confidence };
+            var j: usize = 0;
+            while (j < @min(count, max_chain)) : (j += 1) {
+                const got = try o.pick(d, position + j, sm);
+                const t = stop.take(j, got.prob);
+                if (!t.propose) break;
+                out.tokens[out.n] = got.token;
+                out.probs[out.n] = got.prob;
+                out.n += 1;
+                if (!t.more) break;
+                if (j + 1 < count) {
+                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    d.drafted += 1;
+                    o.e.ngram.warmToken(&d.draft_hist, got.token);
+                }
+            }
+        }""",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    "    try o.forwardHeadMany(ds, nexts, rows, true);",
+    "    try o.forwardHeadMany(ds, nexts, rows, true);\n    o.e.ngram.warmBatch(ds, nexts);",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    "            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);\n            for (step_ds[0..n_step]) |d| d.drafted += 1;",
+    "            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);\n            for (step_ds[0..n_step]) |d| d.drafted += 1;\n            o.e.ngram.warmBatch(step_ds[0..n_step], step_nexts[0..n_step]);",
+)
 
 # 5b. cuda_mtp.zig + cuda_lanes_load.zig: hook W2 proposal head & share Engine's BF16 lm_head buffer
 patch_exact(
@@ -1187,6 +2238,7 @@ PY
     export TF_FLASHNEXT_MTP_W2="1"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_HEAD_NVFP4="1"
+    export TF_FLASHNEXT_BF13="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
@@ -1198,7 +2250,7 @@ PY
       THINK="--thinking"
     else
       export TF_FLASHNEXT_DRAFTS_GREEDY="14"
-      export TF_FLASHNEXT_CONFIDENCE="-0.12"
+      export TF_FLASHNEXT_CONFIDENCE="-0.18"
       CTX="$SPEED_CONTEXT"
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
