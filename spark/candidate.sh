@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4"
+BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4-trunk8"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -34,6 +34,7 @@ MODEL_DIR="$WORKDIR/models/Qwen3.8-Flash-Next-NVFP4-${WEIGHTS_REV:0:8}"
 
 apply_patches() {
   local fn_dir="$SRC_DIR/zig/src/families/flashnext"
+  local cu_dir="$SRC_DIR/zig/src/cuda"
 
   # 1a. Append W2 group-32 proposal GEMV + shared-BF16 exact top-64 rescore kernels to flashnext_mtp.cu
   cat >> "$SRC_DIR/zig/kernels/cuda/flashnext_mtp.cu" <<'CU'
@@ -315,49 +316,160 @@ extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
 }
 CU
 
-  # 2a. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0)
+  # 1c. Append strided MXFP8 shared_expert.down_proj kernels to qmmf.cu
+  cat >> "$SRC_DIR/zig/kernels/cuda/qmmf.cu" <<'CU'
+
+#define TF_SHARED_DOWN_MXFP8(NAME, BM, BN) \
+extern "C" __global__ void __launch_bounds__(128) NAME( \
+        const __nv_bfloat16* x, const unsigned char* w, const uint8_t* bs, float scale, float* out, \
+        int M, int N, int K, int npad, int ldx, int group, int ldy) { \
+    tf_qmmf::qmmf_body<tf_qmmf::MXFP8, BM, BN, 1, 4, 4, true, false, false>( \
+        x, w, bs, scale, out, nullptr, M, N, K, 1, npad, ldx, group, ldy); \
+}
+TF_SHARED_DOWN_MXFP8(tf_qmmf_shared_mxfp8_16_half, 16, 32)
+TF_SHARED_DOWN_MXFP8(tf_qmmf_shared_mxfp8_16, 16, 64)
+TF_SHARED_DOWN_MXFP8(tf_qmmf_shared_mxfp8_32, 32, 64)
+TF_SHARED_DOWN_MXFP8(tf_qmmf_shared_mxfp8_64, 64, 64)
+#undef TF_SHARED_DOWN_MXFP8
+CU
+
+  # 2a. Fast 8-thread bit-exact BF16 -> group-32 UE8M0 MXFP8 projection encoder & tile packer
   cat > "$fn_dir/cuda_mtp_mxfp8.zig" <<'ZIG'
-//! Re-codes the MTP drafter's BF16 linears to group-32 UE8M0 MXFP8 at load; target verify stays untouched.
+//! Re-codes BF16 linears to group-32 UE8M0 MXFP8 across 8 worker threads with bit-exact IEEE-754 exponent math.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
 const projection = @import("cuda_projection.zig");
 
-const top_code: f32 = 448.0;
 const group = 32;
 
-fn value(bf16: []const u8, i: usize) f32 {
-    return @bitCast(@as(u32, std.mem.readInt(u16, bf16[i * 2 ..][0..2], .little)) << 16);
-}
-
-fn exponentFor(top: f32) i32 {
-    if (!(top > 0) or !std.math.isFinite(top)) return 0;
-    var e: i32 = @intFromFloat(@ceil(@log2(top / top_code)));
-    while (std.math.ldexp(top, -e) > top_code) e += 1;
-    while (e > -126 and std.math.ldexp(top, -(e - 1)) <= top_code) e -= 1;
+fn fastExpFor(u16_abs: u16) i32 {
+    if (u16_abs == 0 or u16_abs >= 0x7f80) return 0;
+    if (u16_abs < 0x0080) return -126;
+    const bits: u32 = @as(u32, u16_abs) << 16;
+    const exp_biased: i32 = @intCast((bits >> 23) & 0xff);
+    const mant: u32 = bits & 0x7fffff;
+    const k: i32 = exp_biased - 127;
+    const e: i32 = if (mant <= 0x600000) k - 8 else k - 7;
     return std.math.clamp(e, -126, 127);
 }
 
-pub fn encode(bf16: []const u8, n: usize, k: usize, codes: []u8, scales: []u8) void {
-    std.debug.assert(k % group == 0 and bf16.len == n * k * 2 and codes.len == n * k and scales.len == n * k / group);
-    for (0..n * k / group) |g| {
-        const base = g * group;
-        var top: f32 = 0;
-        for (0..group) |i| top = @max(top, @abs(value(bf16, base + i)));
-        const e = exponentFor(top);
-        scales[g] = @intCast(127 + e);
-        for (0..group) |i| codes[base + i] = core.exlr8.codec.e4m3FromF32(std.math.ldexp(value(bf16, base + i), -e));
+const EncodeCtx = struct {
+    bf16: []const u8,
+    codes: []u8,
+    scales: []u8,
+    groups: usize,
+    per: usize,
+
+    fn worker(ctx: *const EncodeCtx, tid: usize) void {
+        const lo = @min(ctx.groups, tid * ctx.per);
+        const hi = @min(ctx.groups, lo + ctx.per);
+        for (lo..hi) |g| {
+            const base = g * group;
+            var top_u16: u16 = 0;
+            for (0..group) |i| {
+                const u = std.mem.readInt(u16, ctx.bf16[(base + i) * 2 ..][0..2], .little) & 0x7fff;
+                if (u > top_u16) {
+                    top_u16 = u;
+                }
+            }
+            const e = fastExpFor(top_u16);
+            ctx.scales[g] = @intCast(127 + e);
+            const sc_bits: u32 = if (e == 127) 0x00400000 else (@as(u32, @intCast(127 - e)) << 23);
+            const sc: f32 = @bitCast(sc_bits);
+            for (0..group) |i| {
+                const raw = std.mem.readInt(u16, ctx.bf16[(base + i) * 2 ..][0..2], .little);
+                const v: f32 = @bitCast(@as(u32, raw) << 16);
+                ctx.codes[base + i] = core.exlr8.codec.e4m3FromF32(v * sc);
+            }
+        }
     }
+};
+
+const PackCodesCtx = struct {
+    out: []u8,
+    codes: []const u8,
+    n: usize,
+    k: usize,
+    tiles: usize,
+    per: usize,
+
+    fn kin(lane: usize, byte: usize) usize {
+        const p = 16 * (byte / 4) + 4 * (lane % 4) + byte % 4;
+        return 16 * (p / 16) + 2 * ((p % 16) / 4) + p % 2 + 8 * ((p % 4) / 2);
+    }
+
+    fn worker(ctx: *const PackCodesCtx, tid: usize) void {
+        const lo = @min(ctx.tiles, tid * ctx.per);
+        const hi = @min(ctx.tiles, lo + ctx.per);
+        const kg64 = ctx.k / 64;
+        for (lo..hi) |t| {
+            var i: usize = t * kg64 * 4096;
+            for (0..kg64) |g| for (0..8) |a| for (0..32) |lane| for (0..2) |h| for (0..8) |b| {
+                const row = t * 64 + a * 8 + lane / 4;
+                const col = g * 64 + h * 32 + kin(lane, b);
+                ctx.out[i] = if (row < ctx.n) ctx.codes[row * ctx.k + col] else 0;
+                i += 1;
+            };
+        }
+    }
+};
+
+pub fn useFor(prefix: []const u8) bool {
+    if (std.mem.startsWith(u8, prefix, "language_model.mtp.")) return true;
+    if (!std.mem.startsWith(u8, prefix, "language_model.model.")) return false;
+    const raw = std.c.getenv("TF_FLASHNEXT_TRUNK_MXFP8") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+pub fn encode(bf16: []const u8, n: usize, k: usize, codes: []u8, scales: []u8) !void {
+    std.debug.assert(k % group == 0 and bf16.len == n * k * 2 and codes.len == n * k and scales.len == n * k / group);
+    const groups = n * k / group;
+    const n_th: usize = if (groups >= 4096) 8 else 1;
+    const ctx: EncodeCtx = .{ .bf16 = bf16, .codes = codes, .scales = scales, .groups = groups, .per = (groups + n_th - 1) / n_th };
+    if (n_th == 1) {
+        ctx.worker(0);
+        return;
+    }
+    var ths: [8]?std.Thread = @splat(null);
+    for (0..n_th) |ti| ths[ti] = try std.Thread.spawn(.{}, EncodeCtx.worker, .{ &ctx, ti });
+    for (&ths) |*th| if (th.*) |tr| tr.join();
 }
 
 pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const u8, n: usize, k: usize) !projection.Projection {
     if (k % 64 != 0 or bf16.len != n * k * 2) return error.UnexpectedTensor;
-    const codes = try gpa.alloc(u8, n * k);
+    const raw_codes = try gpa.alloc(u8, n * k);
+    defer gpa.free(raw_codes);
+    const raw_scales = try gpa.alloc(u8, n * k / group);
+    defer gpa.free(raw_scales);
+    try encode(bf16, n, k, raw_codes, raw_scales);
+
+    const npad = cuda.mxfp8.padded(n);
+    const codes = try gpa.alloc(u8, npad * k);
     defer gpa.free(codes);
-    const scales = try gpa.alloc(u8, n * k / group);
+    const scales = try gpa.alloc(u8, (npad * k) / group);
     defer gpa.free(scales);
-    encode(bf16, n, k, codes, scales);
-    return projection.mxfp8(gpa, driver, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / group, 1, 1, 1 }, .bytes = scales });
+
+    const tiles = npad / 64;
+    const n_th: usize = if (tiles >= 8) 8 else 1;
+    const pctx: PackCodesCtx = .{ .out = codes, .codes = raw_codes, .n = n, .k = k, .tiles = tiles, .per = (tiles + n_th - 1) / n_th };
+    if (n_th == 1) {
+        pctx.worker(0);
+    } else {
+        var ths: [8]?std.Thread = @splat(null);
+        for (0..n_th) |ti| ths[ti] = try std.Thread.spawn(.{}, PackCodesCtx.worker, .{ &pctx, ti });
+        for (&ths) |*th| if (th.*) |tr| tr.join();
+    }
+    cuda.mxfp8.packScales(scales, raw_scales, n, k);
+
+    var p = projection.Projection.empty(driver);
+    p.w = try cuda.DeviceBuffer.fromHost(driver, codes);
+    errdefer p.w.free();
+    p.s = try cuda.DeviceBuffer.fromHost(driver, scales);
+    p.n = n;
+    p.k = k;
+    p.native = cuda.mxfp8.weight(p.w.ptr, p.s.ptr, n, k);
+    return p;
 }
 ZIG
 
@@ -460,6 +572,48 @@ pub fn load(driver: *cuda.Driver, stream: cuda.Stream, store: anytype, t: core.s
         .k = k,
         .native = cuda.nvfp4.weight(w_buf.ptr, s_buf.ptr, global_scale, n, k),
     };
+}
+ZIG
+
+  # 2c. Extend qmmf_shared.zig to support strided MXFP8 shared_expert.down_proj
+  cat > "$cu_dir/qmmf_shared.zig" <<'ZIG'
+//! BF16 and MXFP8 weight products with one K slice write FP32 rows directly into a caller's row stride.
+const q = @import("qmmf.zig");
+const launch = @import("launch.zig");
+const Stream = @import("stream.zig").Stream;
+pub const symbols = [4][:0]const u8{ "tf_qmmf_shared16_half", "tf_qmmf_shared16", "tf_qmmf_shared32", "tf_qmmf_shared64" };
+pub const mxfp8_symbols = [4][:0]const u8{ "tf_qmmf_shared_mxfp8_16_half", "tf_qmmf_shared_mxfp8_16", "tf_qmmf_shared_mxfp8_32", "tf_qmmf_shared_mxfp8_64" };
+
+pub fn eligible(l: q.Lane, m: usize, w: q.Weight, ldx: usize, ldy: usize) bool {
+    if (m == 0 or w.n == 0 or w.k == 0 or w.k % q.group != 0 or w.npad < w.n or w.npad % 128 != 0) return false;
+    if (ldy < w.n or ldx < w.k or (m > 1 and ldx % 8 != 0)) return false;
+    return (w.mode == .bf16 or w.mode == .mxfp8) and q.planFor(m, w, l.clusters).sk == 1;
+}
+
+pub fn matmulF32Strided(l: q.Lane, s: Stream, x: u64, ldx: usize, m: usize, w: q.Weight, y: u64, ldy: usize) !void {
+    if (!eligible(l, m, w, ldx, ldy)) return error.StridedLaneNotSupported;
+    const bm: usize = q.bucket(m);
+    const rows = (m + bm - 1) / bm;
+    const half = bm == 16 and rows * ((w.n + 63) / 64) < l.half_below;
+    const index: usize = if (half) 0 else if (bm == 16) 1 else if (bm == 32) 2 else 3;
+    const cols: usize = if (half) 32 else 64;
+    const band = @max(1, @min(rows, (12 << 20) / (bm * w.k * 2)));
+    var a: launch.Args = .{};
+    a.add(x);
+    a.add(w.codes);
+    if (w.mode == .mxfp8) {
+        a.add(w.scales);
+    }
+    a.add(w.scale);
+    a.add(y);
+    for ([_]usize{ m, w.n, w.k, w.npad, if (m == 1) w.k else ldx, band, ldy }) |v| a.add(@as(i32, @intCast(v)));
+    const f = if (w.mode == .mxfp8) l.shared_down_mxfp8[index] else l.shared_down[index];
+    const smem = if (half) q.halfShared(w.mode) else q.sharedBytes(w.mode, @intCast(bm));
+    try launch.launch(f, .{
+        .grid = .{ .x = @intCast(rows * ((w.n + cols - 1) / cols)) },
+        .block = .{ .x = 128 },
+        .shared = smem,
+    }, s, &a);
 }
 ZIG
 
@@ -889,51 +1043,81 @@ fn part(store: anytype, prefix: []const u8, i: usize, name: []const u8, n: usize
 ZIG
 
   # 5. Wire Zig call sites cleanly
-  python3 - "$fn_dir" <<'PY'
+  python3 - "$fn_dir" "$cu_dir" <<'PY'
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+cu_root = Path(sys.argv[2])
 
-def patch_exact(rel: str, old: str, new: str) -> None:
-    p = root / rel
+def patch_exact(base: Path, rel: str, old: str, new: str) -> None:
+    p = base / rel
     txt = p.read_text(encoding="utf-8")
     if txt.count(old) != 1:
         raise RuntimeError(f"Expected exactly 1 match in {rel}, got {txt.count(old)}")
     p.write_text(txt.replace(old, new, 1), encoding="utf-8")
 
-# 5a. cuda_projection_load.zig: MTP BF16 projections -> MXFP8
+# 5a. cuda_projection_load.zig: MTP + opt-in main trunk/shared/ple BF16 projections -> MXFP8
 for storage, original in (
     ("t.bytes", "            return projection.dense(a, d, t);"),
     ("bytes", "        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });"),
 ):
     indent = original[:len(original) - len(original.lstrip())]
-    check = 'if (std.mem.startsWith(u8, prefix, "language_model.mtp."))'
+    check = 'if (@import("cuda_mtp_mxfp8.zig").useFor(prefix))'
     project = f'return @import("cuda_mtp_mxfp8.zig").project(a, d, {storage}, n, k);'
-    patch_exact("cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
+    patch_exact(root, "cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
+
+# 5a2. cuda/qmmf.zig: load strided MXFP8 shared_expert.down_proj kernels
+patch_exact(
+    cu_root,
+    "qmmf.zig",
+    "    shared_down: [4]Function = undefined,",
+    "    shared_down: [4]Function = undefined,\n    shared_down_mxfp8: [4]Function = undefined,",
+)
+patch_exact(
+    cu_root,
+    "qmmf.zig",
+    """        for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.bf16, 64));
+        }""",
+    """        for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.bf16, 64));
+        }
+        for (@import("qmmf_shared.zig").mxfp8_symbols, &l.shared_down_mxfp8) |name, *f| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(sharedBytes(.mxfp8, 64));
+        }""",
+)
 
 # 5b. cuda_mtp.zig + cuda_lanes_load.zig: hook W2 proposal head & share Engine's BF16 lm_head buffer
 patch_exact(
+    root,
     "cuda_mtp.zig",
     "    topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)",
     "    topk_fn: cuda.Function,\n    w2: @import(\"cuda_mtp_w2.zig\").W2 = .{},",
 )
 patch_exact(
+    root,
     "cuda_mtp.zig",
     "        h.draw_batch = try @import(\"cuda_draw_batch.zig\").Batch.init(gpa, driver, batch_on, h.ids.len);\n        return h;",
     "        h.draw_batch = try @import(\"cuda_draw_batch.zig\").Batch.init(gpa, driver, batch_on, h.ids.len);\n        errdefer h.draw_batch.deinit(gpa);\n        h.w2 = try @import(\"cuda_mtp_w2.zig\").W2.init(gpa, driver, &store, &h.artifact, &h.module);\n        return h;",
 )
 patch_exact(
+    root,
     "cuda_mtp.zig",
     "    pub fn deinit(h: *Head) void {\n        h.draw_batch.deinit(h.gpa);",
     "    pub fn deinit(h: *Head) void {\n        h.w2.deinit();\n        h.draw_batch.deinit(h.gpa);",
 )
 patch_exact(
+    root,
     "cuda_mtp.zig",
     "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (h.draft.native) |weight| {",
     "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (rows == 1 and h.w2.ready()) return h.w2.project(h, pass.stream, input, out, h.ids.len);\n        if (h.draft.native) |weight| {",
 )
 patch_exact(
+    root,
     "cuda_lanes_load.zig",
     "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);",
     "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);\n        own.head.?.w2.bf16_ptr = own.engine.head_q.b.ptr;",
@@ -941,6 +1125,7 @@ patch_exact(
 
 # 5c. cuda_lanes_bytes.zig: reflect NVFP4 MTP expert size in budget check
 patch_exact(
+    root,
     "cuda_lanes_bytes.zig",
     "pub fn headFp8(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {",
     "pub fn headFp8(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {\n    if (std.c.getenv(\"TF_FLASHNEXT_MTP_EXPERTS\")) |v| if (std.mem.eql(u8, std.mem.span(v), \"nvfp4\")) return false;",
@@ -948,21 +1133,25 @@ patch_exact(
 
 # 5d. cuda_prompt.zig + cuda_batch_kernels.zig + cuda_batch_head.zig: two-stage exact NVFP4 + top-128 BF16 rescore head
 patch_exact(
+    root,
     "cuda_prompt.zig",
     "            e.head_q = try @import(\"cuda_projection.zig\").dense(gpa, driver, if (try @import(\"cuda_head.zig\").enabled()) try @import(\"cuda_head.zig\").shard(head_tensor, world, rank) else head_tensor);",
     "            e.head_q = if (world == 1 and !(try @import(\"cuda_head.zig\").enabled()) and @import(\"cuda_head_nvfp4.zig\").enabled())\n                try @import(\"cuda_head_nvfp4.zig\").load(driver, stream.*, &e.store, head_tensor)\n            else\n                try @import(\"cuda_projection.zig\").dense(gpa, driver, if (try @import(\"cuda_head.zig\").enabled()) try @import(\"cuda_head.zig\").shard(head_tensor, world, rank) else head_tensor);",
 )
 patch_exact(
+    root,
     "cuda_batch_kernels.zig",
     "    select: cuda.Function,\n    select_lanes: cuda.Function,",
     "    select: cuda.Function,\n    select_lanes: cuda.Function,\n    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,",
 )
 patch_exact(
+    root,
     "cuda_batch_kernels.zig",
     "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        return k;",
     "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        k.head_topk_floor = try k.batch.function(\"fn_head_topk_floor\");\n        k.head_rescore = try k.batch.function(\"fn_head_rescore\");\n        return k;",
 )
 patch_exact(
+    root,
     "cuda_batch_head.zig",
     """    if (self.m.head.n == vocab) {
         _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
@@ -1117,7 +1306,7 @@ new_cache = """pub fn Cache(comptime K: type) type {
             try exec.launchOn(stream);
         }"""
 
-patch_exact("cuda_window_graph.zig", old_cache, new_cache)
+patch_exact(root, "cuda_window_graph.zig", old_cache, new_cache)
 PY
 }
 
@@ -1187,12 +1376,13 @@ PY
     export TF_FLASHNEXT_MTP_W2="1"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_HEAD_NVFP4="1"
+    export TF_FLASHNEXT_TRUNK_MXFP8="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
-      export TF_FLASHNEXT_DRAFTS="6"
+      export TF_FLASHNEXT_DRAFTS="8"
       export TF_FLASHNEXT_DRAFTS_GREEDY="14"
-      export TF_FLASHNEXT_CONFIDENCE="-0.35"
+      export TF_FLASHNEXT_CONFIDENCE="-0.25"
       CTX="$GUARD_CONTEXT"
       PAR="$GUARD_PARALLEL"
       THINK="--thinking"
