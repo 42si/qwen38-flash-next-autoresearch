@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl-t26"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl2-sk8-wbn4-t27"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -49,7 +49,6 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
     float4* __restrict__ stats,
     int V) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
     __shared__ float sx[2560];
@@ -64,7 +63,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
         const float* xg = sx + tid * 32;
         #pragma unroll
         for (int j = 0; j < 32; ++j) s += xg[j];
-        sg_sum[tid] = 1.5f * s;
+        sg_sum[tid] = 2.75f * s;
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -75,30 +74,44 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
         const uint4* wp = W + static_cast<size_t>(blk) * 40 * 32 + lane;
         const uint16_t* sp = S + static_cast<size_t>(blk) * 40 * 32 + lane;
         float acc = 0.0f;
+        uint4 w4 = __ldg(wp);
+        uint32_t s2 = __ldg(sp);
+        auto q2f = [](uint32_t word, int j) -> float {
+            const uint32_t bits = (j <= 10) ? ((word << (21 - 2 * j)) & 0x00600000u) : ((word >> (2 * j - 21)) & 0x00600000u);
+            return __uint_as_float(0x40000000u | bits);
+        };
         for (int g2 = 0; g2 < 40; ++g2) {
-            const uint4 w4 = __ldg(wp + g2 * 32);
-            const uint32_t s2 = __ldg(sp + g2 * 32);
+            uint4 nw4;
+            uint32_t ns2;
+            if (g2 + 1 < 40) {
+                nw4 = __ldg(wp + (g2 + 1) * 32);
+                ns2 = __ldg(sp + (g2 + 1) * 32);
+            }
             const uint32_t sx2 = (s2 & 0xFFu) | ((s2 & 0xFF00u) << 8);
             const uint32_t ts = ((sx2 & 0x007F007Fu) << 4) | ((sx2 & 0x00800080u) << 8);
             uint32_t bf2;
             asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(bf2) : "r"(ts), "r"(0x7B807B80u), "r"(0x80008000u));
-            const float sc0 = __uint_as_float((bf2 & 0xFFFFu) << 16);
-            const float sc1 = __uint_as_float(bf2 & 0xFFFF0000u);
+            const float sc0 = 2.0f * __uint_as_float((bf2 & 0xFFFFu) << 16);
+            const float sc1 = 2.0f * __uint_as_float(bf2 & 0xFFFF0000u);
             const int g0 = g2 * 2;
             const float* xg0 = sx + g0 * 32;
             float dot0 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[j], static_cast<float>((w4.x >> (2 * j)) & 3u), dot0);
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[j], q2f(w4.x, j), dot0);
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[16 + j], static_cast<float>((w4.y >> (2 * j)) & 3u), dot0);
+            for (int j = 0; j < 16; ++j) dot0 = fmaf(xg0[16 + j], q2f(w4.y, j), dot0);
             acc = fmaf(sc0, dot0 - sg_sum[g0], acc);
             const float* xg1 = sx + (g0 + 1) * 32;
             float dot1 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[j], static_cast<float>((w4.z >> (2 * j)) & 3u), dot1);
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[j], q2f(w4.z, j), dot1);
             #pragma unroll
-            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[16 + j], static_cast<float>((w4.w >> (2 * j)) & 3u), dot1);
+            for (int j = 0; j < 16; ++j) dot1 = fmaf(xg1[16 + j], q2f(w4.w, j), dot1);
             acc = fmaf(sc1, dot1 - sg_sum[g0 + 1], acc);
+            if (g2 + 1 < 40) {
+                w4 = nw4;
+                s2 = ns2;
+            }
         }
         acc *= __ldg(G + row);
         if (row < V) {
@@ -107,6 +120,9 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(
             fv = __bfloat162float(bv);
         }
     }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
     float wm = fv;
     int wc = (row < V) ? row : 0x7fffffff;
     for (int o = 16; o; o >>= 1) {
@@ -147,8 +163,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best(
     int V,
     float* __restrict__ best_out) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     __shared__ float sx[320 * 9];
@@ -454,8 +470,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_row_argmax(
     long long ld,
     float* __restrict__ out) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     using namespace fn_mtp;
     const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -573,8 +589,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     int K,
     int* __restrict__ out_c) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int r = blockIdx.x, t = threadIdx.x, nt = blockDim.x;
     unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
@@ -847,8 +863,8 @@ extern "C" __global__ void __launch_bounds__(256) fn_head_rescore(
     int V,
     int K) {
 #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     const int r = blockIdx.y;
     if (cols[static_cast<long long>(r) * K] < 0) return;
@@ -1370,7 +1386,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
         int group, int ldy) {
-    qmm_frag::grid_launch();
 #define TF_QMMF_STRIDED
 #define TF_QMMF_WFIRST
 #include "qmmf_body.cuh"
@@ -1384,7 +1399,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
         int group) {
-    if constexpr (BN <= 64) qmm_frag::grid_launch();
 #define TF_QMMF_WFIRST
 #include "qmmf_body.cuh"
 #undef TF_QMMF_WFIRST
@@ -1400,8 +1414,8 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
     """template <bool F32>
 __global__ void reduce_kernel(const float* part, void* __restrict__ out, long long total, int SK,
                               float scale) {
-    qmm_frag::grid_launch();
     qmm_frag::grid_wait();
+    qmm_frag::grid_launch();
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;""",
 )
 qmmf_p = kdir / "qmmf.cu"
@@ -1477,7 +1491,20 @@ patch_k(
     }""",
 )
 
-# nvfp4_experts.cu: coherent dynamic reads (X/items/counts/members) + PDL enter on decode kernels (keep ld_nc on W/scale)
+patch_k(
+    "qmmf_body.cuh",
+    """    wait<0>();
+    __syncthreads();
+    if constexpr (FUSE) {""",
+    """    wait<0>();
+    __syncthreads();
+#ifdef TF_QMMF_WFIRST
+    if constexpr (BN <= 64) qmm_frag::grid_launch();
+#endif
+    if constexpr (FUSE) {""",
+)
+
+# nvfp4_experts.cu: coherent dynamic reads + non-cascading PDL (wait at entry, launch_dependents after K-loop / before return)
 nvp = kdir / "nvfp4_experts.cu"
 nvtxt = nvp.read_text(encoding="utf-8")
 for old_s, new_s in [
@@ -1522,29 +1549,49 @@ for old_s, new_s in [
                         const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
                         float limit, int skip) {
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = __ldg(counts) * NB;""",
+  const int units = __ldg(counts) * NB;
+  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+}""",
      """    nvfp4_expert_kernel(const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
                         const float* __restrict__ scale, int KG, int NB, const int* items,
                         const int* counts, const int* members, void* __restrict__ out, int N,
                         float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = (*counts) * NB;"""),
+  const int units = (*counts) * NB;
+  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+  qmm_frag::grid_launch();
+}"""),
     ("""    nvfp4_expert_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                        const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                        const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
                        float limit, int skip) {
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = __ldg(counts) * NB;""",
+  const int units = __ldg(counts) * NB;
+  if (units == 0) return;  // no items: no wave to divide by
+  const int warps = gridDim.x * WARPS, waves = (units + warps - 1) / warps;
+  const int run = (units + waves - 1) / waves, w = blockIdx.x * WARPS + (threadIdx.x >> 5);
+  if (w >= run) return;
+  for (int unit = w; unit < units; unit += run)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+}""",
      """    nvfp4_expert_waves(const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
                        const float* __restrict__ scale, int KG, int NB, const int* items,
                        const int* counts, const int* members, void* __restrict__ out, int N,
                        float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = (*counts) * NB;"""),
+  const int units = (*counts) * NB;
+  if (units == 0) { qmm_frag::grid_launch(); return; }
+  const int warps = gridDim.x * WARPS, waves = (units + warps - 1) / warps;
+  const int run = (units + waves - 1) / waves, w = blockIdx.x * WARPS + (threadIdx.x >> 5);
+  if (w >= run) { qmm_frag::grid_launch(); return; }
+  for (int unit = w; unit < units; unit += run)
+    unit_full<M, EPI>(unit, lane, gq, t, X, x_stride, slots, W, scale, KG, NB, items, members, out, N, limit, skip);
+  qmm_frag::grid_launch();
+}"""),
     ("""    nvfp4_expert_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
@@ -1565,7 +1612,6 @@ for old_s, new_s in [
                       const float* __restrict__ scale, int KG, int NB, const int* items,
                       const int* counts, const int* members, void* __restrict__ out, int N,
                       float limit, int skip) {
-  qmm_frag::grid_launch();
   qmm_frag::grid_wait();
   constexpr int D = 2;
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
@@ -1579,6 +1625,15 @@ for old_s, new_s in [
       const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
       const int pr0 = v0 ? members[first + r0 + gq] : 0;
       const int pr1 = v1 ? members[first + r0 + gq + 8] : 0;"""),
+    ("""      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
+    }
+  }
+}""",
+     """      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
+    }
+  }
+  qmm_frag::grid_launch();
+}"""),
 ]:
     if nvtxt.count(old_s) != 1:
         raise RuntimeError(f"Expected 1 match in nvfp4_experts.cu, got {nvtxt.count(old_s)}")
@@ -1590,8 +1645,119 @@ nvtxt = nvtxt.replace(
 )
 nvp.write_text(nvtxt, encoding="utf-8")
 
-# Instrument remaining decode .cu/.cuh kernels with unconditional PDL enter() and coherent const inputs
-PDL_SNIP = "\n#if __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n    asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n#endif\n"
+# 4x-parallel (row, stream) fused hc_writeback_norm in flashnext_hc.cu (grid=(rows, 4): 64 CTAs on 48 SMs, 4x fewer regs)
+patch_k(
+    "flashnext_hc.cu",
+    """    constexpr int D = NC * 256;
+    __shared__ float red[NC][8][S];
+    __shared__ float rinv[S];
+    const int r = blockIdx.x, warp = threadIdx.x >> 5;
+    float hv[NC][S];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int d = c * 256 + threadIdx.x;
+        float branch = 0.0f;
+        if constexpr (MODE == 4) {
+            float acc = BR[static_cast<long long>(r) * D + d];
+            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+            branch = rbf(acc);
+        } else if constexpr (MODE == 2) {
+            float acc = 0.0f;
+            for (int k = 0; k <= TOPK; ++k) {
+                const long long at = static_cast<long long>(r) * SLOTS + k;
+                acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+            }
+            branch = rbf(acc);
+        }
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const long long at = static_cast<long long>(r) * S * D + static_cast<long long>(s) * D + d;
+            float v = bf(H[at]);
+            if constexpr (MODE != 0) {
+                v = rbf(__fmaf_rn(branch, bf(INJ[r * S + s]), v));
+                HOUT[at] = __float2bfloat16_rn(v);
+            }
+            hv[c][s] = v;
+            const float ss = warp_sum(__fmul_rn(v, v));
+            if ((threadIdx.x & 31) == 0) red[c][warp][s] = ss;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < S) {
+        float all = 0.0f;
+        for (int c = 0; c < NC; ++c) {
+            float total = 0.0f;
+            for (int w = 0; w < 8; ++w) total = __fadd_rn(total, red[c][w][threadIdx.x]);
+            PSS[(static_cast<long long>(r) * NC + c) * S + threadIdx.x] = total;
+            all = __fadd_rn(all, total);
+        }
+        rinv[threadIdx.x] = tf_common::rms_scale(all, D, eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const int col = s * D + c * 256 + threadIdx.x;
+            NORM[static_cast<long long>(r) * S * D + col] =
+                __float2bfloat16_rn(__fmul_rn(__fmul_rn(hv[c][s], rinv[s]), SCALE[col]));
+        }""",
+    """    constexpr int D = NC * 256;
+    __shared__ float red[NC][8];
+    __shared__ float rinv_s;
+    const int r = blockIdx.x, s = blockIdx.y, warp = threadIdx.x >> 5;
+    float inj_s = 0.0f;
+    if constexpr (MODE != 0) inj_s = bf(INJ[r * S + s]);
+    float hv[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int d = c * 256 + threadIdx.x;
+        float branch = 0.0f;
+        if constexpr (MODE == 4) {
+            float acc = BR[static_cast<long long>(r) * D + d];
+            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+            branch = rbf(acc);
+        } else if constexpr (MODE == 2) {
+            float acc = 0.0f;
+            for (int k = 0; k <= TOPK; ++k) {
+                const long long at = static_cast<long long>(r) * SLOTS + k;
+                acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+            }
+            branch = rbf(acc);
+        }
+        const long long at = static_cast<long long>(r) * S * D + static_cast<long long>(s) * D + d;
+        float v = bf(H[at]);
+        if constexpr (MODE != 0) {
+            v = rbf(__fmaf_rn(branch, inj_s, v));
+            HOUT[at] = __float2bfloat16_rn(v);
+        }
+        hv[c] = v;
+        const float ss = warp_sum(__fmul_rn(v, v));
+        if ((threadIdx.x & 31) == 0) red[c][warp] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float all = 0.0f;
+        for (int c = 0; c < NC; ++c) {
+            float total = 0.0f;
+            for (int w = 0; w < 8; ++w) total = __fadd_rn(total, red[c][w]);
+            PSS[(static_cast<long long>(r) * NC + c) * S + s] = total;
+            all = __fadd_rn(all, total);
+        }
+        rinv_s = tf_common::rms_scale(all, D, eps);
+    }
+    __syncthreads();
+    const float rv = rinv_s;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int col = s * D + c * 256 + threadIdx.x;
+        NORM[static_cast<long long>(r) * S * D + col] =
+            __float2bfloat16_rn(__fmul_rn(__fmul_rn(hv[c], rv), SCALE[col]));
+    }""",
+)
+
+# Instrument remaining decode .cu/.cuh kernels with non-cascading PDL (wait FIRST, then launch_dependents)
+PDL_SNIP = "\n#if __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n    asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n#endif\n"
 
 def instrument_pdl(rel: str, expect_min: int = 0, only_prefix: str | None = None, stop_marker: str | None = None) -> int:
     p = kdir / rel
@@ -3432,7 +3598,23 @@ patch_exact(
 patch_exact(
     root, "cuda_batch_hc.zig",
     "    return n >= 64 and hc_w.down.native != null",
-    "    return n >= 48 and hc_w.down.native != null",
+    "    return n >= 8 and hc_w.down.native != null",
+)
+patch_exact(
+    root, "cuda_glue.zig",
+    "        const grid: [3]usize = .{ rows, 1, 1 };",
+    "        const grid: [3]usize = .{ rows, 4, 1 };",
+)
+# Issue #3681: keep clusters for sk<=4 only; run sk=8 (out_proj/o_proj/hc_down) as full-GPU plain split-K + PDL reduce
+patch_exact(
+    cdir, "qmmf.zig",
+    "    const cluster = !fused and sk > 1 and sk <= 8 and clusters;",
+    "    const cluster = !fused and sk > 1 and sk <= 4 and clusters;",
+)
+patch_exact(
+    root, "cuda_prompt.zig",
+    ".lane_reduce = !e.batch_k.native_lane.clusters };",
+    ".lane_reduce = true };",
 )
 patch_exact(
     root, "cuda_mtp.zig",
@@ -3919,7 +4101,7 @@ PY
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_HEAD_NVFP4="1"
     export TF_FLASHNEXT_TRUNK_BF12="1"
-    export TF_FLASHNEXT_FUSED_SPLIT="1"
+    export TF_FLASHNEXT_FUSED_SPLIT="0"
     export TF_NVFP4_DECODE_WARPS="1"
     export TF_NVFP4_DYNAMIC_GRID="1"
     export TF_FLASHNEXT_ATTN_LANES="1"
