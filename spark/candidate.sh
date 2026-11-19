@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2-nvfp4-g4"
+BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -35,7 +35,7 @@ MODEL_DIR="$WORKDIR/models/Qwen3.8-Flash-Next-NVFP4-${WEIGHTS_REV:0:8}"
 apply_patches() {
   local fn_dir="$SRC_DIR/zig/src/families/flashnext"
 
-  # 1. Append W2 group-32 proposal GEMV + exact BF16 top-64 rescore kernels to flashnext_mtp.cu
+  # 1a. Append W2 group-32 proposal GEMV + shared-BF16 exact top-64 rescore kernels to flashnext_mtp.cu
   cat >> "$SRC_DIR/zig/kernels/cuda/flashnext_mtp.cu" <<'CU'
 
 extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv(
@@ -89,14 +89,16 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_gemv(
 
 extern "C" __global__ void __launch_bounds__(256) fn_w2_rescore(
     const __nv_bfloat16* __restrict__ X,
-    const __nv_bfloat16* __restrict__ W_bf16,
+    const __nv_bfloat16* __restrict__ W_full_bf16,
+    const uint32_t* __restrict__ vocab_ids,
     const int* __restrict__ cols,
     __nv_bfloat16* __restrict__ dlogits,
     int V) {
     const int c = cols[blockIdx.x];
     if (c < 0 || c >= V) return;
+    const uint32_t gid = vocab_ids[c];
     const uint32_t* xp = reinterpret_cast<const uint32_t*>(X);
-    const uint32_t* wp = reinterpret_cast<const uint32_t*>(W_bf16 + static_cast<size_t>(c) * 2560);
+    const uint32_t* wp = reinterpret_cast<const uint32_t*>(W_full_bf16 + static_cast<size_t>(gid) * 2560);
     float sum = 0.0f;
     for (int i = threadIdx.x; i < 1280; i += 256) {
         const uint32_t xv = __ldg(xp + i);
@@ -120,7 +122,200 @@ extern "C" __global__ void __launch_bounds__(256) fn_w2_rescore(
 }
 CU
 
-  # 2. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0)
+  # 1b. Append NVFP4 head quantizer + fused top-128 & floor + exact BF16 rescore kernels to flashnext_batch.cu
+  cat >> "$SRC_DIR/zig/kernels/cuda/flashnext_batch.cu" <<'CU'
+
+#include <cuda_fp8.h>
+
+extern "C" __global__ void __launch_bounds__(256) fn_bf16_to_nvfp4(
+    const uint16_t* __restrict__ bf16,
+    float global_scale,
+    uint8_t* __restrict__ codes,
+    uint8_t* __restrict__ scales,
+    long long total_groups) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total_groups) return;
+    float w[16];
+    float mmax = 0.0f;
+    const uint16_t* gp = bf16 + idx * 16;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const uint32_t bits = gp[j];
+        const float f = __uint_as_float(bits << 16);
+        w[j] = f;
+        mmax = fmaxf(mmax, fabsf(f));
+    }
+    const float target = fminf(fmaxf(mmax / (global_scale * 6.0f), 0.0f), 448.0f);
+    const __nv_fp8_storage_t sc_code = __nv_cvt_float_to_fp8(target, __NV_SATFINITE, __NV_E4M3);
+    scales[idx] = static_cast<uint8_t>(sc_code);
+    const float sc_val = __half2float(__half(__nv_cvt_fp8_to_halfraw(sc_code, __NV_E4M3))) * global_scale;
+    uint64_t word = 0;
+    if (sc_val > 0.0f) {
+        const float inv = 1.0f / sc_val;
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            auto q4 = [](float v) -> uint64_t {
+                const uint64_t s = signbit(v) ? 8ull : 0ull;
+                const float a = fabsf(v);
+                const uint64_t m = a < 0.25f ? 0ull : a <= 0.75f ? 1ull : a < 1.25f ? 2ull : a <= 1.75f ? 3ull : a < 2.5f ? 4ull : a <= 3.5f ? 5ull : a < 5.0f ? 6ull : 7ull;
+                return s | m;
+            };
+            const uint64_t b = q4(w[2 * p] * inv) | (q4(w[2 * p + 1] * inv) << 4);
+            word |= (b << (8 * p));
+        }
+    }
+    reinterpret_cast<uint64_t*>(codes)[idx] = word;
+}
+
+extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
+    __nv_bfloat16* __restrict__ L,
+    int V,
+    long long ld,
+    int K,
+    int* __restrict__ out_c) {
+    const int r = blockIdx.x, t = threadIdx.x, nt = blockDim.x;
+    unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
+    int* oc = out_c + static_cast<long long>(r) * K;
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int scan[1024], scan_eq[1024];
+    __shared__ unsigned int pick_hi, pick_lo, above;
+    for (int i = t; i < 256; i += nt) hist[i] = 0;
+    __syncthreads();
+    int bad = 0;
+    for (int i = t; i < V; i += nt) {
+        const unsigned short u = row[i];
+        bad |= ((u & 0x7fff) > 0x7f80) | (u == 0x7f80);
+        const unsigned short uk = (u == 0x8000u) ? 0u : u;
+        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+        atomicAdd(&hist[ok >> 8], 1u);
+    }
+    const int row_bad = __syncthreads_or(bad);
+    if (row_bad) {
+        if (t == 0) oc[0] = -1;
+        return;
+    }
+    if (t == 0) {
+        unsigned int cum = 0;
+        int b = 255;
+        for (; b > 0; --b) {
+            if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+            cum += hist[b];
+        }
+        pick_hi = b;
+        above = cum;
+    }
+    __syncthreads();
+    const unsigned int hi = pick_hi;
+    for (int i = t; i < 256; i += nt) hist[i] = 0;
+    __syncthreads();
+    for (int i = t; i < V; i += nt) {
+        unsigned short uk = row[i];
+        if (uk == 0x8000u) uk = 0u;
+        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+        if ((ok >> 8) == hi) atomicAdd(&hist[ok & 255u], 1u);
+    }
+    __syncthreads();
+    if (t == 0) {
+        unsigned int cum = above;
+        int b = 255;
+        for (; b > 0; --b) {
+            if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
+            cum += hist[b];
+        }
+        pick_lo = b;
+        above = cum;
+    }
+    __syncthreads();
+    const unsigned int kth = (hi << 8) | pick_lo, high = above, need = K - high;
+    const int per = (V + nt - 1) / nt, lo = t * per, end = min(V, lo + per);
+    unsigned int gt = 0, eq = 0;
+    for (int i = lo; i < end; ++i) {
+        unsigned short uk = row[i];
+        if (uk == 0x8000u) uk = 0u;
+        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+        gt += ok > kth;
+        eq += ok == kth;
+    }
+    scan[t] = gt;
+    scan_eq[t] = eq;
+    __syncthreads();
+    if (t == 0) {
+        unsigned int s = 0, q = 0;
+        for (int i = 0; i < nt; ++i) {
+            const unsigned int x = scan[i], y = scan_eq[i];
+            scan[i] = s;
+            scan_eq[i] = q;
+            s += x;
+            q += y;
+        }
+    }
+    __syncthreads();
+    unsigned int at = scan[t], rank = scan_eq[t];
+    for (int i = lo; i < end; ++i) {
+        unsigned short uk = row[i];
+        if (uk == 0x8000u) uk = 0u;
+        const unsigned int ok = (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+        if (ok > kth) {
+            oc[at++] = i;
+        } else if (ok == kth && rank < need) {
+            oc[high + rank] = i;
+            ++rank;
+        }
+    }
+    __syncthreads();
+    if ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) {
+        const uint4 fill4 = make_uint4(0xC680C680u, 0xC680C680u, 0xC680C680u, 0xC680C680u);
+        uint4* row4 = reinterpret_cast<uint4*>(row);
+        const int v8 = V / 8;
+        for (int i = t; i < v8; i += nt) row4[i] = fill4;
+        for (int i = v8 * 8 + t; i < V; i += nt) row[i] = 0xC680u;
+    } else {
+        for (int i = t; i < V; i += nt) row[i] = 0xC680u;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
+    const __nv_bfloat16* __restrict__ X,
+    const __nv_bfloat16* __restrict__ W_bf16,
+    const int* __restrict__ cols,
+    __nv_bfloat16* __restrict__ out,
+    int V,
+    int K) {
+    const int r = blockIdx.y;
+    if (cols[static_cast<long long>(r) * K] < 0) return;
+    __shared__ float sx[320 * 9];
+    const __nv_bfloat16* xr = X + static_cast<size_t>(r) * 2560;
+    for (int idx = threadIdx.x; idx < 2560; idx += 128) {
+        sx[(idx >> 3) * 9 + (idx & 7)] = __bfloat162float(xr[idx]);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int j = blockIdx.x * 4 + warp;
+    if (j >= K) return;
+    const int c = cols[static_cast<long long>(r) * K + j];
+    if (c < 0 || c >= V) return;
+    const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = lane; i < 320; i += 32) {
+        const uint4 wv = __ldg(wp4 + i);
+        const float* xp = sx + i * 9;
+        const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
+        sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+    }
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) out[static_cast<size_t>(r) * V + c] = __float2bfloat16_rn(sum);
+}
+CU
+
+  # 2a. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0)
   cat > "$fn_dir/cuda_mtp_mxfp8.zig" <<'ZIG'
 //! Re-codes the MTP drafter's BF16 linears to group-32 UE8M0 MXFP8 at load; target verify stays untouched.
 const std = @import("std");
@@ -166,9 +361,105 @@ pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const
 }
 ZIG
 
-  # 3. 2.5-bit Lloyd-Max group-32 MTP proposal head with GPU top-64 exact BF16 rescore
+  # 2b. Two-stage main lm_head loader: GPU NVFP4 coarse packed weight + shared resident BF16 rows in p.b
+  cat > "$fn_dir/cuda_head_nvfp4.zig" <<'ZIG'
+//! Load-time NVFP4 coarse projection + resident BF16 rows for exact top-128 main lm_head rescoring.
+const std = @import("std");
+const core = @import("core");
+const cuda = @import("cuda");
+const projection = @import("cuda_projection.zig");
+
+const MaxCtx = struct {
+    bytes: []const u8,
+    total: usize,
+    per: usize,
+    out: []u16,
+
+    fn worker(ctx: *const MaxCtx, tid: usize) void {
+        const lo = @min(ctx.total, tid * ctx.per);
+        const hi = @min(ctx.total, lo + ctx.per);
+        var m: u16 = 0;
+        for (lo..hi) |i| {
+            const u = std.mem.readInt(u16, ctx.bytes[i * 2 ..][0..2], .little) & 0x7fff;
+            if (u <= 0x7f80 and u > m) m = u;
+        }
+        ctx.out[tid] = m;
+    }
+};
+
+pub fn enabled() bool {
+    const raw = std.c.getenv("TF_FLASHNEXT_HEAD_NVFP4") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+pub fn load(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, store: anytype, t: core.safetensors.Tensor) !projection.Projection {
+    if (t.rank != 2 or t.dtype != .bf16 or t.dim(0) == 0 or t.dim(1) == 0 or t.dim(1) % 64 != 0)
+        return error.UnexpectedTensor;
+    const n = t.dim(0);
+    const k = t.dim(1);
+    const count = try std.math.mul(usize, n, k);
+    if (t.bytes.len != count * 2) return error.UnexpectedTensor;
+
+    const n_th: usize = 8;
+    var max_u16: [n_th]u16 = @splat(0);
+    const ctx: MaxCtx = .{ .bytes = t.bytes, .total = count, .per = (count + n_th - 1) / n_th, .out = &max_u16 };
+    var ths: [n_th]?std.Thread = @splat(null);
+    for (0..n_th) |ti| ths[ti] = try std.Thread.spawn(.{}, MaxCtx.worker, .{ &ctx, ti });
+    for (&ths) |*th| if (th.*) |tr| tr.join();
+    var top_bits: u16 = 0;
+    for (max_u16) |u| if (u > top_bits) top_bits = u;
+    const max_abs: f32 = @bitCast(@as(u32, top_bits) << 16);
+    const global_scale: f32 = if (max_abs > 0) max_abs / (6.0 * 448.0) else 1.0;
+
+    var bf16_buf = try cuda.DeviceBuffer.fromHost(driver, t.bytes);
+    errdefer bf16_buf.free();
+    store.release();
+
+    const npad = cuda.nvfp4.padded(n);
+    const words_bytes = (npad / 64) * (k / 64) * 512 * 4;
+    const tiles_bytes = npad * (k / 16);
+    var w_buf = try cuda.DeviceBuffer.alloc(driver, words_bytes);
+    errdefer w_buf.free();
+    var s_buf = try cuda.DeviceBuffer.alloc(driver, tiles_bytes);
+    errdefer s_buf.free();
+
+    const groups = count / 16;
+    var raw_codes = try cuda.DeviceBuffer.alloc(driver, count / 2);
+    defer raw_codes.free();
+    var raw_scales = try cuda.DeviceBuffer.alloc(driver, groups);
+    defer raw_scales.free();
+    errdefer cuda.completion.drain(driver, stream, "head nvfp4 pack did not drain");
+
+    var batch_mod = try cuda.Module.load(driver, cuda.kernels.flashnext_batch);
+    defer batch_mod.unload();
+    const quant_fn = try batch_mod.function("fn_bf16_to_nvfp4");
+    var qa: cuda.Args = .{};
+    qa.add(bf16_buf.ptr);
+    qa.add(global_scale);
+    qa.add(raw_codes.ptr);
+    qa.add(raw_scales.ptr);
+    qa.add(@as(c_longlong, @intCast(groups)));
+    try cuda.launch.launch(quant_fn, .{ .grid = .{ .x = @intCast((groups + 255) / 256) }, .block = .{ .x = 256 } }, stream, &qa);
+
+    var packer = try cuda.modelopt.Packer.load(driver);
+    defer packer.unload();
+    try packer.fp4Lane(stream, raw_codes.ptr, raw_scales.ptr, w_buf.ptr, s_buf.ptr, n, k);
+    try stream.synchronize();
+
+    return .{
+        .w = w_buf,
+        .s = s_buf,
+        .b = bf16_buf,
+        .n = n,
+        .k = k,
+        .native = cuda.nvfp4.weight(w_buf.ptr, s_buf.ptr, global_scale, n, k),
+    };
+}
+ZIG
+
+  # 3. 2.5-bit Lloyd-Max group-32 MTP proposal head sharing Engine's resident BF16 lm_head buffer
   cat > "$fn_dir/cuda_mtp_w2.zig" <<'ZIG'
-//! 2.5-bit symmetric group-32 proposal head + GPU top-64 exact BF16 rescore for single-stream MTP drafting.
+//! 2.5-bit symmetric group-32 proposal head + GPU top-64 exact BF16 rescore sharing Engine's resident BF16 lm_head.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -179,7 +470,8 @@ const affine = @import("cuda_draft_affine.zig");
 const kg = wt.dims / 32;
 
 const PackCtx = struct {
-    rows: []const u8,
+    full_rows: []const u8,
+    ids: []const u32,
     codes: []u64,
     scales: []u16,
     v: usize,
@@ -191,7 +483,8 @@ const PackCtx = struct {
         for (lo..hi) |r| {
             const blk = r / 32;
             const lane = r % 32;
-            const rb = ctx.rows[r * wt.dims * 2 ..][0 .. wt.dims * 2];
+            const gid: usize = ctx.ids[r];
+            const rb = ctx.full_rows[gid * wt.dims * 2 ..][0 .. wt.dims * 2];
             for (0..kg) |g| {
                 var w: [32]f32 = undefined;
                 var sq: f32 = 0;
@@ -234,18 +527,19 @@ const PackCtx = struct {
 pub const W2 = struct {
     codes: ?cuda.DeviceBuffer = null,
     scales: ?cuda.DeviceBuffer = null,
-    bf16: ?cuda.DeviceBuffer = null,
+    vocab_ids: ?cuda.DeviceBuffer = null,
+    bf16_ptr: u64 = 0,
     scratch: ?cuda.DeviceBuffer = null,
     gemv_fn: ?cuda.Function = null,
     rescore_fn: ?cuda.Function = null,
 
     pub fn ready(self: *const W2) bool {
-        return self.codes != null;
+        return self.codes != null and self.bf16_ptr != 0;
     }
 
     pub fn deinit(self: *W2) void {
         if (self.scratch) |*b| b.free();
-        if (self.bf16) |*b| b.free();
+        if (self.vocab_ids) |*b| b.free();
         if (self.scales) |*b| b.free();
         if (self.codes) |*b| b.free();
         self.* = .{};
@@ -256,9 +550,8 @@ pub const W2 = struct {
         if (!std.mem.eql(u8, std.mem.span(raw), "1")) return .{};
         const tensor = try store.tensor("language_model.lm_head.weight");
         if (tensor.dtype != .bf16 or !tensor.is(.bf16, &.{ wt.vocab, wt.dims })) return .{};
-        var selected = try (core.proposal_rows.Source{ .identity = artifact.identity(), .storage = .bf16, .recipe = .qlinear_decode, .codes = .{ .bytes = tensor.bytes, .stride = wt.dims * 2 } }).extract(gpa, artifact, 1, std.math.maxInt(usize));
-        defer selected.deinit();
-        const v = artifact.ids().len;
+        const ids = artifact.ids();
+        const v = ids.len;
         const nb = (v + 31) / 32;
         const total = nb * kg * 32;
         const codes_host = try gpa.alloc(u64, total);
@@ -269,14 +562,14 @@ pub const W2 = struct {
         @memset(scales_host, 0);
 
         const n_threads: usize = 8;
-        const ctx: PackCtx = .{ .rows = selected.codes, .codes = codes_host, .scales = scales_host, .v = v, .per = (v + n_threads - 1) / n_threads };
+        const ctx: PackCtx = .{ .full_rows = tensor.bytes, .ids = ids, .codes = codes_host, .scales = scales_host, .v = v, .per = (v + n_threads - 1) / n_threads };
         var ths: [n_threads]?std.Thread = @splat(null);
         for (0..n_threads) |ti| ths[ti] = try std.Thread.spawn(.{}, PackCtx.worker, .{ &ctx, ti });
         for (&ths) |*th| if (th.*) |t| t.join();
-
-        var bf16_buf = try cuda.DeviceBuffer.fromHost(driver, selected.codes);
-        errdefer bf16_buf.free();
         store.release();
+
+        var ids_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(ids));
+        errdefer ids_buf.free();
         var codes_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(codes_host));
         errdefer codes_buf.free();
         var scales_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(scales_host));
@@ -287,7 +580,7 @@ pub const W2 = struct {
         return .{
             .codes = codes_buf,
             .scales = scales_buf,
-            .bf16 = bf16_buf,
+            .vocab_ids = ids_buf,
             .scratch = scratch_buf,
             .gemv_fn = try module.function("fn_w2_gemv"),
             .rescore_fn = try module.function("fn_w2_rescore"),
@@ -307,7 +600,8 @@ pub const W2 = struct {
         try h.topk(stream, out, v, v, 1, 64, sc, sc + 256);
         var a2: cuda.Args = .{};
         a2.add(input);
-        a2.add(self.bf16.?.ptr);
+        a2.add(self.bf16_ptr);
+        a2.add(self.vocab_ids.?.ptr);
         a2.add(sc + 256);
         a2.add(out);
         a2.add(@as(c_int, @intCast(v)));
@@ -560,12 +854,8 @@ pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix:
     }
     var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_scale));
     errdefer us.free();
-    const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_globals_or(down_scale)));
+    const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_scale));
     return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .format = .fp8g };
-}
-
-fn down_globals_or(s: []const f32) []const f32 {
-    return s;
 }
 
 fn drained(d: *const cuda.Driver, e: anyerror) anyerror {
@@ -592,7 +882,7 @@ fn part(store: anytype, prefix: []const u8, i: usize, name: []const u8, n: usize
 }
 ZIG
 
-  # 5. Wire cuda_projection_load.zig, cuda_mtp.zig, cuda_lanes_bytes.zig, and 4-way cuda_window_graph.zig
+  # 5. Wire Zig call sites cleanly
   python3 - "$fn_dir" <<'PY'
 from pathlib import Path
 import sys
@@ -616,7 +906,7 @@ for storage, original in (
     project = f'return @import("cuda_mtp_mxfp8.zig").project(a, d, {storage}, n, k);'
     patch_exact("cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
 
-# 5b. cuda_mtp.zig: hook W2 proposal head
+# 5b. cuda_mtp.zig + cuda_lanes_load.zig: hook W2 proposal head & share Engine's BF16 lm_head buffer
 patch_exact(
     "cuda_mtp.zig",
     "    topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)",
@@ -637,6 +927,11 @@ patch_exact(
     "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (h.draft.native) |weight| {",
     "    pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {\n        if (rows == 1 and h.w2.ready()) return h.w2.project(h, pass.stream, input, out, h.ids.len);\n        if (h.draft.native) |weight| {",
 )
+patch_exact(
+    "cuda_lanes_load.zig",
+    "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);",
+    "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);\n        own.head.?.w2.bf16_ptr = own.engine.head_q.b.ptr;",
+)
 
 # 5c. cuda_lanes_bytes.zig: reflect NVFP4 MTP expert size in budget check
 patch_exact(
@@ -645,7 +940,54 @@ patch_exact(
     "pub fn headFp8(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {\n    if (std.c.getenv(\"TF_FLASHNEXT_MTP_EXPERTS\")) |v| if (std.mem.eql(u8, std.mem.span(v), \"nvfp4\")) return false;",
 )
 
-# 5d. cuda_window_graph.zig: 4-way LRU cache per shape slot to eliminate state-swap & streams/out re-recording
+# 5d. cuda_prompt.zig + cuda_batch_kernels.zig + cuda_batch_head.zig: two-stage exact NVFP4 + top-128 BF16 rescore head
+patch_exact(
+    "cuda_prompt.zig",
+    "            e.head_q = try @import(\"cuda_projection.zig\").dense(gpa, driver, if (try @import(\"cuda_head.zig\").enabled()) try @import(\"cuda_head.zig\").shard(head_tensor, world, rank) else head_tensor);",
+    "            e.head_q = if (world == 1 and !(try @import(\"cuda_head.zig\").enabled()) and @import(\"cuda_head_nvfp4.zig\").enabled())\n                try @import(\"cuda_head_nvfp4.zig\").load(gpa, driver, stream.*, &e.store, head_tensor)\n            else\n                try @import(\"cuda_projection.zig\").dense(gpa, driver, if (try @import(\"cuda_head.zig\").enabled()) try @import(\"cuda_head.zig\").shard(head_tensor, world, rank) else head_tensor);",
+)
+patch_exact(
+    "cuda_batch_kernels.zig",
+    "    select: cuda.Function,\n    select_lanes: cuda.Function,",
+    "    select: cuda.Function,\n    select_lanes: cuda.Function,\n    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,",
+)
+patch_exact(
+    "cuda_batch_kernels.zig",
+    "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        return k;",
+    "        k.late_roll = try k.batch.function(\"fn_late_roll\");\n        k.head_topk_floor = try k.batch.function(\"fn_head_topk_floor\");\n        k.head_rescore = try k.batch.function(\"fn_head_rescore\");\n        return k;",
+)
+patch_exact(
+    "cuda_batch_head.zig",
+    """    if (self.m.head.n == vocab) {
+        _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
+        return;
+    }""",
+    """    if (self.m.head.n == vocab) {
+        _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
+        if (self.m.head.b.ptr != 0) if (self.m.head.native) |nw| if (nw.mode == .fp4) {
+            const k_top: usize = 128;
+            if (n * k_top * 4 > s.cap * (wt.experts_n + 1) * 4) return error.UnexpectedTensor;
+            var a1: cuda.Args = .{};
+            a1.add(out);
+            a1.add(@as(c_int, vocab));
+            a1.add(@as(c_longlong, vocab));
+            a1.add(@as(c_int, k_top));
+            a1.add(s.router_l);
+            try cuda.launch.launch(self.k.head_topk_floor, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, self.stream, &a1);
+            var a2: cuda.Args = .{};
+            a2.add(s.mixed);
+            a2.add(self.m.head.b.ptr);
+            a2.add(s.router_l);
+            a2.add(out);
+            a2.add(@as(c_int, vocab));
+            a2.add(@as(c_int, k_top));
+            try cuda.launch.launch(self.k.head_rescore, .{ .grid = .{ .x = @intCast((k_top + 3) / 4), .y = @intCast(n) }, .block = .{ .x = 128 } }, self.stream, &a2);
+        };
+        return;
+    }""",
+)
+
+# 5e. cuda_window_graph.zig: 4-way LRU cache per shape slot to eliminate state-swap & streams/out re-recording
 old_cache = """pub fn Cache(comptime K: type) type {
     return struct {
         const Self = @This();
@@ -838,6 +1180,7 @@ PY
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
     export TF_FLASHNEXT_MTP_W2="1"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
+    export TF_FLASHNEXT_HEAD_NVFP4="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
