@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn1t-h4-t42"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn1t-h4-bf11-w2h-t43"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -743,6 +743,95 @@ extern "C" __global__ void __launch_bounds__(256) fn_bf16_to_nvfp4(
     reinterpret_cast<uint64_t*>(codes)[idx] = word;
 }
 
+extern "C" __global__ void __launch_bounds__(64) fn_bf16_to_w2(
+    const uint16_t* __restrict__ bf16,
+    float global_scale,
+    uint32_t* __restrict__ W_out,
+    uint8_t* __restrict__ S_out,
+    int N,
+    int K,
+    int npad) {
+    const int n64 = blockIdx.x;
+    const int g = blockIdx.y;
+    const int KG = K / 64;
+    const size_t tile = static_cast<size_t>(n64) * KG + g;
+    const int tid = threadIdx.x;
+    const int row = n64 * 64 + tid;
+    uint8_t q[64];
+    uint8_t sc[2] = {0, 0};
+    if (row < N) {
+        const uint16_t* rp = bf16 + static_cast<size_t>(row) * K + g * 64;
+        const float inv_g = 1.0f / global_scale;
+        for (int blk = 0; blk < 2; ++blk) {
+            float w[32];
+            float sq = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                const float f = __uint_as_float(static_cast<uint32_t>(rp[blk * 32 + j]) << 16);
+                w[j] = f;
+                sq += f * f;
+            }
+            float s = sqrtf(sq * (1.0f / 32.0f)) * 0.9957f;
+            if (s < 1e-12f) {
+                sc[blk] = 0;
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) q[blk * 32 + j] = 0;
+            } else {
+                for (int iter = 0; iter < 3; ++iter) {
+                    float num = 0.0f, den = 0.0f;
+                    const float inv = 1.0f / fmaxf(s, 1e-12f);
+                    #pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        const float raw = rintf(w[j] * inv + 1.5f);
+                        const int qi = raw <= 0.0f ? 0 : (raw >= 3.0f ? 3 : static_cast<int>(raw));
+                        const float qc = static_cast<float>(qi) - 1.5f;
+                        num += w[j] * qc;
+                        den += qc * qc;
+                    }
+                    s = (den > 0.0f) ? fmaxf(num / den, 0.0f) : 0.0f;
+                }
+                const float target = fminf(fmaxf(s * inv_g, 0.0f), 448.0f);
+                const __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(target, __NV_SATFINITE, __NV_E4M3);
+                sc[blk] = static_cast<uint8_t>(code);
+                const float sv = __half2float(__half(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3))) * global_scale;
+                if (sv > 0.0f) {
+                    const float inv = 1.0f / sv;
+                    #pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        const float raw = rintf(w[j] * inv + 1.5f);
+                        q[blk * 32 + j] = static_cast<uint8_t>(raw <= 0.0f ? 0 : (raw >= 3.0f ? 3 : static_cast<int>(raw)));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 32; ++j) q[blk * 32 + j] = 0;
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 64; ++j) q[j] = 0;
+    }
+    S_out[tile * 128 + tid * 2 + 0] = sc[0];
+    S_out[tile * 128 + tid * 2 + 1] = sc[1];
+    const int jj = tid >> 3;
+    const int r_in_jj = tid & 7;
+    uint32_t* wtile = W_out + tile * 256 + jj * 32;
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        const int lane = (r_in_jj << 2) | sub;
+        uint32_t word = 0u;
+        #pragma unroll
+        for (int kt = 0; kt < 4; ++kt) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int c = kt * 16 + 2 * sub + (e & 1) + 8 * (e >> 1);
+                word |= static_cast<uint32_t>(q[c]) << (kt * 8 + e * 2);
+            }
+        }
+        wtile[lane] = word;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     __nv_bfloat16* L,
     int V,
@@ -1224,9 +1313,27 @@ def patch_k(rel: str, old: str, new: str) -> None:
 patch_k(
     "qmmf.cu",
     "enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4 };",
-    """enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, BF12 = 5 };
+    """enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, BF12 = 5, BF11 = 6, W2 = 7 };
 
-__device__ __noinline__ uint32_t dec12_pair_esc(
+__device__ __forceinline__ uint32_t unpack8x3(uint32_t b24) {
+    const uint32_t lo = (b24 & 0x0007u) | ((b24 & 0x0038u) << 1) | ((b24 & 0x01C0u) << 2) | ((b24 & 0x0E00u) << 3);
+    const uint32_t hi = ((b24 >> 12) & 0x0007u) | (((b24 >> 12) & 0x0038u) << 1) | (((b24 >> 12) & 0x01C0u) << 2) | (((b24 >> 12) & 0x0E00u) << 3);
+    return lo | (hi << 16);
+}
+
+__device__ __forceinline__ uint32_t w2pair(uint32_t word, int s) {
+    const uint32_t w = word >> s;
+    const uint32_t t = 0x40004000u | ((w & 0x3u) << 4) | ((w & 0xCu) << 18);
+    uint32_t r;
+#if __CUDA_ARCH__ >= 900
+    asm("sub.rn.bf16x2 %0, %1, %2;\\n" : "=r"(r) : "r"(t), "r"(0x40184018u));
+#else
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC018C018u));
+#endif
+    return r;
+}
+
+__device__ __forceinline__ uint32_t dec12_pair_esc_inl(
         uint32_t x, uint32_t d_pair, uint32_t em,
         const uint8_t* __restrict__ bs, size_t total_tiles, size_t tile_idx, uint32_t key_base) {
     const size_t dir_off = (total_tiles * 64 + 15) & ~static_cast<size_t>(15);
@@ -1252,6 +1359,12 @@ __device__ __noinline__ uint32_t dec12_pair_esc(
         }
     }
     return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+}
+
+__device__ __noinline__ uint32_t dec12_pair_esc(
+        uint32_t x, uint32_t d_pair, uint32_t em,
+        const uint8_t* __restrict__ bs, size_t total_tiles, size_t tile_idx, uint32_t key_base) {
+    return dec12_pair_esc_inl(x, d_pair, em, bs, total_tiles, tile_idx, key_base);
 }""",
 )
 
@@ -1262,11 +1375,11 @@ patch_k(
     static constexpr int STAGE = (X + W + S + 127) / 128 * 128;
     static constexpr int PARTIALS = MT * NT * 4 * THREADS * 4;
     static constexpr int BARRIERS = MODE == BF16 && BN > 64 ? 128 : 0;""",
-    """    static constexpr int W = MODE == FP4 ? BN * GS / 2 : MODE == BF16 ? BN * GS * 2 : MODE == BF12 ? (BN * GS * 3) / 2 : BN * GS;
-    static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 ? BN * 2 : MODE == BF12 ? BN : 0;
+    """    static constexpr int W = MODE == FP4 ? BN * GS / 2 : MODE == W2 ? BN * GS / 4 : MODE == BF16 ? BN * GS * 2 : MODE == BF12 ? (BN * GS * 3) / 2 : MODE == BF11 ? BN * 90 : BN * GS;
+    static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 || MODE == W2 ? BN * 2 : MODE == BF12 || MODE == BF11 ? BN : 0;
     static constexpr int STAGE = (X + W + S + 127) / 128 * 128;
     static constexpr int PARTIALS = MT * NT * 4 * THREADS * 4;
-    static constexpr int BARRIERS = (MODE == BF16 || MODE == BF12) && BN > 64 ? 128 : 0;""",
+    static constexpr int BARRIERS = (MODE == BF16 || MODE == BF12 || MODE == BF11) && BN > 64 ? 128 : 0;""",
 )
 
 patch_k(
@@ -1331,6 +1444,53 @@ BF12_INST(128, 128, 2, 4, 3, true, false, false)
 BF12_INST(128, 128, 2, 4, 3, true, false, true)
 #undef BF12_INST
 
+// Lossless BF11-fixed (11.375-bit, 5760 B/tile, 6 CTAs/SM at BM=16 STAGES=2) and 2.25-bit W2 coarse lm_head instances.
+#define BF11_INST(BM, BN, WM, WN, ST, F32, CL, FU) \\
+    template __global__ void qmmf_kernel<BF11, BM, BN, WM, WN, ST, F32, CL, FU>( \\
+        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
+        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+BF11_INST(16, 64, 1, 4, 3, false, false, false)
+BF11_INST(16, 64, 1, 4, 2, false, false, false)
+BF11_INST(16, 64, 1, 4, 3, false, true, false)
+BF11_INST(32, 64, 1, 4, 3, false, false, false)
+BF11_INST(32, 64, 1, 4, 3, false, true, false)
+BF11_INST(64, 64, 1, 4, 3, false, false, false)
+BF11_INST(64, 64, 1, 4, 3, false, true, false)
+BF11_INST(64, 64, 1, 4, 3, false, false, true)
+BF11_INST(16, 64, 1, 4, 3, true, false, false)
+BF11_INST(16, 64, 1, 4, 2, true, false, false)
+BF11_INST(16, 64, 1, 4, 3, true, true, false)
+BF11_INST(32, 64, 1, 4, 3, true, false, false)
+BF11_INST(32, 64, 1, 4, 3, true, true, false)
+BF11_INST(64, 64, 1, 4, 3, true, false, false)
+BF11_INST(64, 64, 1, 4, 3, true, true, false)
+BF11_INST(64, 64, 1, 4, 3, true, false, true)
+BF11_INST(128, 128, 2, 4, 3, false, false, false)
+BF11_INST(128, 128, 2, 4, 3, false, false, true)
+BF11_INST(128, 128, 2, 4, 3, true, false, false)
+BF11_INST(128, 128, 2, 4, 3, true, false, true)
+#undef BF11_INST
+
+#define W2_INST(BM, F32, CL, FU) \\
+    template __global__ void qmmf_kernel<W2, BM, 64, 1, 4, 4, F32, CL, FU>( \\
+        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \\
+        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+W2_INST(16, false, false, false)
+W2_INST(16, false, true, false)
+W2_INST(32, false, false, false)
+W2_INST(32, false, true, false)
+W2_INST(64, false, false, false)
+W2_INST(64, false, true, false)
+W2_INST(64, false, false, true)
+W2_INST(16, true, false, false)
+W2_INST(16, true, true, false)
+W2_INST(32, true, false, false)
+W2_INST(32, true, true, false)
+W2_INST(64, true, false, false)
+W2_INST(64, true, true, false)
+W2_INST(64, true, false, true)
+#undef W2_INST
+
 // PR #3475 fused split-K at row tiles 16 and 32 for MXFP8 and BF16.
 #define FUSE_SPLIT(MD, BM, F32) \\
     template __global__ void qmmf_kernel<MD, BM, 64, 1, 4, 4, F32, false, true>( \\
@@ -1350,13 +1510,13 @@ FUSE_SPLIT(BF16, 32, true)
 patch_k(
     "qmmf_body.cuh",
     'static_assert(BN == 64 || BN == 32 || (MODE == BF16 && BN == 128), "packed column tiles");',
-    'static_assert(BN == 64 || BN == 32 || ((MODE == BF16 || MODE == BF12) && BN == 128), "packed column tiles");',
+    'static_assert(BN == 64 || BN == 32 || ((MODE == BF16 || MODE == BF12 || MODE == BF11) && BN == 128), "packed column tiles");',
 )
 
 patch_k(
     "qmmf_body.cuh",
     "        constexpr int TILE_BYTES = MODE == FP4 ? 64 * GS / 2 : MODE == BF16 ? 64 * GS * 2 : 64 * GS;",
-    "        constexpr int TILE_BYTES = MODE == FP4 ? 64 * GS / 2 : MODE == BF16 ? 64 * GS * 2 : MODE == BF12 ? 6144 : 64 * GS;",
+    "        constexpr int TILE_BYTES = MODE == FP4 ? 64 * GS / 2 : MODE == W2 ? 64 * GS / 4 : MODE == BF16 ? 64 * GS * 2 : MODE == BF12 ? 6144 : MODE == BF11 ? 5760 : 64 * GS;",
 )
 
 patch_k(
@@ -1372,7 +1532,7 @@ patch_k(
             }
             if constexpr (T::S > 0) {
                 unsigned char* ps = pw + T::W;
-                constexpr int S_TILE = MODE == BF12 ? 64 : T::S;
+                constexpr int S_TILE = (MODE == BF12 || MODE == BF11) ? 64 : T::S;
                 for (int c = tid; c < T::S / 16; c += T::THREADS) {
                     const int st = c / (S_TILE / 16), soff = c % (S_TILE / 16);
                     cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + st) * KG + g) * S_TILE + soff * 16);
@@ -1390,12 +1550,20 @@ patch_k(
         }""",
     """        if constexpr (T::S > 0) {
             unsigned char* ps = pw + T::W;
-            constexpr int S_TILE = MODE == BF12 ? 64 : T::S;
+            constexpr int S_TILE = (MODE == BF12 || MODE == BF11) ? 64 : T::S;
             for (int c = tid; c < T::S / 16; c += T::THREADS) {
                 const int st = c / (S_TILE / 16), soff = c % (S_TILE / 16);
                 cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + st) * KG + g) * S_TILE + soff * 16);
             }
         }""",
+)
+
+patch_k(
+    "qmmf_body.cuh",
+    """            } else if constexpr (MODE == MXFP8) {
+                const uint32_t v = *reinterpret_cast<const uint32_t*>(ps + col * 2);""",
+    """            } else if constexpr (MODE == MXFP8 || MODE == W2) {
+                const uint32_t v = *reinterpret_cast<const uint32_t*>(ps + col * 2);""",
 )
 
 patch_k(
@@ -1409,10 +1577,62 @@ patch_k(
     """            if constexpr (MODE == FP4) {
                 const uint2 u = reinterpret_cast<const uint2*>(pw)[jj * 32 + lane];
                 wq[j] = make_uint4(u.x, u.y, 0u, 0u);
+            } else if constexpr (MODE == W2) {
+                const uint32_t u = reinterpret_cast<const uint32_t*>(pw)[jj * 32 + lane];
+                wq[j] = make_uint4(u, 0u, 0u, 0u);
             } else if constexpr (MODE == BF12) {
                 const unsigned char* pjj = pw + jj * 768;
                 const uint32_t d01 = reinterpret_cast<const uint32_t*>(pjj + 512)[lane];
                 const uint32_t d23 = reinterpret_cast<const uint32_t*>(pjj + 640)[lane];
+                const uint32_t f01 = d01 & (d01 >> 1) & (d01 >> 2) & (d01 >> 3) & 0x11111111u;
+                const uint32_t f23 = d23 & (d23 >> 1) & (d23 >> 2) & (d23 >> 3) & 0x11111111u;
+                const uint32_t em_sh = (static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) << 7) * 0x00010001u;
+                wq[j] = make_uint4(d01, d23, em_sh, f01 | f23);
+            } else if constexpr (MODE == BF11) {
+                const unsigned char* pjj = pw + jj * 720;
+                const uint32_t w0 = reinterpret_cast<const uint32_t*>(pjj + 512)[lane];
+                const uint32_t w1p = reinterpret_cast<const uint32_t*>(pjj + 640)[lane >> 1];
+                const uint32_t w1 = (lane & 1) ? (w1p >> 16) : (w1p & 0xFFFFu);
+                uint32_t d01 = unpack8x3(w0 & 0x00FFFFFFu);
+                uint32_t d23 = unpack8x3((w0 >> 24) | (w1 << 8));
+                uint32_t e01 = d01 & (d01 >> 1) & (d01 >> 2) & 0x11111111u;
+                uint32_t e23 = d23 & (d23 >> 1) & (d23 >> 2) & 0x11111111u;
+                const uint32_t e_cnt = __popc(e01) + __popc(e23);
+                const uint32_t b1 = __ballot_sync(0xffffffffu, e_cnt >= 1u);
+                if (b1 != 0u) {
+                    const uint32_t lane_lt = (1u << lane) - 1u;
+                    const uint32_t b2 = __ballot_sync(0xffffffffu, e_cnt >= 2u);
+                    const uint32_t b3 = __ballot_sync(0xffffffffu, e_cnt >= 3u);
+                    uint32_t e_pos;
+                    if (__builtin_expect(__all_sync(0xffffffffu, e_cnt <= 3u), 1)) {
+                        e_pos = __popc(b1 & lane_lt) + __popc(b2 & lane_lt) + __popc(b3 & lane_lt);
+                    } else {
+                        uint32_t e_inc = e_cnt;
+#pragma unroll
+                        for (int off = 1; off < 32; off <<= 1) {
+                            const uint32_t v = __shfl_up_sync(0xffffffffu, e_inc, off);
+                            if (lane >= off) e_inc += v;
+                        }
+                        e_pos = e_inc - e_cnt;
+                    }
+                    if (e_cnt > 0u) {
+                        const uint32_t* hi_p = reinterpret_cast<const uint32_t*>(pjj + 704);
+                        while (e01 != 0u) {
+                            const int sh = __ffs(e01) - 1;
+                            e01 &= e01 - 1u;
+                            const uint32_t dv = (e_pos < 32u) ? ((hi_p[e_pos >> 3] >> ((e_pos & 7u) * 4u)) & 0xFu) : 15u;
+                            ++e_pos;
+                            d01 = (d01 & ~(0xFu << sh)) | (dv << sh);
+                        }
+                        while (e23 != 0u) {
+                            const int sh = __ffs(e23) - 1;
+                            e23 &= e23 - 1u;
+                            const uint32_t dv = (e_pos < 32u) ? ((hi_p[e_pos >> 3] >> ((e_pos & 7u) * 4u)) & 0xFu) : 15u;
+                            ++e_pos;
+                            d23 = (d23 & ~(0xFu << sh)) | (dv << sh);
+                        }
+                    }
+                }
                 const uint32_t f01 = d01 & (d01 >> 1) & (d01 >> 2) & (d01 >> 3) & 0x11111111u;
                 const uint32_t f23 = d23 & (d23 >> 1) & (d23 >> 2) & (d23 >> 3) & 0x11111111u;
                 const uint32_t em_sh = (static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) << 7) * 0x00010001u;
@@ -1431,10 +1651,21 @@ patch_k(
                 }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
-                    if constexpr (MODE == FP8 || MODE == BF16) mma(acc[i][j], a[i], b0, b1);""",
-    """                } else if constexpr (MODE == BF12) {
+                    if constexpr (MODE == FP8 || MODE == BF16) mma(acc[i][j], a[i], b0, b1);
+                    else if (MODE == FP4 || (MODE == MXFP8 && (kt & 1) == 0) || (MODE == FP8G && kt == 0))
+                        mma0(d[i][j], a[i], b0, b1);
+                    else mma(d[i][j], a[i], b0, b1);
+                }
+            }
+            if constexpr (MODE == FP4 || MODE == MXFP8 || MODE == FP8G) {
+                if (MODE == FP4 || (MODE == MXFP8 && (kt & 1)) || (MODE == FP8G && kt == GS / 16 - 1)) {""",
+    """                } else if constexpr (MODE == W2) {
+                    b0 = w2pair(wq[j].x, kt * 8);
+                    b1 = w2pair(wq[j].x, kt * 8 + 4);
+                } else if constexpr (MODE == BF12 || MODE == BF11) {
                     const int jj_in_pw = wn * T::NT + j;
-                    const unsigned char* pjj = pw + jj_in_pw * 768;
+                    constexpr int JJ_STRIDE = (MODE == BF11) ? 720 : 768;
+                    const unsigned char* pjj = pw + jj_in_pw * JJ_STRIDE;
                     const uint32_t ms = reinterpret_cast<const uint32_t*>(pjj)[kt * 32 + lane];
                     const uint32_t dlo = kt < 2 ? wq[j].x : wq[j].y;
                     const int sh = (kt & 1) * 8;
@@ -1451,8 +1682,13 @@ patch_k(
                         const size_t tile_idx = static_cast<size_t>(n0 / 64 + (BN == 128 ? (jj_in_pw >> 3) : 0)) * KG + (g0 + it);
                         const uint32_t kbase = (static_cast<uint32_t>(local_jj) << 9) | (static_cast<uint32_t>(kt) << 7) | (static_cast<uint32_t>(lane) << 2);
                         const uint32_t em = (wq[j].z >> 7) & 0xFFu;
-                        b0 = dec12_pair_esc(x0, d0, em, bs, total_tiles, tile_idx, kbase);
-                        b1 = dec12_pair_esc(x1, d1, em, bs, total_tiles, tile_idx, kbase + 2u);
+                        if constexpr (BM == 16) {
+                            b0 = dec12_pair_esc_inl(x0, d0, em, bs, total_tiles, tile_idx, kbase);
+                            b1 = dec12_pair_esc_inl(x1, d1, em, bs, total_tiles, tile_idx, kbase + 2u);
+                        } else {
+                            b0 = dec12_pair_esc(x0, d0, em, bs, total_tiles, tile_idx, kbase);
+                            b1 = dec12_pair_esc(x1, d1, em, bs, total_tiles, tile_idx, kbase + 2u);
+                        }
                     }
                 } else {
                     const uint32_t word = comp(wq[j], kt);
@@ -1461,16 +1697,23 @@ patch_k(
                 }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
-                    if constexpr (MODE == FP8 || MODE == BF16 || MODE == BF12) mma(acc[i][j], a[i], b0, b1);""",
+                    if constexpr (MODE == FP8 || MODE == BF16 || MODE == BF12 || MODE == BF11) mma(acc[i][j], a[i], b0, b1);
+                    else if (MODE == FP4 || ((MODE == MXFP8 || MODE == W2) && (kt & 1) == 0) || (MODE == FP8G && kt == 0))
+                        mma0(d[i][j], a[i], b0, b1);
+                    else mma(d[i][j], a[i], b0, b1);
+                }
+            }
+            if constexpr (MODE == FP4 || MODE == MXFP8 || MODE == FP8G || MODE == W2) {
+                if (MODE == FP4 || ((MODE == MXFP8 || MODE == W2) && (kt & 1)) || (MODE == FP8G && kt == GS / 16 - 1)) {""",
 )
 
-# Fast bit-exact bf16x2 E4M3 scale decode in qmmf_body.cuh (FP4) and nvfp4_experts.cu (+ mma0)
+# Fast bit-exact bf16x2 E4M3 scale decode in qmmf_body.cuh (FP4 + W2) and nvfp4_experts.cu (+ mma0)
 patch_k(
     "qmmf_body.cuh",
     """                        } else if constexpr (MODE == FP4) {
                             s0 = e4m3f(static_cast<uint8_t>(sq[j][0] >> (8 * blk)));
                             s1 = e4m3f(static_cast<uint8_t>(sq[j][1] >> (8 * blk)));""",
-    """                        } else if constexpr (MODE == FP4) {
+    """                        } else if constexpr (MODE == FP4 || MODE == W2) {
                             const uint32_t b2 = ((sq[j][0] >> (8 * blk)) & 0xFFu) | (((sq[j][1] >> (8 * blk)) & 0xFFu) << 8);
                             const uint32_t sp = tf_common::fp8pair_unit(b2, 0x7B807B80u);
                             s0 = __uint_as_float((sp & 0xFFFFu) << 16);
@@ -3343,7 +3586,13 @@ const MaxCtx = struct {
 
 pub fn enabled() bool {
     const raw = std.c.getenv("TF_FLASHNEXT_HEAD_NVFP4") orelse return false;
-    return std.mem.eql(u8, std.mem.span(raw), "1");
+    const s = std.mem.span(raw);
+    return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "w2");
+}
+
+fn useW2() bool {
+    const raw = std.c.getenv("TF_FLASHNEXT_HEAD_NVFP4") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "w2");
 }
 
 pub fn load(driver: *cuda.Driver, stream: cuda.Stream, store: anytype, t: core.safetensors.Tensor) !projection.Projection {
@@ -3367,13 +3616,55 @@ pub fn load(driver: *cuda.Driver, stream: cuda.Stream, store: anytype, t: core.s
         }
     }
     const max_abs: f32 = @bitCast(@as(u32, top_bits) << 16);
-    const global_scale: f32 = if (max_abs > 0) max_abs / (6.0 * 448.0) else 1.0;
 
     var bf16_buf = try cuda.DeviceBuffer.fromHost(driver, t.bytes);
     errdefer bf16_buf.free();
     store.release();
 
     const npad = cuda.nvfp4.padded(n);
+    if (useW2()) {
+        const global_scale: f32 = if (max_abs > 0) max_abs / (1.5 * 448.0) else 1.0;
+        const words_bytes = (npad / 64) * (k / 64) * 1024;
+        const scales_bytes = (npad / 64) * (k / 64) * 128;
+        var w_buf = try cuda.DeviceBuffer.alloc(driver, words_bytes);
+        errdefer w_buf.free();
+        var s_buf = try cuda.DeviceBuffer.alloc(driver, scales_bytes);
+        errdefer s_buf.free();
+        errdefer cuda.completion.drain(driver, stream, "head w2 pack did not drain");
+
+        var batch_mod = try cuda.Module.load(driver, cuda.kernels.flashnext_batch);
+        defer batch_mod.unload();
+        const quant_fn = try batch_mod.function("fn_bf16_to_w2");
+        var qa: cuda.Args = .{};
+        qa.add(bf16_buf.ptr);
+        qa.add(global_scale);
+        qa.add(w_buf.ptr);
+        qa.add(s_buf.ptr);
+        qa.add(@as(c_int, @intCast(n)));
+        qa.add(@as(c_int, @intCast(k)));
+        qa.add(@as(c_int, @intCast(npad)));
+        try cuda.launch.launch(quant_fn, .{ .grid = .{ .x = @intCast(npad / 64), .y = @intCast(k / 64) }, .block = .{ .x = 64 } }, stream, &qa);
+        try stream.synchronize();
+
+        return .{
+            .w = w_buf,
+            .s = s_buf,
+            .b = bf16_buf,
+            .n = n,
+            .k = k,
+            .native = .{
+                .mode = .w2,
+                .codes = w_buf.ptr,
+                .scales = s_buf.ptr,
+                .scale = 4.0 * global_scale,
+                .n = @intCast(n),
+                .k = @intCast(k),
+                .npad = @intCast(npad),
+            },
+        };
+    }
+
+    const global_scale: f32 = if (max_abs > 0) max_abs / (6.0 * 448.0) else 1.0;
     const words_bytes = (npad / 64) * (k / 64) * 512 * 4;
     const tiles_bytes = npad * (k / 16);
     var w_buf = try cuda.DeviceBuffer.alloc(driver, words_bytes);
@@ -3542,6 +3833,304 @@ pub fn enabled() bool {
     return std.mem.eql(u8, std.mem.span(raw), "1");
 }
 
+fn bf11Enabled() bool {
+    const raw = std.c.getenv("TF_FLASHNEXT_TRUNK_BF11") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+const Pass1Bf11Ctx = struct {
+    src: []const u8,
+    n: usize,
+    k: usize,
+    kg: usize,
+    n_tiles: usize,
+    per: usize,
+    w_out: []u8,
+    emax_out: []u8,
+    esc_counts: []u32,
+
+    inline fn readU16(ctx: *const Pass1Bf11Ctx, row: usize, col: usize) u16 {
+        const idx = (row * ctx.k + col) * 2;
+        return std.mem.readInt(u16, ctx.src[idx..][0..2], .little);
+    }
+
+    fn worker(ctx: *const Pass1Bf11Ctx, tid: usize) void {
+        const lo = @min(ctx.n_tiles, tid * ctx.per);
+        const hi = @min(ctx.n_tiles, lo + ctx.per);
+        for (lo..hi) |n64| {
+            for (0..ctx.kg) |g| {
+                const tg = n64 * ctx.kg + g;
+                const em_slice = ctx.emax_out[tg * 64 ..][0..64];
+                for (0..64) |r| {
+                    const row = n64 * 64 + r;
+                    if (row >= ctx.n) {
+                        em_slice[r] = 0;
+                        continue;
+                    }
+                    var em: u8 = 0;
+                    const base = (row * ctx.k + g * 64) * 2;
+                    for (0..64) |c| {
+                        const u = std.mem.readInt(u16, ctx.src[base + c * 2 ..][0..2], .little);
+                        if ((u & 0x7FFF) != 0) {
+                            const exp: u8 = @intCast((u >> 7) & 0xFF);
+                            if (exp > em) em = exp;
+                        }
+                    }
+                    em_slice[r] = em;
+                }
+                const tile = ctx.w_out[tg * 5760 ..][0..5760];
+                var ec: u32 = 0;
+                for (0..8) |jj| {
+                    const pjj = jj * 720;
+                    var hi4: [4]u32 = .{ 0, 0, 0, 0 };
+                    var e_pos: u32 = 0;
+                    for (0..32) |lane| {
+                        const r = jj * 8 + (lane >> 2);
+                        const row = n64 * 64 + r;
+                        const em: u16 = em_slice[r];
+                        var d01: u32 = 0;
+                        var d23: u32 = 0;
+                        for (0..4) |kt| {
+                            var ms: u32 = 0;
+                            for (0..4) |e| {
+                                const col = g * 64 + kt * 16 + 2 * (lane & 3) + (e & 1) + 8 * (e >> 1);
+                                const u: u16 = if (row < ctx.n) ctx.readU16(row, col) else 0;
+                                var msb: u8 = 0;
+                                var dn: u32 = 0;
+                                if (!(em == 0 and u == 0)) {
+                                    const exp: u16 = (u >> 7) & 0xFF;
+                                    if ((u & 0x7FFF) == 0 or exp == 0 or (em - exp) >= 15) {
+                                        msb = 0;
+                                        dn = 15;
+                                    } else {
+                                        msb = @truncate(((u >> 8) & 0x80) | (u & 0x7F));
+                                        dn = @intCast(em - exp);
+                                    }
+                                }
+                                ms |= @as(u32, msb) << @intCast(8 * e);
+                                const sh: u5 = @intCast((kt & 1) * 8 + (e & 1) * 16 + (e >> 1) * 4);
+                                if (kt < 2) {
+                                    d01 |= dn << sh;
+                                } else {
+                                    d23 |= dn << sh;
+                                }
+                            }
+                            std.mem.writeInt(u32, tile[pjj + kt * 128 + lane * 4 ..][0..4], ms, .little);
+                        }
+                        var b01: u32 = 0;
+                        var b23: u32 = 0;
+                        for (0..16) |nib| {
+                            const dv: u32 = if (nib < 8)
+                                (d01 >> @intCast(nib * 4)) & 0xF
+                            else
+                                (d23 >> @intCast((nib - 8) * 4)) & 0xF;
+                            if (dv < 7) {
+                                if (nib < 8) {
+                                    b01 |= dv << @intCast(3 * nib);
+                                } else {
+                                    b23 |= dv << @intCast(3 * (nib - 8));
+                                }
+                            } else {
+                                if (nib < 8) {
+                                    b01 |= @as(u32, 7) << @intCast(3 * nib);
+                                } else {
+                                    b23 |= @as(u32, 7) << @intCast(3 * (nib - 8));
+                                }
+                                if (e_pos < 32) {
+                                    hi4[e_pos >> 3] |= dv << @intCast((e_pos & 7) * 4);
+                                    if (dv == 15) ec += 1;
+                                } else {
+                                    ec += 1;
+                                }
+                                e_pos += 1;
+                            }
+                        }
+                        const w0: u32 = b01 | ((b23 & 0xFF) << 24);
+                        const w1: u16 = @intCast(b23 >> 8);
+                        std.mem.writeInt(u32, tile[pjj + 512 + lane * 4 ..][0..4], w0, .little);
+                        std.mem.writeInt(u16, tile[pjj + 640 + lane * 2 ..][0..2], w1, .little);
+                    }
+                    for (0..4) |wi| {
+                        std.mem.writeInt(u32, tile[pjj + 704 + wi * 4 ..][0..4], hi4[wi], .little);
+                    }
+                }
+                ctx.esc_counts[tg] = ec;
+            }
+        }
+    }
+};
+
+const Pass2Bf11Ctx = struct {
+    src: []const u8,
+    n: usize,
+    k: usize,
+    kg: usize,
+    n_tiles: usize,
+    per: usize,
+    emax_out: []const u8,
+    dir: []const u32,
+    ents: []u32,
+
+    inline fn readU16(ctx: *const Pass2Bf11Ctx, row: usize, col: usize) u16 {
+        const idx = (row * ctx.k + col) * 2;
+        return std.mem.readInt(u16, ctx.src[idx..][0..2], .little);
+    }
+
+    fn worker(ctx: *const Pass2Bf11Ctx, tid: usize) void {
+        const lo = @min(ctx.n_tiles, tid * ctx.per);
+        const hi = @min(ctx.n_tiles, lo + ctx.per);
+        for (lo..hi) |n64| {
+            for (0..ctx.kg) |g| {
+                const tg = n64 * ctx.kg + g;
+                const d_lo = ctx.dir[tg];
+                const d_hi = ctx.dir[tg + 1];
+                if (d_lo == d_hi) continue;
+                const em_slice = ctx.emax_out[tg * 64 ..][0..64];
+                var at: usize = d_lo;
+                for (0..8) |jj| {
+                    var e_pos: u32 = 0;
+                    for (0..32) |lane| {
+                        const r = jj * 8 + (lane >> 2);
+                        const row = n64 * 64 + r;
+                        const em: u16 = em_slice[r];
+                        var d_arr: [16]u32 = undefined;
+                        var u_arr: [16]u16 = undefined;
+                        for (0..4) |kt| {
+                            for (0..4) |e| {
+                                const col = g * 64 + kt * 16 + 2 * (lane & 3) + (e & 1) + 8 * (e >> 1);
+                                const u: u16 = if (row < ctx.n) ctx.readU16(row, col) else 0;
+                                const nib: usize = (if (kt < 2) @as(usize, 0) else 8) + ((kt & 1) * 2) + ((e & 1) * 4) + (e >> 1);
+                                u_arr[nib] = u;
+                                var dn: u32 = 0;
+                                if (!(em == 0 and u == 0)) {
+                                    const exp: u16 = (u >> 7) & 0xFF;
+                                    if ((u & 0x7FFF) == 0 or exp == 0 or (em - exp) >= 15) {
+                                        dn = 15;
+                                    } else {
+                                        dn = @intCast(em - exp);
+                                    }
+                                }
+                                d_arr[nib] = dn;
+                            }
+                        }
+                        for (0..16) |nib| {
+                            const dv = d_arr[nib];
+                            if (dv >= 7) {
+                                if (dv == 15 or e_pos >= 32) {
+                                    const kt_e: u32 = @intCast((if (nib >= 8) @as(usize, 2) else 0) + ((nib >> 1) & 1));
+                                    const e_e: u32 = @intCast(((nib >> 2) & 1) | ((nib & 1) << 1));
+                                    const key12: u32 = (@as(u32, @intCast(jj)) << 9) | (kt_e << 7) | (@as(u32, @intCast(lane)) << 2) | e_e;
+                                    ctx.ents[at] = (key12 << 16) | @as(u32, u_arr[nib]);
+                                    at += 1;
+                                }
+                                e_pos += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
+fn packBf11Raw(gpa: std.mem.Allocator, driver: *const cuda.Driver, src_bytes: []const u8, n: usize, k: usize) !projection.Projection {
+    const npad = cuda.nvfp4.padded(n);
+    const n_tiles = npad / 64;
+    const kg = k / 64;
+    const total_tiles = n_tiles * kg;
+
+    const w_host = try gpa.alloc(u8, total_tiles * 5760);
+    defer gpa.free(w_host);
+    const emax_host = try gpa.alloc(u8, total_tiles * 64);
+    defer gpa.free(emax_host);
+    const esc_counts = try gpa.alloc(u32, total_tiles);
+    defer gpa.free(esc_counts);
+
+    const n_th: usize = if (n_tiles >= 8) 8 else n_tiles;
+    const p1: Pass1Bf11Ctx = .{
+        .src = src_bytes,
+        .n = n,
+        .k = k,
+        .kg = kg,
+        .n_tiles = n_tiles,
+        .per = (n_tiles + n_th - 1) / n_th,
+        .w_out = w_host,
+        .emax_out = emax_host,
+        .esc_counts = esc_counts,
+    };
+    if (n_th <= 1) {
+        Pass1Bf11Ctx.worker(&p1, 0);
+    } else {
+        var ths: [8]?std.Thread = @splat(null);
+        for (0..n_th) |ti| ths[ti] = std.Thread.spawn(.{}, Pass1Bf11Ctx.worker, .{ &p1, ti }) catch null;
+        for (0..n_th) |ti| {
+            if (ths[ti]) |tr| tr.join() else Pass1Bf11Ctx.worker(&p1, ti);
+        }
+    }
+
+    const dir_off = (total_tiles * 64 + 15) & ~@as(usize, 15);
+    var total_esc: usize = 0;
+    for (esc_counts) |c| total_esc += c;
+    const s_total_bytes = dir_off + (total_tiles + 1 + total_esc) * 4;
+    const s_words = try gpa.alloc(u32, s_total_bytes / 4);
+    defer gpa.free(s_words);
+    const s_host = std.mem.sliceAsBytes(s_words);
+    @memcpy(s_host[0 .. total_tiles * 64], emax_host);
+    if (dir_off > total_tiles * 64) {
+        @memset(s_host[total_tiles * 64 .. dir_off], 0);
+    }
+
+    const dir_idx = dir_off / 4;
+    const dir = s_words[dir_idx..][0 .. total_tiles + 1];
+    var acc: u32 = 0;
+    for (0..total_tiles) |tg| {
+        dir[tg] = acc;
+        acc += esc_counts[tg];
+    }
+    dir[total_tiles] = acc;
+
+    if (total_esc > 0) {
+        const ents = s_words[dir_idx + total_tiles + 1 ..][0..total_esc];
+        const p2: Pass2Bf11Ctx = .{
+            .src = src_bytes,
+            .n = n,
+            .k = k,
+            .kg = kg,
+            .n_tiles = n_tiles,
+            .per = (n_tiles + n_th - 1) / n_th,
+            .emax_out = emax_host,
+            .dir = dir,
+            .ents = ents,
+        };
+        if (n_th <= 1) {
+            Pass2Bf11Ctx.worker(&p2, 0);
+        } else {
+            var ths: [8]?std.Thread = @splat(null);
+            for (0..n_th) |ti| ths[ti] = std.Thread.spawn(.{}, Pass2Bf11Ctx.worker, .{ &p2, ti }) catch null;
+            for (0..n_th) |ti| {
+                if (ths[ti]) |tr| tr.join() else Pass2Bf11Ctx.worker(&p2, ti);
+            }
+        }
+    }
+
+    var p = projection.Projection.empty(driver);
+    p.w = try cuda.DeviceBuffer.fromHost(driver, w_host);
+    errdefer p.w.free();
+    p.s = try cuda.DeviceBuffer.fromHost(driver, s_host);
+    p.n = n;
+    p.k = k;
+    p.native = .{
+        .mode = .bf11,
+        .codes = p.w.ptr,
+        .scales = p.s.ptr,
+        .scale = 1.0,
+        .n = @intCast(n),
+        .k = @intCast(k),
+        .npad = @intCast(npad),
+    };
+    return p;
+}
+
 const Pass1Ctx = struct {
     src: []const u8,
     n: usize,
@@ -3696,6 +4285,7 @@ pub fn packRaw(gpa: std.mem.Allocator, driver: *const cuda.Driver, src_bytes: []
     if (n == 0 or k == 0 or k % 64 != 0) return error.UnexpectedTensor;
     const count = try std.math.mul(usize, n, k);
     if (src_bytes.len != try std.math.mul(usize, count, 2)) return error.UnexpectedTensor;
+    if (bf11Enabled() and n >= 4096 and k >= 2560) return packBf11Raw(gpa, driver, src_bytes, n, k);
 
     const npad = cuda.nvfp4.padded(n);
     const n_tiles = npad / 64;
@@ -4276,11 +4866,11 @@ def patch_exact(base: Path, rel: str, old: str, new: str) -> None:
         raise RuntimeError(f"Expected exactly 1 match in {rel}, got {txt.count(old)}")
     p.write_text(txt.replace(old, new, 1), encoding="utf-8")
 
-# 5a. zig/src/cuda/qmmf.zig + qmmf_shared.zig: Mode::bf12 (decode, half, prompt, strided) + PR #3475 fused split-K
+# 5a. zig/src/cuda/qmmf.zig + qmmf_shared.zig: Mode::bf12 + Mode::bf11 + Mode::w2 + PR #3475 fused split-K
 patch_exact(
     cdir, "qmmf.zig",
     "pub const Mode = enum(u3) { fp4 = 0, fp8 = 1, mxfp8 = 2, fp8g = 3, bf16 = 4 };\n\nconst modes = [_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16 };",
-    "pub const Mode = enum(u3) { fp4 = 0, fp8 = 1, mxfp8 = 2, fp8g = 3, bf16 = 4, bf12 = 5 };\n\nconst modes = [_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16, .bf12 };",
+    "pub const Mode = enum(u3) { fp4 = 0, fp8 = 1, mxfp8 = 2, fp8g = 3, bf16 = 4, bf12 = 5, bf11 = 6, w2 = 7 };\n\nconst modes = [_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16, .bf12, .bf11, .w2 };",
 )
 patch_exact(
     cdir, "qmmf.zig",
@@ -4292,11 +4882,13 @@ patch_exact(
     return @max(4 * stage, partials);""",
     """        .bf16 => bn * group * 2,
         .bf12 => (bn * group * 3) / 2,
+        .bf11 => bn * 90,
+        .w2 => bn * group / 4,
     };
-    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8) bn * 2 else if (mode == .bf12) bn else 0;
+    const s: u32 = if (mode == .fp4 or mode == .fp8g) bn * 4 else if (mode == .mxfp8 or mode == .w2) bn * 2 else if (mode == .bf12 or mode == .bf11) bn else 0;
     const stage = (bm * group * 2 + w + s + 127) / 128 * 128;
     const partials = (bm / 16) * 2 * 4 * threads * 4;
-    const stages: u32 = if (mode == .bf12) 3 else 4;
+    const stages: u32 = if (mode == .bf12 or mode == .bf11) 3 else 4;
     return @max(stages * stage, partials);""",
 )
 patch_exact(
@@ -4305,7 +4897,7 @@ patch_exact(
         "EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
     const flags = .{ @intFromBool(wide), @intFromBool(cluster), @intFromBool(fused) };
     return std.fmt.comptimePrint(name, .{ @backingInt(mode), bm, flags[0], flags[1], flags[2] });""",
-    """    const st: u32 = if (mode == .bf12) 3 else 4;
+    """    const st: u32 = if (mode == .bf12 or mode == .bf11) 3 else 4;
     const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi{d}ELb{d}ELb{d}ELb{d}" ++
         "EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
     const flags = .{ @intFromBool(wide), @intFromBool(cluster), @intFromBool(fused) };
@@ -4378,6 +4970,7 @@ pub const prompt_rows: usize = 512;
 pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;""",
     """pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
 pub const prompt_bf12_shared: u32 = 3 * ((128 * group * 2 + (128 * group * 3) / 2 + 128 + 127) / 128 * 128) + 128;
+pub const prompt_bf11_shared: u32 = 3 * ((128 * group * 2 + 128 * 90 + 128 + 127) / 128 * 128) + 128;
 pub const prompt_rows: usize = 512;
 pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;""",
 )
@@ -4400,9 +4993,13 @@ pub fn promptBf12Symbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi5ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
 }
 
-/// Only large BF16/BF12 grids use the prompt tile; the packed allocation contains complete 128-column tiles.
+pub fn promptBf11Symbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi6ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
+}
+
+/// Only large BF16/BF12/BF11 grids use the prompt tile; the packed allocation contains complete 128-column tiles.
 pub fn promptEligible(m: usize, w: Weight) bool {
-    return m >= prompt_rows and (w.mode == .bf16 or w.mode == .bf12) and w.n >= 128 and
+    return m >= prompt_rows and (w.mode == .bf16 or w.mode == .bf12 or w.mode == .bf11) and w.n >= 128 and
         (w.k >= 512 or (w.n == 10240 and w.k == 320)) and w.npad % 128 == 0;
 }""",
 )
@@ -4418,11 +5015,13 @@ patch_exact(
     shared_down: [4]Function = undefined,
     shared_down_bf12: [4]Function = undefined,
     bf12_s2: [2]Function = undefined, // Out (bf16/f32), BM=16 BN=64 STAGES=2 plain (5 CTAs/SM for short-K per<=12)
+    bf11_s2: [2]Function = undefined, // Out (bf16/f32), BM=16 BN=64 STAGES=2 plain (6 CTAs/SM for BF11)
     fuse_s: [3][2][2]Function = undefined, // by halfModeIndex, Out, bm=16/32 (PR #3475)
     fuse_split_n: usize = 0,
     pdl: bool = false,
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
     prompt_bf12: ?[2][2]Function = null, // Out, then plain / fused for BF12
+    prompt_bf11: ?[2][2]Function = null, // Out, then plain / fused for BF11
     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x""",
 )
 patch_exact(
@@ -4462,6 +5061,12 @@ patch_exact(
             try f.allowDynamicShared(2 * 8320);
             l.bf12_s2[oi] = f;
         }
+        inline for (.{ false, true }, 0..) |wide, oi| {
+            const sym = std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi6ELi16ELi64ELi1ELi4ELi2ELb{d}ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(wide)});
+            const f = try mod.function(sym);
+            try f.allowDynamicShared(2 * 7936);
+            l.bf11_s2[oi] = f;
+        }
         l.half_below = try halfBelow();
         if (std.c.getenv("TF_FLASHNEXT_FUSED_SPLIT")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "1")) l.fuse_split_n = 2048;
@@ -4479,8 +5084,15 @@ patch_exact(
             try f.allowDynamicShared(prompt_bf12_shared);
             prompt_bf12[oi][fi] = f;
         };
+        var prompt_bf11: [2][2]Function = undefined;
+        inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| inline for (.{ false, true }, 0..) |fused, fi| {
+            const f = try l.mod.function(promptBf11Symbol(out, fused));
+            try f.allowDynamicShared(prompt_bf11_shared);
+            prompt_bf11[oi][fi] = f;
+        };
         l.prompt = prompt;
         l.prompt_bf12 = prompt_bf12;
+        l.prompt_bf11 = prompt_bf11;
         l.prompt_k32 = k32;""",
 )
 patch_exact(
@@ -4492,7 +5104,7 @@ patch_exact(
     }""",
     """    pub fn usesPrompt(l: Lane, m: usize, w: Weight) bool {
         const p = planFor(m, w, l.clusters);
-        const has_p = if (w.mode == .bf12) l.prompt_bf12 != null else l.prompt != null;
+        const has_p = if (w.mode == .bf12) l.prompt_bf12 != null else if (w.mode == .bf11) l.prompt_bf11 != null else l.prompt != null;
         return promptEligible(m, w) and !p.cluster and !p.reduce and has_p and
             2 * promptBlocks(m, w.n) > l.prompt_sms;
     }""",
@@ -4569,12 +5181,14 @@ patch_exact(
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
-        const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
+        const h_thr: usize = if (w.mode == .bf12) 32 else l.half_below;
+        const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < h_thr;
         const use_s2 = w.mode == .bf12 and !prompt and !half and !fs and !p.fused and !p.cluster and p.bm == 16 and (w.k / group) / p.sk <= 12;
+        const use_bf11_s2 = w.mode == .bf11 and !prompt and !p.fused and !p.cluster and p.bm == 16;
         const f = if (k32)
             l.prompt_k32.?[@backingInt(out)]
         else if (prompt)
-            (if (w.mode == .bf12) l.prompt_bf12.?[@backingInt(out)][@intFromBool(p.fused)] else l.prompt.?[@backingInt(out)][@intFromBool(p.fused)])
+            (if (w.mode == .bf12) l.prompt_bf12.?[@backingInt(out)][@intFromBool(p.fused)] else if (w.mode == .bf11) l.prompt_bf11.?[@backingInt(out)][@intFromBool(p.fused)] else l.prompt.?[@backingInt(out)][@intFromBool(p.fused)])
         else if (half)
             l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)]
         else if (fs)
@@ -4583,6 +5197,8 @@ patch_exact(
             set[6]
         else if (use_s2)
             l.bf12_s2[@backingInt(out)]
+        else if (use_bf11_s2)
+            l.bf11_s2[@backingInt(out)]
         else
             set[ti * 2 + @intFromBool(p.cluster)];
         const cols: usize = if (prompt) 128 else if (half) 32 else bn;
@@ -4604,7 +5220,7 @@ patch_exact(
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else if (use_s2) 2 * 8320 else sharedBytes(w.mode, p.bm),
+            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else if (w.mode == .bf11) prompt_bf11_shared else prompt_shared) else if (half) halfShared(w.mode) else if (use_s2) 2 * 8320 else if (use_bf11_s2) 2 * 7936 else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
             .pdl = l.pdl and !prompt,
         }, s, &args);
@@ -5498,7 +6114,7 @@ patch_exact(
     }""",
     """    if (self.m.head.n == vocab) {
         _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
-        if (self.m.head.b.ptr != 0) if (self.m.head.native) |nw| if (nw.mode == .fp4) {
+        if (self.m.head.b.ptr != 0) if (self.m.head.native) |nw| if (nw.mode == .fp4 or nw.mode == .w2) {
             const k_top: usize = 64;
             if (n * k_top * 4 > s.cap * (wt.experts_n + 1) * 4) return error.UnexpectedTensor;
             const direct = self.hooks.best_out != 0;
@@ -6404,8 +7020,9 @@ PY
     export TF_FLASHNEXT_MTP_W2="1"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_MTP_NVFP4="0"
-    export TF_FLASHNEXT_HEAD_NVFP4="1"
+    export TF_FLASHNEXT_HEAD_NVFP4="w2"
     export TF_FLASHNEXT_TRUNK_BF12="1"
+    export TF_FLASHNEXT_TRUNK_BF11="1"
     export TF_FLASHNEXT_FUSED_SPLIT="0"
     export TF_FLASHNEXT_L2PF_MB="0"
     export TF_FLASHNEXT_L2PF_PACE_GBPS="165"
