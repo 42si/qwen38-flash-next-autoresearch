@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4"
+BUILD_FLAVOR="mtp-w2-nvfp4-g4-head4-ple-hc"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -315,9 +315,9 @@ extern "C" __global__ void __launch_bounds__(128) fn_head_rescore(
 }
 CU
 
-  # 2a. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0)
+  # 2a. MTP BF16 -> MXFP8 projection encoder (PR #3218, Apache-2.0, 8-thread load)
   cat > "$fn_dir/cuda_mtp_mxfp8.zig" <<'ZIG'
-//! Re-codes the MTP drafter's BF16 linears to group-32 UE8M0 MXFP8 at load; target verify stays untouched.
+//! Re-codes the MTP drafter's BF16 linears and HC mixers to group-32 UE8M0 MXFP8 at load; target verify stays untouched.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -338,15 +338,40 @@ fn exponentFor(top: f32) i32 {
     return std.math.clamp(e, -126, 127);
 }
 
+const Job = struct {
+    bf16: []const u8,
+    codes: []u8,
+    scales: []u8,
+    groups: usize,
+    per: usize,
+
+    fn worker(ctx: *const Job, tid: usize) void {
+        const lo = @min(ctx.groups, tid * ctx.per);
+        const hi = @min(ctx.groups, lo + ctx.per);
+        for (lo..hi) |g| {
+            const base = g * group;
+            var top: f32 = 0;
+            for (0..group) |i| top = @max(top, @abs(value(ctx.bf16, base + i)));
+            const e = exponentFor(top);
+            ctx.scales[g] = @intCast(127 + e);
+            for (0..group) |i| ctx.codes[base + i] = core.exlr8.codec.e4m3FromF32(std.math.ldexp(value(ctx.bf16, base + i), -e));
+        }
+    }
+};
+
 pub fn encode(bf16: []const u8, n: usize, k: usize, codes: []u8, scales: []u8) void {
     std.debug.assert(k % group == 0 and bf16.len == n * k * 2 and codes.len == n * k and scales.len == n * k / group);
-    for (0..n * k / group) |g| {
-        const base = g * group;
-        var top: f32 = 0;
-        for (0..group) |i| top = @max(top, @abs(value(bf16, base + i)));
-        const e = exponentFor(top);
-        scales[g] = @intCast(127 + e);
-        for (0..group) |i| codes[base + i] = core.exlr8.codec.e4m3FromF32(std.math.ldexp(value(bf16, base + i), -e));
+    const groups = n * k / group;
+    const n_th: usize = if (groups >= 4096) 8 else 1;
+    const job: Job = .{ .bf16 = bf16, .codes = codes, .scales = scales, .groups = groups, .per = (groups + n_th - 1) / n_th };
+    if (n_th == 1) {
+        Job.worker(&job, 0);
+        return;
+    }
+    var ths: [8]?std.Thread = @splat(null);
+    for (0..n_th) |ti| ths[ti] = std.Thread.spawn(.{}, Job.worker, .{ &job, ti }) catch null;
+    for (0..n_th) |ti| {
+        if (ths[ti]) |t| t.join() else Job.worker(&job, ti);
     }
 }
 
@@ -359,6 +384,120 @@ pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const
     encode(bf16, n, k, codes, scales);
     return projection.mxfp8(gpa, driver, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / group, 1, 1, 1 }, .bytes = scales });
 }
+ZIG
+
+  # 2c. Thread-safe 32K-entry in-RAM PLE 3-gram row cache (pre-faulted at init, 64 striped spinlocks)
+  cat > "$fn_dir/cuda_ple_cache.zig" <<'ZIG'
+//! Exact in-RAM 4-way set-associative cache for immutable Layer-2 PLE 3-gram embeddings and group-32 sums.
+const std = @import("std");
+
+pub const row_w: usize = 2560;
+pub const xs_w: usize = row_w / 32;
+const n_sets: usize = 8192;
+const ways: usize = 4;
+const n_locks: usize = 64;
+
+const Lock = struct {
+    state: std.atomic.Value(u32) align(64) = .init(0),
+
+    fn acquire(self: *Lock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *Lock) void {
+        self.state.store(0, .release);
+    }
+};
+
+const Entry = struct {
+    h0: i64,
+    h1: i64,
+    tok: u32,
+    valid: u32,
+    emb: [row_w]u16,
+    xs: [xs_w]f32,
+};
+
+const Set = struct {
+    hand: u32,
+    items: [ways]Entry,
+};
+
+pub const Cache = struct {
+    sets: []Set,
+    locks: [n_locks]Lock = @splat(.{}),
+
+    pub fn create(gpa: std.mem.Allocator) !*Cache {
+        const sets = try gpa.alloc(Set, n_sets);
+        errdefer gpa.free(sets);
+        @memset(std.mem.sliceAsBytes(sets), 0);
+        const c = try gpa.create(Cache);
+        c.* = .{ .sets = sets };
+        return c;
+    }
+
+    pub fn destroy(self: *Cache, gpa: std.mem.Allocator) void {
+        gpa.free(self.sets);
+        gpa.destroy(self);
+    }
+
+    fn setIndex(h0: i64, h1: i64, tok: u32) usize {
+        var x: u64 = @bitCast(h0);
+        x = (x ^ (@as(u64, @bitCast(h1)) *% 0x9E3779B97F4A7C15)) *% 0xBF58476D1CE4E5B9;
+        x = (x ^ (@as(u64, tok) *% 0x94D049BB133111EB)) *% 0x9E3779B97F4A7C15;
+        return @intCast((x >> 51) & (n_sets - 1));
+    }
+
+    pub fn has(self: *Cache, h0: i64, h1: i64, tok: u32) bool {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) return true;
+        }
+        return false;
+    }
+
+    pub fn get(self: *Cache, h0: i64, h1: i64, tok: u32, emb_out: *[row_w]u16, xs_out: *[xs_w]f32) bool {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) {
+                @memcpy(emb_out, &e.emb);
+                @memcpy(xs_out, &e.xs);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn put(self: *Cache, h0: i64, h1: i64, tok: u32, emb_in: *const [row_w]u16, xs_in: *const [xs_w]f32) void {
+        const idx = setIndex(h0, h1, tok);
+        const lk = &self.locks[idx & (n_locks - 1)];
+        lk.acquire();
+        defer lk.release();
+        const set = &self.sets[idx];
+        for (&set.items) |*e| {
+            if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) return;
+        }
+        const way: usize = @intCast(set.hand & (ways - 1));
+        set.hand +%= 1;
+        const dst = &set.items[way];
+        dst.h0 = h0;
+        dst.h1 = h1;
+        dst.tok = tok;
+        dst.valid = 1;
+        @memcpy(&dst.emb, emb_in);
+        @memcpy(&dst.xs, xs_in);
+    }
+};
 ZIG
 
   # 2b. Two-stage main lm_head loader: GPU NVFP4 coarse packed weight + shared resident BF16 rows in p.b
@@ -902,7 +1041,7 @@ def patch_exact(rel: str, old: str, new: str) -> None:
         raise RuntimeError(f"Expected exactly 1 match in {rel}, got {txt.count(old)}")
     p.write_text(txt.replace(old, new, 1), encoding="utf-8")
 
-# 5a. cuda_projection_load.zig: MTP BF16 projections -> MXFP8
+# 5a. cuda_projection_load.zig + cuda_prompt_wt.zig: MTP BF16 projections & HC mixers -> MXFP8
 for storage, original in (
     ("t.bytes", "            return projection.dense(a, d, t);"),
     ("bytes", "        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes });"),
@@ -911,6 +1050,392 @@ for storage, original in (
     check = 'if (std.mem.startsWith(u8, prefix, "language_model.mtp."))'
     project = f'return @import("cuda_mtp_mxfp8.zig").project(a, d, {storage}, n, k);'
     patch_exact("cuda_projection_load.zig", original, f"{indent}{check}\n{indent}    {project}\n{original}")
+
+patch_exact(
+    "cuda_prompt_wt.zig",
+    """    var dq = try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
+    errdefer dq.free();
+    const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
+    if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
+    var uq = try projection.dense(gpa, driver, up);""",
+    """    var dq = if (std.mem.startsWith(u8, prefix, "language_model.mtp."))
+        try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, data, n, wide)
+    else
+        try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
+    errdefer dq.free();
+    const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
+    if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
+    var uq = if (std.mem.startsWith(u8, prefix, "language_model.mtp."))
+        try @import("cuda_mtp_mxfp8.zig").project(gpa, driver, up.bytes, wide, low)
+    else
+        try projection.dense(gpa, driver, up);""",
+)
+
+# 5a2. cuda_batch_hc.zig + cuda_mtp_pieces.zig: fuse hcWritebackNorm on verify windows (n >= 2) and MTP Piece, plus direct sk=1 fc_e/fc_h
+patch_exact(
+    "cuda_batch_hc.zig",
+    "    return n >= 64 and hc_w.down.native != null and std.meta.eql(keep, parts.HcKeep{}) and dims == 2560 and",
+    "    return n >= 2 and hc_w.down.native != null and std.meta.eql(keep, parts.HcKeep{}) and dims == 2560 and",
+)
+patch_exact(
+    "cuda_mtp_pieces.zig",
+    """            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
+            try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
+            // the hidden branch: the four streams normed as one row, fc_hidden on each stream
+            try t.rmsnorm(r.input, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, m, wide, wide);
+            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
+            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);
+            try t.addStreams(ps.branch, ps.ple_gated, ps.h, m, dims, streams);
+            // the layer: attention over the head's own cache, its experts
+            try pp.writeback(0, m);
+            try pp.readout(hh.layer.attn_hc, 0, m);
+            try pp.attnBlock(&hh.layer, 0);
+            try t.hcWriteback(ps.h, ps.h, ps.pss, ps.part, "*fp32", ps.inj, ps.dummy, "*bf16", ps.dummy, "*bf16", m * dims, m, dims, streams, 4, 1, 1, pp.out_slices);
+            // the cache is written; only the call's last row reaches d.out, so the experts run on it alone
+            if (!r.last) return;
+            if (m > 1) {
+                try pp.copy(ps.h, ps.h + (m - 1) * wide * 2, wide * 2);
+                try pp.copy(ps.pss, ps.pss + (m - 1) * pss_n * 4, pss_n * 4);
+                pp.rows = 1;
+            }
+            try pp.readout(hh.layer.mlp_hc, 0, 1);
+            try pp.moeBlock(&hh.layer);
+            pp.pending = 0;
+            try pp.writeback(0, 1);
+            try pp.copy(r.d.out.ptr, ps.h, wide * 2);
+            if (!r.score) return;
+            // the last row's streams and sums are at row 0, where the captured kernels' pointers stay aligned
+            try pp.readout(hh.mixer, 0, 1);""",
+    """            const hc_mod = @import("cuda_batch_hc.zig");
+            const can_fuse = dims == 2560 and streams == 4 and pp.tri.writebackOwned() and pp.k.forms.hc_fuse;
+            if (hh.fc_e.native != null) {
+                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, m, 1);
+            } else {
+                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
+                try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
+            }
+            try t.rmsnorm(r.input, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, m, wide, wide);
+            if (hh.fc_h.native != null) {
+                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * m, 1);
+            } else {
+                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
+                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);
+            }
+            try t.addStreams(ps.branch, ps.ple_gated, ps.h, m, dims, streams);
+            if (can_fuse and hh.layer.attn_hc.down.native != null) {
+                try hc_mod.writebackNorm(pp, hh.layer.attn_hc, 0, m);
+                try hc_mod.readoutNative(pp, hh.layer.attn_hc, 0, m);
+            } else {
+                try pp.writeback(0, m);
+                try pp.readout(hh.layer.attn_hc, 0, m);
+            }
+            try pp.attnBlock(&hh.layer, 0);
+            if (m == 1 and r.last and can_fuse and hh.layer.mlp_hc.down.native != null) {
+                try t.hcWritebackNorm(ps.h, ps.h, ps.pss, ps.part, ps.inj, ps.dummy, ps.dummy, hh.layer.mlp_hc.scale.ptr, ps.norm, eps, dims, 1, dims, streams, 4, 1, 1, pp.out_slices);
+                try hc_mod.readoutNative(pp, hh.layer.mlp_hc, 0, 1);
+            } else {
+                try t.hcWriteback(ps.h, ps.h, ps.pss, ps.part, "*fp32", ps.inj, ps.dummy, "*bf16", ps.dummy, "*bf16", m * dims, m, dims, streams, 4, 1, 1, pp.out_slices);
+                if (!r.last) return;
+                if (m > 1) {
+                    try pp.copy(ps.h, ps.h + (m - 1) * wide * 2, wide * 2);
+                    try pp.copy(ps.pss, ps.pss + (m - 1) * pss_n * 4, pss_n * 4);
+                    pp.rows = 1;
+                }
+                try pp.readout(hh.layer.mlp_hc, 0, 1);
+            }
+            try pp.moeBlock(&hh.layer);
+            pp.pending = 0;
+            if (r.score and can_fuse and hh.mixer.down.native != null) {
+                try hc_mod.writebackNorm(pp, hh.mixer, 0, 1);
+                try pp.copy(r.d.out.ptr, ps.h, wide * 2);
+                try hc_mod.readoutNative(pp, hh.mixer, 0, 1);
+            } else {
+                try pp.writeback(0, 1);
+                try pp.copy(r.d.out.ptr, ps.h, wide * 2);
+                if (!r.score) return;
+                try pp.readout(hh.mixer, 0, 1);
+            }""",
+)
+patch_exact(
+    "cuda_mtp_pieces.zig",
+    """            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
+            try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
+            // each lane's rows of main-model streams, side by side (the head reads them as one block of rows)
+            var row0: usize = 0;
+            for (r.group.rows, r.group.nexts) |rw, nx| {
+                try pp.copy(ps.ple_nrow + row0 * wide * 2, rw, nx.len * wide * 2);
+                row0 += nx.len;
+            }
+            try t.rmsnorm(ps.ple_nrow, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, tot, wide, wide);
+            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
+            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);""",
+    """            if (hh.fc_e.native != null) {
+                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, tot, 1);
+            } else {
+                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
+                try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
+            }
+            var row0: usize = 0;
+            for (r.group.rows, r.group.nexts) |rw, nx| {
+                try pp.copy(ps.ple_nrow + row0 * wide * 2, rw, nx.len * wide * 2);
+                row0 += nx.len;
+            }
+            try t.rmsnorm(ps.ple_nrow, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, tot, wide, wide);
+            if (hh.fc_h.native != null) {
+                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * tot, 1);
+            } else {
+                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
+                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);
+            }""",
+)
+
+# 5a3. cuda_mtp.zig: optional MoE-aware per-step branch gate (TF_FLASHNEXT_MTP_MIN_P)
+patch_exact(
+    "cuda_mtp.zig",
+    """        if (s.c < 0) {
+            s.product *= p;
+            // below the line it ends the chain: no later product can reach it again
+            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
+        }""",
+    """        if (s.c < 0) {
+            s.product *= p;
+            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
+            if (std.c.getenv("TF_FLASHNEXT_MTP_MIN_P")) |raw| {
+                const mp = std.fmt.parseFloat(f64, std.mem.span(raw)) catch 0.0;
+                if (mp > 0 and p < mp) return .{ .propose = true, .more = false };
+            }
+        }""",
+)
+
+# 5a4. cuda_ple.zig + cuda_mtp_draft.zig + cuda_mtp_ops.zig + cuda_lanes.zig + cuda_lanes_draft.zig: 32K PLE cache + async CPU pre-warm behind MTP GPU work
+patch_exact(
+    "cuda_ple.zig",
+    "const ple_fp8 = @import(\"cuda_ple_fp8.zig\");",
+    "const ple_fp8 = @import(\"cuda_ple_fp8.zig\");\nconst ple_cache = @import(\"cuda_ple_cache.zig\");",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "    pool: ?*ple_pool.Pool = null, // the gather's parked workers (null: every row on the caller's thread)\n    warmer: ?std.Thread = null, // warm's read-ahead thread until joined (waitWarm, deinit)",
+    "    pool: ?*ple_pool.Pool = null,\n    warmer: ?std.Thread = null,\n    cache: ?*ple_cache.Cache = null,",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "        g.pool = try ple_pool.Pool.create(gpa, io);\n        return g;",
+    "        g.pool = try ple_pool.Pool.create(gpa, io);\n        if (g.width() == ple_cache.row_w and g.hash.n == 3) {\n            g.cache = try ple_cache.Cache.create(gpa);\n        }\n        return g;",
+)
+patch_exact(
+    "cuda_ple.zig",
+    "    pub fn deinit(g: *Ngram) void {\n        g.waitWarm();\n        if (g.pool) |p| p.destroy();",
+    "    pub fn deinit(g: *Ngram) void {\n        g.waitWarm();\n        if (g.cache) |c| c.destroy(g.gpa);\n        if (g.pool) |p| p.destroy();",
+)
+patch_exact(
+    "cuda_ple.zig",
+    """    pub fn rows(g: *const Ngram, history: []i64, tokens: []const u32, out: []u16, xs: []f32) !void {
+        const heads = g.hash.heads;
+        const w = g.width();
+        if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;""",
+    """    pub fn warmToken(g: *const Ngram, hist: *[2]i64, tok: u32) void {
+        const cache = g.cache orelse return;
+        if (g.hash.n != 3 or g.width() != ple_cache.row_w) return;
+        if (cache.has(hist[0], hist[1], tok)) {
+            hist.* = .{ hist[1], tok };
+            return;
+        }
+        var emb: [ple_cache.row_w]u16 = undefined;
+        var xs_tmp: [ple_cache.xs_w]f32 = undefined;
+        g.rows(hist[0..], &.{tok}, &emb, &xs_tmp) catch {};
+    }
+
+    pub fn warmBatch(g: *const Ngram, ds: anytype, nexts: []const []const u32) void {
+        const cache = g.cache orelse return;
+        if (g.hash.n != 3 or g.width() != ple_cache.row_w or ds.len == 0 or ds.len != nexts.len) return;
+        const heads = g.hash.heads;
+        var miss_tok: [16]u32 = undefined;
+        var miss_h0: [16]i64 = undefined;
+        var miss_h1: [16]i64 = undefined;
+        var n_miss: usize = 0;
+        const lim = @min(ds.len, 16);
+        for (0..lim) |i| {
+            const nx = nexts[i];
+            if (nx.len == 0) continue;
+            const tok = nx[nx.len - 1];
+            const d = ds[i];
+            const h0 = d.draft_hist[0];
+            const h1 = d.draft_hist[1];
+            d.draft_hist = .{ h1, tok };
+            if (!cache.has(h0, h1, tok)) {
+                miss_tok[n_miss] = tok;
+                miss_h0[n_miss] = h0;
+                miss_h1[n_miss] = h1;
+                n_miss += 1;
+            }
+        }
+        if (n_miss == 0) return;
+        const miss_items = n_miss * heads;
+        const miss_ids = g.gpa.alloc(i64, miss_items) catch return;
+        defer g.gpa.free(miss_ids);
+        const miss_emb = g.gpa.alloc(u16, n_miss * ple_cache.row_w) catch return;
+        defer g.gpa.free(miss_emb);
+        for (0..n_miss) |m| {
+            const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
+            lastIds(g.hash, &mh, @intCast(miss_tok[m]), miss_ids[m * heads ..][0..heads]) catch return;
+        }
+        if (g.format != .mlx and miss_items > 1) {
+            @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb) catch return;
+        } else {
+            g.fill(miss_ids, miss_emb, 0, miss_items) catch return;
+        }
+        var xs_tmp: [ple_cache.xs_w]f32 = undefined;
+        for (0..n_miss) |m| {
+            const row: *[ple_cache.row_w]u16 = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
+            if (g.format == .mlx and g.scale != 1) {
+                for (row) |*v| {
+                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                    v.* = toBf16(f * g.scale);
+                }
+            }
+            sumGroups(row, &xs_tmp);
+            cache.put(miss_h0[m], miss_h1[m], miss_tok[m], row, &xs_tmp);
+        }
+    }
+
+    pub fn rows(g: *const Ngram, history: []i64, tokens: []const u32, out: []u16, xs: []f32) !void {
+        const heads = g.hash.heads;
+        const w = g.width();
+        if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;
+        if (g.cache) |cache| if (history.len == 2 and w == ple_cache.row_w and tokens.len > 0) {
+            var hist2: [2]i64 = .{ history[0], history[1] };
+            var stack_idx: [64]usize = undefined;
+            var stack_h0: [64]i64 = undefined;
+            var stack_h1: [64]i64 = undefined;
+            const dyn = tokens.len > stack_idx.len;
+            const miss_idx = if (dyn) try g.gpa.alloc(usize, tokens.len) else stack_idx[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_idx);
+            const miss_h0 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h0[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_h0);
+            const miss_h1 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h1[0..tokens.len];
+            defer if (dyn) g.gpa.free(miss_h1);
+            var n_miss: usize = 0;
+            for (tokens, 0..) |tok, t| {
+                const out_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                const xs_row: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                if (!cache.get(hist2[0], hist2[1], tok, out_row, xs_row)) {
+                    miss_idx[n_miss] = t;
+                    miss_h0[n_miss] = hist2[0];
+                    miss_h1[n_miss] = hist2[1];
+                    n_miss += 1;
+                }
+                hist2 = .{ hist2[1], tok };
+            }
+            if (n_miss > 0) {
+                const miss_items = n_miss * heads;
+                const miss_ids = try g.gpa.alloc(i64, miss_items);
+                defer g.gpa.free(miss_ids);
+                const miss_emb = try g.gpa.alloc(u16, n_miss * ple_cache.row_w);
+                defer g.gpa.free(miss_emb);
+                for (0..n_miss) |m| {
+                    const t = miss_idx[m];
+                    const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
+                    try lastIds(g.hash, &mh, @intCast(tokens[t]), miss_ids[m * heads ..][0..heads]);
+                }
+                const nt = @min(ple_pool.max_parts, miss_items / 4);
+                if (g.format != .mlx and miss_items > 1) {
+                    try @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb);
+                } else if (nt <= 1 or g.pool == null) {
+                    try g.fill(miss_ids, miss_emb, 0, miss_items);
+                } else {
+                    const split_m: Split = .{ .g = g, .ids = miss_ids, .out = miss_emb, .per = (miss_items + nt - 1) / nt };
+                    try g.pool.?.run(nt, .{ .ctx = &split_m, .run = Split.part });
+                }
+                for (0..n_miss) |m| {
+                    const t = miss_idx[m];
+                    const src_row = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
+                    if (g.format == .mlx and g.scale != 1) {
+                        for (src_row) |*v| {
+                            const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                            v.* = toBf16(f * g.scale);
+                        }
+                    }
+                    const dst_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                    const dst_xs: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                    @memcpy(dst_row, src_row);
+                    sumGroups(dst_row, dst_xs);
+                    cache.put(miss_h0[m], miss_h1[m], tokens[t], dst_row, dst_xs);
+                }
+            }
+            history[0] = hist2[0];
+            history[1] = hist2[1];
+            return;
+        };""",
+)
+patch_exact(
+    "cuda_mtp_draft.zig",
+    "    history: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
+)
+patch_exact(
+    "cuda_lanes.zig",
+    "                if (r.position != l.seq.fed + 1) return error.PositionMismatch;",
+    "                if (r.position != l.seq.fed + 1) return error.PositionMismatch;\n                d.draft_hist = l.seq.history;",
+)
+patch_exact(
+    "cuda_lanes_draft.zig",
+    "        if (r.position != l.seq.fed + 1) return error.PositionMismatch;",
+    "        if (r.position != l.seq.fed + 1) return error.PositionMismatch;\n        d.draft_hist = l.seq.history;",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    """        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+            out.n = 0;
+            try o.absorb(d, next, rows, count > 0);
+            var stop: mtp.Stop = .{ .c = confidence };
+            var j: usize = 0;
+            while (j < @min(count, max_chain)) : (j += 1) {
+                const got = try o.pick(d, position + j, sm);
+                const t = stop.take(j, got.prob);
+                if (!t.propose) break;
+                out.tokens[out.n] = got.token;
+                out.probs[out.n] = got.prob;
+                out.n += 1;
+                if (!t.more) break;
+                if (j + 1 < count) {
+                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    d.drafted += 1;
+                }
+            }
+        }""",
+    """        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+            out.n = 0;
+            try o.absorb(d, next, rows, count > 0);
+            if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
+            var stop: mtp.Stop = .{ .c = confidence };
+            var j: usize = 0;
+            while (j < @min(count, max_chain)) : (j += 1) {
+                const got = try o.pick(d, position + j, sm);
+                const t = stop.take(j, got.prob);
+                if (!t.propose) break;
+                out.tokens[out.n] = got.token;
+                out.probs[out.n] = got.prob;
+                out.n += 1;
+                if (!t.more) break;
+                if (j + 1 < count) {
+                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    d.drafted += 1;
+                    o.e.ngram.warmToken(&d.draft_hist, got.token);
+                }
+            }
+        }""",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    "    try o.forwardHeadMany(ds, nexts, rows, true);",
+    "    try o.forwardHeadMany(ds, nexts, rows, true);\n    o.e.ngram.warmBatch(ds, nexts);",
+)
+patch_exact(
+    "cuda_mtp_ops.zig",
+    "            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);\n            for (step_ds[0..n_step]) |d| d.drafted += 1;",
+    "            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);\n            for (step_ds[0..n_step]) |d| d.drafted += 1;\n            o.e.ngram.warmBatch(step_ds[0..n_step], step_nexts[0..n_step]);",
+)
 
 # 5b. cuda_mtp.zig + cuda_lanes_load.zig: hook W2 proposal head & share Engine's BF16 lm_head buffer
 patch_exact(
@@ -1198,7 +1723,8 @@ PY
       THINK="--thinking"
     else
       export TF_FLASHNEXT_DRAFTS_GREEDY="14"
-      export TF_FLASHNEXT_CONFIDENCE="-0.12"
+      export TF_FLASHNEXT_CONFIDENCE="-0.18"
+      export TF_FLASHNEXT_MTP_MIN_P="0.25"
       CTX="$SPEED_CONTEXT"
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
