@@ -24,24 +24,69 @@ GUARD_CONTEXT="139264"
 GUARD_PARALLEL="2"
 
 ENGINE_DIR="$WORKDIR/engines/tensorfold-${ENGINE_VERSION}-aarch64"
-ENGINE_BIN="$ENGINE_DIR/tensorfold-${ENGINE_VERSION}-linux-aarch64/bin/tensorfold-native"
+RELEASE_BIN="$ENGINE_DIR/tensorfold-${ENGINE_VERSION}-linux-aarch64/bin/tensorfold-native"
+BUILD_FLAVOR="mtp-vocab-sm121"
+BUILD_DIR="$WORKDIR/engines/tf-${ENGINE_COMMIT:0:8}-$BUILD_FLAVOR"
+ENGINE_BIN="$BUILD_DIR/native/bin/tensorfold-native"
 MODEL_DIR="$WORKDIR/models/Qwen3.8-Flash-Next-NVFP4-${WEIGHTS_REV:0:8}"
 
 case "$ACTION" in
   meta)
     cat <<EOF
-{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
+{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
 EOF
     ;;
 
   prepare)
     mkdir -p "$WORKDIR/engines" "$WORKDIR/models"
-    if [[ ! -x "$ENGINE_BIN" ]]; then
+    if [[ ! -x "$RELEASE_BIN" ]]; then
       mkdir -p "$ENGINE_DIR"
       ARCHIVE="$ENGINE_DIR/tensorfold-${ENGINE_VERSION}-linux-aarch64.tar.gz"
       curl -fsSL "https://github.com/ashhart/TensorFold/releases/download/v${ENGINE_VERSION}/tensorfold-${ENGINE_VERSION}-linux-aarch64.tar.gz" -o "$ARCHIVE"
       tar -xzf "$ARCHIVE" -C "$ENGINE_DIR"
-      chmod +x "$ENGINE_BIN"
+      chmod +x "$RELEASE_BIN"
+    fi
+
+
+    if [[ ! -x "$ENGINE_BIN" ]]; then
+      mkdir -p "$WORKDIR/engines"
+      stage="$(mktemp -d "$WORKDIR/engines/.tf-build.XXXXXXXX")"
+      trap 'rm -rf -- "$stage"' EXIT
+      zig_dir="$WORKDIR/engines/zig-0.17.0-aarch64"
+      if [[ ! -x "$zig_dir/zig" ]]; then
+        curl -fsSL "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz" -o "$stage/zig.tar.xz"
+        echo "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8  $stage/zig.tar.xz" | sha256sum -c -
+        mkdir "$stage/zig"
+        tar -xJf "$stage/zig.tar.xz" --strip-components=1 -C "$stage/zig"
+        mv "$stage/zig" "$zig_dir"
+      fi
+      git init -q "$stage/src"
+      git -C "$stage/src" fetch -q --depth 1 https://github.com/ashhart/TensorFold.git "$ENGINE_COMMIT"
+      git -C "$stage/src" checkout -q --detach "$ENGINE_COMMIT"
+      python3 - "$stage/src/zig/src/families/flashnext/cuda_mtp.zig" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source = path.read_text()
+old = 'return proposal.legacy.ids(gpa, @import("proposal_table.zig").text, .{ .vocab = vocab,'
+new = '''const cutoff: u32 = if (std.c.getenv("QFN_DRAFT_VOCAB_LIMIT")) |raw|
+        try std.fmt.parseInt(u32, std.mem.span(raw), 10)
+    else
+        vocab;
+    if (cutoff == 0 or cutoff > vocab) return error.BadDraftVocab;
+    return proposal.legacy.ids(gpa, @import("proposal_table.zig").text, .{ .vocab = cutoff,'''
+if source.count(old) != 1:
+    raise ValueError("unexpected draft vocabulary loader")
+path.write_text(source.replace(old, new))
+PY
+      (
+        cd "$stage/src"
+        "$zig_dir/zig" build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc \
+          -Doptimize=fast -j6 --prefix "$stage/install"
+      )
+      test -x "$stage/install/native/bin/tensorfold-native"
+      mv "$stage/install" "$BUILD_DIR"
     fi
 
     if [[ ! -f "$MODEL_DIR/config.json" ]]; then
@@ -55,7 +100,8 @@ PY
     ;;
 
   start)
-    export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="${RELEASE_BIN%/bin/*}/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export QFN_DRAFT_VOCAB_LIMIT=32768
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
     export TF_FLASHNEXT_DRAFTS_GREEDY="14"
     export TF_FLASHNEXT_CONFIDENCE="-0.10"
