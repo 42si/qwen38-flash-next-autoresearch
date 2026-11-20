@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-t56"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5dn-r256-t60"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1997,6 +1997,12 @@ def patch_k(rel: str, old: str, new: str) -> None:
 
 patch_k(
     "qmmf.cu",
+    '#include "common/qmm_frag.cuh"',
+    '#include "common/qmm_frag.cuh"\n#include "common/glue_math.cuh"',
+)
+
+patch_k(
+    "qmmf.cu",
     "enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4 };",
     """enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, BF12 = 5, INT6 = 6, W2 = 7, W1 = 8 };
 
@@ -2102,7 +2108,165 @@ TF_SHARED_DOWN_BF12(tf_qmmf_shared_bf12_16_half, 16, 32)
 TF_SHARED_DOWN_BF12(tf_qmmf_shared_bf12_16, 16, 64)
 TF_SHARED_DOWN_BF12(tf_qmmf_shared_bf12_32, 32, 64)
 TF_SHARED_DOWN_BF12(tf_qmmf_shared_bf12_64, 64, 64)
-#undef TF_SHARED_DOWN_BF12""",
+#undef TF_SHARED_DOWN_BF12
+
+// Bit-exact fused BF12 hc.up [4*D, 320] + fn_hc_dense_mix8 (caches [BM,320] act once, streams 20 W tiles with weights-first PDL).
+template <int BM, int STAGES>
+__device__ __forceinline__ void bf12_hc_upmix_body(
+        const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        const __nv_bfloat16* norm, __nv_bfloat16* __restrict__ mixed, int M, int D) {
+    constexpr int BN = 32, WN = 4, GS = 64, KG = 5, SS = 4, CHUNKS = 8, ROW = 128;
+    constexpr int X_ALL = KG * BM * ROW;
+    constexpr int W = (BN * GS * 3) / 2, S = BN;
+    constexpr int WSTAGE = (W + S + 127) / 128 * 128;
+    constexpr int THREADS = WN * 32, MT = BM / 16, NT = (BN / WN) / 8;
+    extern __shared__ __align__(128) unsigned char buf[];
+    const int tid = threadIdx.x, wn = tid >> 5, lane = tid & 31;
+    const int m0 = blockIdx.x * BM, d0 = blockIdx.y * BN;
+    const int d_tiles = D / 64;
+    const size_t total_tiles = static_cast<size_t>(SS * d_tiles) * KG;
+    const int part = (d0 % 64) / 32;
+    const int w_off = part * W, s_off = part * S;
+    auto xbuf = [&](int g) { return buf + g * (BM * ROW); };
+    auto wstage = [&](int st) { return buf + X_ALL + st * WSTAGE; };
+    auto load_w = [&](int st, int step) {
+        const int s = step / KG, g = step - s * KG;
+        const size_t tbase = static_cast<size_t>(s * d_tiles + (d0 / 64)) * KG + g;
+        unsigned char* pw = wstage(st);
+        unsigned char* ps = pw + W;
+        for (int c = tid; c < W / 16; c += THREADS) cp16_256(pw + c * 16, w + tbase * 6144 + w_off + c * 16);
+        for (int c = tid; c < S / 16; c += THREADS) cp16_256(ps + c * 16, bs + tbase * 64 + s_off + c * 16);
+    };
+    // Weights-first PDL: start fetching step-0 weights before waiting on fn_hc_reduce_act_s1
+    load_w(0, 0);
+    qmm_frag::grid_wait();
+    for (int c = tid; c < KG * BM * CHUNKS; c += THREADS) {
+        const int g = c / (BM * CHUNKS), rem = c % (BM * CHUNKS), r = rem / CHUNKS, ch = rem % CHUNKS;
+        cp16z(xbuf(g) + r * ROW + swz<CHUNKS>(r, ch) * 16, x + static_cast<size_t>(min(m0 + r, M - 1)) * (KG * GS) + g * GS + ch * 8, m0 + r < M);
+    }
+    commit();
+    #pragma unroll
+    for (int st = 1; st < STAGES - 1; ++st) { load_w(st, st); commit(); }
+
+    float mix_tot[MT][NT][4] = {};
+    float acc[MT][NT][4];
+    for (int step = 0; step < SS * KG; ++step) {
+        const int s = step / KG, g = step - s * KG;
+        if (g == 0) {
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int j = 0; j < NT; ++j)
+                    acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+        }
+        wait<STAGES - 2>();
+        __syncthreads();
+        const int next = step + STAGES - 1;
+        if (next < SS * KG) load_w(next % STAGES, next);
+        commit();
+        const unsigned char* px = xbuf(g);
+        const unsigned char* pw = wstage(step % STAGES);
+        const uint8_t* ps = pw + W;
+        uint4 wq[NT];
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int jj = wn * NT + j;
+            const unsigned char* pjj = pw + jj * 768;
+            const uint32_t d01 = reinterpret_cast<const uint32_t*>(pjj + 512)[lane];
+            const uint32_t d23 = reinterpret_cast<const uint32_t*>(pjj + 640)[lane];
+            const uint32_t f01 = d01 & (d01 >> 1) & (d01 >> 2) & (d01 >> 3) & 0x11111111u;
+            const uint32_t f23 = d23 & (d23 >> 1) & (d23 >> 2) & (d23 >> 3) & 0x11111111u;
+            const uint32_t em_sh = (static_cast<uint32_t>(ps[jj * 8 + (lane >> 2)]) << 7) * 0x00010001u;
+            wq[j] = make_uint4(d01, d23, em_sh, f01 | f23);
+        }
+        #pragma unroll
+        for (int kt = 0; kt < 4; ++kt) {
+            uint32_t a[MT][4];
+            #pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r = i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                ldmatrix4(a[i], px + r * ROW + swz<CHUNKS>(r, kt * 2 + (lane >> 4)) * 16);
+            }
+            #pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const int jj = wn * NT + j;
+                const uint32_t ms = reinterpret_cast<const uint32_t*>(pw + jj * 768)[kt * 32 + lane];
+                const uint32_t dlo = kt < 2 ? wq[j].x : wq[j].y;
+                const int sh = (kt & 1) * 8;
+                const uint32_t d0_ = (dlo >> sh) & 0x000F000Fu, d1_ = (dlo >> (sh + 4)) & 0x000F000Fu;
+                const uint32_t x0 = __byte_perm(ms, 0u, 0x4140u), x1 = __byte_perm(ms, 0u, 0x4342u);
+                uint32_t b0, b1;
+                if (__builtin_expect(wq[j].w == 0u, 1)) {
+                    b0 = ((x0 & 0x00800080u) << 8) | (wq[j].z - (d0_ << 7)) | (x0 & 0x007F007Fu);
+                    b1 = ((x1 & 0x00800080u) << 8) | (wq[j].z - (d1_ << 7)) | (x1 & 0x007F007Fu);
+                } else {
+                    const int local_jj = ((d0 & 32) ? 4 : 0) + jj;
+                    const size_t tile_idx = static_cast<size_t>(s * d_tiles + (d0 / 64)) * KG + g;
+                    const uint32_t kbase = (static_cast<uint32_t>(local_jj) << 9) | (static_cast<uint32_t>(kt) << 7) | (static_cast<uint32_t>(lane) << 2);
+                    const uint32_t em = (wq[j].z >> 7) & 0xFFu;
+                    b0 = dec12_pair_esc(x0, d0_, em, bs, total_tiles, tile_idx, kbase);
+                    b1 = dec12_pair_esc(x1, d1_, em, bs, total_tiles, tile_idx, kbase + 2u);
+                }
+                #pragma unroll
+                for (int i = 0; i < MT; ++i) mma(acc[i][j], a[i], b0, b1);
+            }
+        }
+        if (g == KG - 1) {
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    const int col = d0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int row = m0 + i * 16 + (lane >> 2) + h * 8;
+                        if (row < M) {
+                            const uint32_t nv = *reinterpret_cast<const uint32_t*>(norm + (static_cast<size_t>(row) * SS + s) * D + col);
+                            const float n0f = __uint_as_float((nv & 0xFFFFu) << 16);
+                            const float n1f = __uint_as_float(nv & 0xFFFF0000u);
+                            const float u0 = tf_glue::rbf(acc[i][j][2 * h]);
+                            const float u1 = tf_glue::rbf(acc[i][j][2 * h + 1]);
+                            mix_tot[i][j][2 * h]     = __fadd_rn(mix_tot[i][j][2 * h],     tf_glue::rbf(__fmul_rn(tf_glue::rbf(tf_glue::tf_sigmoid(u0)), n0f)));
+                            mix_tot[i][j][2 * h + 1] = __fadd_rn(mix_tot[i][j][2 * h + 1], tf_glue::rbf(__fmul_rn(tf_glue::rbf(tf_glue::tf_sigmoid(u1)), n1f)));
+                        }
+                    }
+                }
+        }
+    }
+    wait<0>();
+    qmm_frag::grid_launch();
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int col = d0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int row = m0 + i * 16 + (lane >> 2) + h * 8;
+                if (row < M) {
+                    const float m0f = tf_glue::rbf(__fdiv_rn(mix_tot[i][j][2 * h], 4.0f));
+                    const float m1f = tf_glue::rbf(__fdiv_rn(mix_tot[i][j][2 * h + 1], 4.0f));
+                    *reinterpret_cast<__nv_bfloat162*>(mixed + static_cast<size_t>(row) * D + col) = __floats2bfloat162_rn(m0f, m1f);
+                }
+            }
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_bf12_hc_upmix_16(
+        const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        const __nv_bfloat16* norm, __nv_bfloat16* __restrict__ mixed, int M, int D) {
+    bf12_hc_upmix_body<16, 4>(x, w, bs, norm, mixed, M, D);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_bf12_hc_upmix_32(
+        const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        const __nv_bfloat16* norm, __nv_bfloat16* __restrict__ mixed, int M, int D) {
+    bf12_hc_upmix_body<32, 3>(x, w, bs, norm, mixed, M, D);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_bf12_hc_upmix_64(
+        const __nv_bfloat16* x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        const __nv_bfloat16* norm, __nv_bfloat16* __restrict__ mixed, int M, int D) {
+    bf12_hc_upmix_body<64, 2>(x, w, bs, norm, mixed, M, D);
+}""",
 )
 
 patch_k(
@@ -2140,6 +2304,7 @@ BF12_INST(16, 32, 1, 4, 3, false, false, false)
 BF12_INST(16, 32, 1, 4, 3, false, true, false)
 BF12_INST(16, 32, 1, 4, 3, true, false, false)
 BF12_INST(16, 32, 1, 4, 3, true, true, false)
+BF12_INST(32, 32, 1, 4, 3, true, false, false)
 BF12_INST(128, 128, 2, 4, 3, false, false, false)
 BF12_INST(128, 128, 2, 4, 3, false, false, true)
 BF12_INST(128, 128, 2, 4, 3, true, false, false)
@@ -2306,12 +2471,20 @@ patch_k(
         } else if constexpr (BN == 32) {
             // half a packed 64-column tile: its n8 tiles 0-3 or 4-7, contiguous in every format's word order
             const int half = (n0 % 64) / 32;
-            for (int c = tid; c < T::W / 16; c += T::THREADS)
-                cp16(pw + c * 16, w + (static_cast<size_t>(n0 / 64) * KG + g) * TILE_BYTES + half * (TILE_BYTES / 2) + c * 16);
+            for (int c = tid; c < T::W / 16; c += T::THREADS) {
+                if constexpr (MODE == BF12 || MODE == INT6)
+                    cp16_256(pw + c * 16, w + (static_cast<size_t>(n0 / 64) * KG + g) * TILE_BYTES + half * (TILE_BYTES / 2) + c * 16);
+                else
+                    cp16(pw + c * 16, w + (static_cast<size_t>(n0 / 64) * KG + g) * TILE_BYTES + half * (TILE_BYTES / 2) + c * 16);
+            }
             if constexpr (T::S > 0) {
                 unsigned char* ps = pw + T::W;
-                for (int c = tid; c < T::S / 16; c += T::THREADS)
-                    cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * (2 * T::S) + half * T::S + c * 16);
+                for (int c = tid; c < T::S / 16; c += T::THREADS) {
+                    if constexpr (MODE == BF12 || MODE == INT6)
+                        cp16_256(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * (2 * T::S) + half * T::S + c * 16);
+                    else
+                        cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * (2 * T::S) + half * T::S + c * 16);
+                }
             }
         } else {
         for (int c = tid; c < T::W / 16; c += T::THREADS) {
@@ -2326,7 +2499,10 @@ patch_k(
             constexpr int S_TILE = (MODE == BF12 || MODE == W1) ? 64 : T::S;
             for (int c = tid; c < T::S / 16; c += T::THREADS) {
                 const int st = c / (S_TILE / 16), soff = c % (S_TILE / 16);
-                cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + st) * KG + g) * S_TILE + soff * 16);
+                if constexpr (BN == 64 && (MODE == BF12 || MODE == W1 || MODE == W2 || MODE == INT6))
+                    cp16_256(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + st) * KG + g) * S_TILE + soff * 16);
+                else
+                    cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + st) * KG + g) * S_TILE + soff * 16);
             }
         }
         }""",
@@ -3324,6 +3500,347 @@ extern "C" __global__ void __launch_bounds__(64) tf_nvfp4_coop2_u4(
     }
   }
   qmm_frag::grid_launch();
+}
+
+// ===== Trial 60: Lossless 256B-aligned 5-bit NVFP4 Expert Scales (S5) =====
+static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
+#if __CUDA_ARCH__ >= 900
+  uint4 v;
+  asm volatile("ld.global.nc.L1::evict_first.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+#else
+  return tf_common::ld_nc(p);
+#endif
+}
+static __device__ __forceinline__ uint2 s5_ld2_256(const uint2* p) {
+#if __CUDA_ARCH__ >= 900
+  uint2 v;
+  asm volatile("ld.global.nc.L1::evict_first.L2::256B.v2.u32 {%0,%1}, [%2];"
+               : "=r"(v.x), "=r"(v.y) : "l"(p));
+  return v;
+#else
+  return tf_common::ld_nc2(p);
+#endif
+}
+static __device__ __forceinline__ uint32_t s5_ld_u16_256(const uint16_t* p) {
+#if __CUDA_ARCH__ >= 900
+  uint32_t v;
+  asm volatile("ld.global.nc.L1::evict_first.L2::256B.u16 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+#else
+  return static_cast<uint32_t>(__ldg(p));
+#endif
+}
+
+static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
+    const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
+  const uint2 mm = __ldg(meta + midx);
+  uint32_t lo = 0u, hi = mm.x >> 8;
+  const uint32_t off = mm.y;
+  while (lo < hi) {
+    const uint32_t mid = (lo + hi) >> 1;
+    const uint32_t k = __ldg(esc + off + mid) >> 8;
+    if (k < key) lo = mid + 1u; else hi = mid;
+  }
+  return __ldg(esc + off + lo) & 0xFFu;
+}
+
+static __device__ __forceinline__ uint32_t s5_pair_bytes(
+    uint32_t lo_byte, uint32_t hi_2bits, uint32_t smin,
+    const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key_base) {
+  const uint32_t q0 = (lo_byte & 0xFu) | ((hi_2bits & 1u) << 4);
+  const uint32_t q1 = ((lo_byte >> 4) & 0xFu) | ((hi_2bits & 2u) << 3);
+  uint32_t b0 = smin + q0;
+  uint32_t b1 = smin + q1;
+  if (__builtin_expect((q0 == 31u) | (q1 == 31u), 0)) {
+    if (q0 == 31u) b0 = s5_lookup_esc_meta(meta, esc, midx, key_base);
+    if (q1 == 31u) b1 = s5_lookup_esc_meta(meta, esc, midx, key_base + 1u);
+  }
+  return (b0 & 0xFFu) | ((b1 & 0xFFu) << 8);
+}
+
+// Per-expert 3-array 256B-aligned S5 down_f32 (STACK:0, +2.56% proven on full model in nsys).
+static __device__ __noinline__ void s5_down_1w_wide(
+    int lane, int gq, int t, int e, int cb, int first, int cnt,
+    const __nv_bfloat16* X, int x_stride,
+    const uint8_t* __restrict__ base, int KG, int NB,
+    float gscale, uint32_t smin, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
+    const int* members, void* __restrict__ out, int N) {
+  const size_t nblk = (size_t)NB * KG;
+  for (int r0 = 0; r0 < cnt; r0 += 16) {
+    const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
+    const int pr0 = v0 ? members[first + r0 + gq] : 0;
+    const int pr1 = v1 ? members[first + r0 + gq + 8] : 0;
+    const __nv_bfloat16* x0 = X + (size_t)pr0 * x_stride;
+    const __nv_bfloat16* x1 = X + (size_t)pr1 * x_stride;
+    float acc[1][1][4][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[0][0][j][0] = acc[0][0][j][1] = acc[0][0][j][2] = acc[0][0][j][3] = 0.f;
+    for (int g = 0; g < KG; ++g) {
+      const size_t blk_i = (size_t)cb * KG + g;
+      const uint4 wv = s5_ld4_256(reinterpret_cast<const uint4*>(base) + blk_i * 32 + lane);
+      const uint2 lov = s5_ld2_256(reinterpret_cast<const uint2*>(base + nblk * 512) + blk_i * 4 + t);
+      const uint32_t hiv = s5_ld_u16_256(reinterpret_cast<const uint16_t*>(base + nblk * 544) + blk_i * 4 + t);
+      const uint2 zero = make_uint2(0u, 0u);
+      const int k0 = g * 32 + 4 * t;
+      const uint32_t gbase = ((uint32_t)blk_i * 64u) + (uint32_t)t * 16u;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint2 xa = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16 * h) : zero;
+        const uint2 xb = v1 ? *reinterpret_cast<const uint2*>(x1 + k0 + 16 * h) : zero;
+        const uint32_t lo_h = h == 0 ? lov.x : lov.y;
+        const uint32_t hi_h = (hiv >> (h * 8)) & 0xFFu;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t word = comp(wv, j);
+          float p[4];
+          qmm_frag::mma0(p, xa.x, xb.x, xa.y, xb.y, tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
+          const uint32_t pair_b = s5_pair_bytes((lo_h >> (j * 8)) & 0xFFu, (hi_h >> (j * 2)) & 3u,
+                                                smin, meta, esc, e, gbase + (uint32_t)h * 8u + (uint32_t)j * 2u);
+          const uint32_t sp = tf_common::fp8pair_unit(pair_b, 0x7B807B80u);
+          const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+          float(&a)[4] = acc[0][0][j];
+          a[0] = fmaf(p[0], s0, a[0]); a[1] = fmaf(p[1], s1, a[1]);
+          if (v1) { a[2] = fmaf(p[2], s0, a[2]); a[3] = fmaf(p[3], s1, a[3]); }
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) acc[0][0][j][q] *= gscale;
+    epilogue<0, 1, 1>(acc, 0, out, N, cb * 32 + 2 * t, pr0, pr1, v0, v1, 0.f);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_nvfp4_s5_down_1w(
+    const __nv_bfloat16* X, int x_stride, int slots, const uint8_t* __restrict__ W_raw,
+    const float* __restrict__ scale, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
+    int KG, int NB, const int* items, const int* counts, const int* members,
+    void* __restrict__ out, int N, float limit, int skip) {
+  (void)slots; (void)limit;
+  qmm_frag::grid_wait();
+  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  const int units = (*counts) * NB;
+  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+    const int it = unit / NB, cb = unit - it * NB;
+    const int e = items[3 * it], first = items[3 * it + 1], cnt = items[3 * it + 2];
+    if (e == skip) continue;
+    const size_t nblk = (size_t)NB * KG;
+    const uint8_t* base = W_raw + (size_t)e * (nblk * 552);
+    const uint32_t smin = __ldg(meta + e).x & 0xFFu;
+    const float gscale = __ldg(scale + e);
+    if (cnt <= 8) {
+      const bool v0 = gq < cnt;
+      const int pr0 = v0 ? members[first + gq] : 0;
+      const __nv_bfloat16* x0 = X + (size_t)pr0 * x_stride;
+      float acc[4][2];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[j][0] = acc[j][1] = 0.f;
+      struct S { uint4 w; uint2 lo; uint32_t hi; uint2 xa[2]; };
+      auto load = [&](S& st, int g) {
+        const size_t blk_i = (size_t)cb * KG + g;
+        st.w = s5_ld4_256(reinterpret_cast<const uint4*>(base) + blk_i * 32 + lane);
+        st.lo = s5_ld2_256(reinterpret_cast<const uint2*>(base + nblk * 512) + blk_i * 4 + t);
+        st.hi = s5_ld_u16_256(reinterpret_cast<const uint16_t*>(base + nblk * 544) + blk_i * 4 + t);
+        const uint2 zero = make_uint2(0u, 0u);
+        const int k0 = g * 32 + 4 * t;
+        st.xa[0] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0) : zero;
+        st.xa[1] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16) : zero;
+      };
+      auto comp_s = [&](const S& st, int g) {
+        const uint32_t gbase = ((uint32_t)(cb * KG + g) * 64u) + (uint32_t)t * 16u;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y;
+          const uint32_t lo_h = h == 0 ? st.lo.x : st.lo.y;
+          const uint32_t hi_h = (st.hi >> (h * 8)) & 0xFFu;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const uint32_t word = comp(st.w, j);
+            float p[4];
+            qmm_frag::mma0(p, a0, 0u, a2, 0u, tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
+            const uint32_t pair_b = s5_pair_bytes((lo_h >> (j * 8)) & 0xFFu, (hi_h >> (j * 2)) & 3u,
+                                                  smin, meta, esc, e, gbase + (uint32_t)h * 8u + (uint32_t)j * 2u);
+            const uint32_t sp = tf_common::fp8pair_unit(pair_b, 0x7B807B80u);
+            const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+            acc[j][0] = fmaf(p[0], s0, acc[j][0]);
+            acc[j][1] = fmaf(p[1], s1, acc[j][1]);
+          }
+        }
+      };
+      S st[2];
+      if (0 < KG) load(st[0], 0);
+      if (1 < KG) load(st[1], 1);
+      for (int g0i = 0; g0i < KG; g0i += 2) {
+        if (g0i < KG)     { comp_s(st[0], g0i);     if (g0i + 2 < KG) load(st[0], g0i + 2); }
+        if (g0i + 1 < KG) { comp_s(st[1], g0i + 1); if (g0i + 3 < KG) load(st[1], g0i + 3); }
+      }
+      if (v0) {
+        const size_t row = (size_t)pr0 * N;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + cb * 32 + 8 * j + 2 * t) =
+              make_float2(acc[j][0] * gscale, acc[j][1] * gscale);
+        }
+      }
+    } else {
+      s5_down_1w_wide(lane, gq, t, e, cb, first, cnt, X, x_stride, base, KG, NB,
+                      gscale, smin, meta, esc, members, out, N);
+    }
+  }
+  qmm_frag::grid_launch();
+}
+
+// 2-stage SMEM-staged S5 prefill factored down_f32 (STACK:0, 34,048B SMEM)
+template <int NT>
+static __device__ __forceinline__ void s5_fact_down_tiles(
+    const __nv_bfloat16* __restrict__ X, int x_stride,
+    const uint8_t* __restrict__ W_raw, const float* __restrict__ scale,
+    const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
+    int KG, int NB, const int* __restrict__ members, void* __restrict__ out, int N,
+    int cbt, int e, int first, int cnt) {
+  constexpr int WN = 8, THREADS = WN * 32, BM = 64, XC = 8, SG = 2;
+  constexpr int CW = SG * 32, LW = SG * 2, HW = 1, CBW = CW + LW + HW;
+  constexpr int XU = BM * XC, WU = WN * CBW, SU = XU + WU;
+  constexpr int XPT = (XU + THREADS - 1) / THREADS;
+  auto chunk = [](int r, int c) { return r * XC + (c ^ ((r & 3) << 1)); };
+  extern __shared__ uint4 sm[];
+  const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+  const int t = lane & 3, gq = lane >> 2, cb = cbt * WN + wn, cbs = min(WN, NB - cbt * WN);
+  const __nv_bfloat16* xsrc[XPT];
+  int xdst[XPT];
+#pragma unroll
+  for (int i = 0; i < XPT; ++i) {
+    const int q = tid + i * THREADS, r = q / XC, c = q - r * XC;
+    xdst[i] = chunk(r, c);
+    xsrc[i] = nullptr;
+    if (q < XU && r < cnt) {
+      const int p = __ldg(members + first + r);
+      xsrc[i] = X + (size_t)p * x_stride + 8 * c;
+    }
+  }
+  const size_t nblk_dn = (size_t)NB * KG;
+  const uint8_t* e_dn_base = W_raw + (size_t)e * (nblk_dn * 552);
+  auto stage = [&](int s, int g0) {
+    const int ng = min(SG, KG - g0);
+    uint4* xs = sm + s * SU;
+#pragma unroll
+    for (int i = 0; i < XPT; ++i)
+      if (xsrc[i] && ((tid + i * THREADS) % XC) < ng * 4) cp16(xs + xdst[i], xsrc[i] + (size_t)g0 * 32);
+    uint4* ws = xs + XU;
+    for (int q = tid; q < cbs * CBW; q += THREADS) {
+      const int j = q / CBW, o = q - j * CBW;
+      const size_t blk0 = (size_t)(cbt * WN + j) * KG + g0;
+      if (o < CW) {
+        if (o < ng * 32) cp16(ws + q, reinterpret_cast<const uint4*>(e_dn_base) + blk0 * 32 + o);
+      } else if (o < CW + LW) {
+        const int lo_o = o - CW;
+        if (lo_o < ng * 2) cp16(ws + q, reinterpret_cast<const uint4*>(e_dn_base + nblk_dn * 512) + blk0 * 2 + lo_o);
+      } else {
+        cp16(ws + q, reinterpret_cast<const uint4*>(e_dn_base + nblk_dn * 544) + (blk0 >> 1));
+      }
+    }
+  };
+  constexpr int TA = NT > 0 ? NT : 1;
+  const bool active = NT > 0 && cb < NB;
+  const uint32_t smin = active ? (__ldg(meta + e).x & 0xFFu) : 0u;
+  float acc[1][TA][4][4];
+#pragma unroll
+  for (int r = 0; r < NT; ++r)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[0][r][j][0] = acc[0][r][j][1] = acc[0][r][j][2] = acc[0][r][j][3] = 0.f;
+  const int steps = (KG + SG - 1) / SG;
+  if (0 < steps) stage(0, 0);
+  cp_commit();
+  for (int k = 0; k < steps; ++k) {
+    cp_wait<0>();
+    __syncthreads();
+    if (k + 1 < steps) stage((k + 1) & 1, (k + 1) * SG);
+    cp_commit();
+    if (!active) continue;
+    const uint4* xs = sm + (k & 1) * SU;
+    const uint4* wcb = xs + XU + wn * CBW;
+    const uint2* sm_lo = reinterpret_cast<const uint2*>(wcb + CW);
+    const uint16_t* sm_hi = reinterpret_cast<const uint16_t*>(wcb + CW + LW);
+#pragma unroll
+    for (int gi = 0; gi < SG; ++gi) {
+      const int g = k * SG + gi;
+      if (g >= KG) break;
+      const uint32_t gbase = ((uint32_t)(cb * KG + g) * 64u) + (uint32_t)t * 16u;
+      const uint4 wv = wcb[gi * 32 + lane];
+      const uint2 lov = sm_lo[gi * 4 + t];
+      const uint32_t hiv = sm_hi[gi * 4 + t];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint2 xa[TA], xb[TA];
+        const int u = gi * 8 + h * 4 + t;
+#pragma unroll
+        for (int r = 0; r < NT; ++r) {
+          const int r0 = 16 * r + gq;
+          xa[r] = reinterpret_cast<const uint2*>(xs + chunk(r0, u >> 1))[u & 1];
+          xb[r] = reinterpret_cast<const uint2*>(xs + chunk(r0 + 8, u >> 1))[u & 1];
+        }
+        const uint32_t lo_h = h == 0 ? lov.x : lov.y;
+        const uint32_t hi_h = (hiv >> (h * 8)) & 0xFFu;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t word = comp(wv, j);
+          const uint32_t b0 = tf_common::fp4pair(word, 8 * h), b1 = tf_common::fp4pair(word, 8 * h + 4);
+          const uint32_t pair_b = s5_pair_bytes((lo_h >> (j * 8)) & 0xFFu, (hi_h >> (j * 2)) & 3u,
+                                                smin, meta, esc, e, gbase + (uint32_t)h * 8u + (uint32_t)j * 2u);
+          const uint32_t sp_b = tf_common::fp8pair_unit(pair_b, 0x7B807B80u);
+          const float s0 = __uint_as_float((sp_b & 0xFFFFu) << 16), s1 = __uint_as_float(sp_b & 0xFFFF0000u);
+#pragma unroll
+          for (int r = 0; r < NT; ++r) {
+            float p[4];
+            qmm_frag::mma0(p, xa[r].x, xb[r].x, xa[r].y, xb[r].y, b0, b1);
+            float(&a)[4] = acc[0][r][j];
+            a[0] = fmaf(p[0], s0, a[0]); a[1] = fmaf(p[1], s1, a[1]);
+            a[2] = fmaf(p[2], s0, a[2]); a[3] = fmaf(p[3], s1, a[3]);
+          }
+        }
+      }
+    }
+  }
+  if (!active) return;
+  if constexpr (NT > 0) {
+    const float g = __ldg(scale + e);
+#pragma unroll
+    for (int r = 0; r < NT; ++r)
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[0][r][j][q] *= g;
+#pragma unroll
+    for (int r = 0; r < NT; ++r) {
+      const int m0 = 16 * r + gq, m1 = m0 + 8;
+      const bool v0 = m0 < cnt, v1 = m1 < cnt;
+      const int p0 = v0 ? __ldg(members + first + m0) : 0, p1 = v1 ? __ldg(members + first + m1) : 0;
+      epilogue<0, 1, TA>(acc, r, out, N, cb * 32 + 2 * t, p0, p1, v0, v1, 0.f);
+    }
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_nvfp4_s5_fact_down_f32(
+    const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint8_t* __restrict__ W_raw,
+    const float* __restrict__ scale, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
+    int KG, int NB, const int* __restrict__ items, const int* __restrict__ counts,
+    const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
+  (void)slots; (void)limit;
+  const int nbt = (NB + 7) / 8, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
+  if (it >= __ldg(counts)) return;
+  const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+  if (e == skip) return;
+  const int nt = max(0, min(4, (cnt + 15) >> 4));
+  switch (nt) {
+    case 4: s5_fact_down_tiles<4>(X, x_stride, W_raw, scale, meta, esc, KG, NB, members, out, N, cbt, e, first, cnt); break;
+    case 3: s5_fact_down_tiles<3>(X, x_stride, W_raw, scale, meta, esc, KG, NB, members, out, N, cbt, e, first, cnt); break;
+    case 2: s5_fact_down_tiles<2>(X, x_stride, W_raw, scale, meta, esc, KG, NB, members, out, N, cbt, e, first, cnt); break;
+    case 1: s5_fact_down_tiles<1>(X, x_stride, W_raw, scale, meta, esc, KG, NB, members, out, N, cbt, e, first, cnt); break;
+    default: s5_fact_down_tiles<0>(X, x_stride, W_raw, scale, meta, esc, KG, NB, members, out, N, cbt, e, first, cnt); break;
+  }
 }""",
 )
 
@@ -3975,11 +4492,25 @@ __global__ void plan_scatter_rows(const int* __restrict__ picks, int P, int E, c
 }""",
 )
 
-# route_rows.cu + router_mma.cuh: keep fast 4-warp <4,3,256> tf_route_logits_few (18.6us) + 1-warp zero-barrier tf_route_topk
+# route_rows.cu + router_mma.cuh: L2::256B weight prefetch (-15.4% router latency, bit-exact) + 1-warp zero-barrier tf_route_topk
 patch_k(
     "common/router_mma.cuh",
     "__device__ __forceinline__ void logits(const __nv_bfloat16* __restrict__ X, int x_ld, const __nv_bfloat16* __restrict__ W,",
     "__device__ __forceinline__ void logits(const __nv_bfloat16* X, int x_ld, const __nv_bfloat16* __restrict__ W,",
+)
+patch_k(
+    "common/router_mma.cuh",
+    "            qmm_frag::cp16z(&tile[buf][row][8 * (v % (KC / 8))], src, read);",
+    """            if (!x_row) {
+#if __CUDA_ARCH__ >= 900
+                const uint32_t sm = static_cast<uint32_t>(__cvta_generic_to_shared(&tile[buf][row][8 * (v % (KC / 8))]));
+                asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, %2;\\n" :: "r"(sm), "l"(src), "r"(read ? 16 : 0));
+#else
+                qmm_frag::cp16z(&tile[buf][row][8 * (v % (KC / 8))], src, read);
+#endif
+            } else {
+                qmm_frag::cp16z(&tile[buf][row][8 * (v % (KC / 8))], src, read);
+            }""",
 )
 patch_k(
     "route_rows.cu",
@@ -4138,6 +4669,7 @@ patch_k(
         const float4* yp0 = reinterpret_cast<const float4*>(Y + static_cast<long long>(r) * SLOTS * D);
         for (int k = 0; k <= TOPK; ++k) {
             const float wk = swts[k];
+            if (wk == 0.0f) continue;
             const float4* yk = yp0 + static_cast<long long>(k) * (D / 4);
             const float4 v0 = yk[tid * 2];
             const float4 v1 = yk[tid * 2 + 1];
@@ -4264,6 +4796,32 @@ patch_k(
 #endif
 }
 
+extern "C" __global__ void __launch_bounds__(384) fn_hc_reduce_act_s1_sc(const float* PART, __nv_bfloat16* __restrict__ ACT,
+                                                                           float* __restrict__ XS, __nv_bfloat16* __restrict__ INJ,
+                                                                           int SK, int M, int S, int LOW, int HAS_INJ, int NDN, float GSCALE) {
+    (void)XS;
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.x, i = threadIdx.x;
+    if (i < LOW + (HAS_INJ ? S : 0)) {
+        const long long stride = static_cast<long long>(M) * NDN;
+        const long long base = static_cast<long long>(r) * NDN + i;
+        float acc = PART[base];
+        for (int s = 1; s < SK; ++s) acc = __fadd_rn(acc, PART[base + static_cast<long long>(s) * stride]);
+        acc = __fmul_rn(acc, GSCALE);
+        const float v = rbf(__fdiv_rn(rbf(acc), static_cast<float>(S)));
+        if (i < LOW) {
+            ACT[static_cast<long long>(r) * LOW + i] = __float2bfloat16_rn(bsilu(v));
+        } else {
+            INJ[static_cast<long long>(r) * S + (i - LOW)] = __float2bfloat16_rn(__fmul_rn(2.0f, bsig(v)));
+        }
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
 extern "C" __global__ void __launch_bounds__(256) fn_shared_reduce_swiglu(const float* PART, __nv_bfloat16* __restrict__ ACT,
                                                                           int M, int W, int SK) {
 #if __CUDA_ARCH__ >= 900
@@ -4314,7 +4872,20 @@ patch_k(
     row[warp][lane] = mixed;""",
 )
 
-# Zero-spill fn_shift_window (taps<=3 in scalar regs, eliminating STACK:32) + skip dead xs in fn_gdn_norm & fn_attn_gate
+# Zero-spill fn_shift_window (taps<=3 in scalar regs, eliminating STACK:32) + skip dead xs in fn_gdn_norm & fn_attn_gate + skip 0-weight slots in hc_writeback<2>
+patch_k(
+    "flashnext_hc.cu",
+    """        for (int k = 0; k <= TOPK; ++k) {
+            const long long at = static_cast<long long>(r) * SLOTS + k;
+            acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+        }""",
+    """        for (int k = 0; k <= TOPK; ++k) {
+            const long long at = static_cast<long long>(r) * SLOTS + k;
+            const float wk = WTS[at];
+            if (wk == 0.0f) continue;
+            acc = __fmaf_rn(Y[at * D + d], wk, acc);
+        }""",
+)
 patch_k(
     "flashnext_batch.cu",
     """static __device__ __forceinline__ void shift_window(__nv_bfloat16* __restrict__ win, const __nv_bfloat16* __restrict__ rows,
@@ -4546,18 +5117,26 @@ extern "C" __global__ void __launch_bounds__(1024) tf_route_topk_plan(
                 pick = bi;
             }
         }
-        if (lane < TOPK) {
-            PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
-            WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
-            sh_pick[warp * SLOTS + lane] = pick;
-            if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
+        const int r_slots = shared ? (SLOTS - 1) : SLOTS;
+        if (lane < r_slots) {
+            if (lane < TOPK) {
+                PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
+                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
+                sh_pick[warp * SLOTS + lane] = pick;
+                if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
+            } else {
+                PICK[static_cast<long long>(warp) * SLOTS + lane] = NE;
+                WTS[static_cast<long long>(warp) * SLOTS + lane] = 0.0f;
+                sh_pick[warp * SLOTS + lane] = NE;
+            }
         }
         if (shared && lane == 0) {
             float sg = row[NE];
             for (int s = 1; s < RSK; ++s) sg = __fadd_rn(sg, row[static_cast<long long>(s) * slice_stride + NE]);
-            PICK[static_cast<long long>(warp) * SLOTS + TOPK] = NE;
-            WTS[static_cast<long long>(warp) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(sg)));
-            sh_pick[warp * SLOTS + TOPK] = NE;
+            const int s_slot = SLOTS - 1;
+            PICK[static_cast<long long>(warp) * SLOTS + s_slot] = NE;
+            WTS[static_cast<long long>(warp) * SLOTS + s_slot] = rbf(tf_sigmoid(rbf(sg)));
+            sh_pick[warp * SLOTS + s_slot] = NE;
             if (NE < E_PLAN) atomicAdd(&sh_cnt[NE], 1);
         }
     }
@@ -4744,6 +5323,64 @@ instrument_pdl("flashnext_gdn_lanes.cuh", expect_min=4)
 instrument_pdl("flashnext_gdn_fused.cuh", expect_min=2)
 instrument_pdl("flashnext_gdn_tpr.cuh", expect_min=2)
 instrument_pdl("flashnext_attn.cu", expect_min=12)
+patch_k(
+    "flashnext_attn.cu",
+    """template <int NB, bool ONE = false, bool FUSE = false, bool PAGED = false>
+__device__ __forceinline__ void attn_chunks(const __nv_bfloat16* Q, const __nv_bfloat16* KC,
+                                            const __nv_bfloat16* VC, const int* POS0,
+                                            float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
+                                            const int* IDS, const int* NKR, const int* SPR,
+                                            int H, int HK, int G, int CH, int NCH, float SCALE, int IDW, int QSA,
+                                            Pg pg = {}) {""",
+    """template <int NB, bool ONE = false, bool FUSE = false, bool PAGED = false, bool GATE = false>
+__device__ __forceinline__ void attn_chunks(const __nv_bfloat16* Q, const __nv_bfloat16* KC,
+                                            const __nv_bfloat16* VC, const int* POS0,
+                                            float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
+                                            const int* IDS, const int* NKR, const int* SPR,
+                                            int H, int HK, int G, int CH, int NCH, float SCALE, int IDW, int QSA,
+                                            Pg pg = {}, const __nv_bfloat16* PROJ = nullptr, int PW = 0) {""",
+)
+patch_k(
+    "flashnext_attn.cu",
+    """    if constexpr (FUSE) {                                  // o / l, rounded once, as fn_attn_merge writes OUT
+        __nv_bfloat16* OUT = reinterpret_cast<__nv_bfloat16*>(PO);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int i = g + 8 * h;
+            if (i >= G) continue;
+            const long long row = (static_cast<long long>(r) * H + hk * G + i) * HD;
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+                    OUT[row + warp * 64 + q * 8 + 2 * t + e] = __float2bfloat16_rn(__fdiv_rn(oo[q][2 * h + e], ll[h]));
+        }
+    }""",
+    """    if constexpr (FUSE) {                                  // o / l, rounded once, optionally fused with fn_attn_gate (bit-exact)
+        __nv_bfloat16* OUT = reinterpret_cast<__nv_bfloat16*>(PO);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int i = g + 8 * h;
+            if (i >= G) continue;
+            const int head = hk * G + i;
+            const long long row = (static_cast<long long>(r) * H + head) * HD;
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int d = warp * 64 + q * 8 + 2 * t + e;
+                    const __nv_bfloat16 ob = __float2bfloat16_rn(__fdiv_rn(oo[q][2 * h + e], ll[h]));
+                    if constexpr (GATE) {
+                        const float o = bf(ob);
+                        const float gv = bf(PROJ[static_cast<long long>(r) * PW + head * 2 * HD + HD + d]);
+                        OUT[row + d] = __float2bfloat16_rn(rbf(__fdiv_rn(o, __fadd_rn(1.0f, tf_exp(-gv)))));
+                    } else {
+                        OUT[row + d] = ob;
+                    }
+                }
+        }
+    }""",
+)
 (kdir / "flashnext_attn.cu").write_text(
     (kdir / "flashnext_attn.cu").read_text(encoding="utf-8") + r"""
 
@@ -4768,6 +5405,54 @@ extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_ahead_paged(
     asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
     attn_chunks<2, false, true, true>(Q, KC, VC, POS0, OUT, nullptr, nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA, pg);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_gate(
+    const __nv_bfloat16* Q, const __nv_bfloat16* KC, const __nv_bfloat16* VC, const int* POS0,
+    float* __restrict__ OUT, const int* IDS, const int* NKR, const int* SPR,
+    int H, int HK, int G, int CH, float SCALE, int IDW, int QSA,
+    const __nv_bfloat16* PROJ, int PW) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+    attn_chunks<1, true, true, false, true>(Q, KC, VC, POS0, OUT, nullptr, nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA, fn_attn::Pg{}, PROJ, PW);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_gate_paged(
+    const __nv_bfloat16* Q, const __nv_bfloat16* KC, const __nv_bfloat16* VC, const int* POS0,
+    float* __restrict__ OUT, const int* IDS, const int* NKR, const int* SPR,
+    int H, int HK, int G, int CH, float SCALE, int IDW, int QSA, fn_attn::Pg pg,
+    const __nv_bfloat16* PROJ, int PW) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+    attn_chunks<1, true, true, true, true>(Q, KC, VC, POS0, OUT, nullptr, nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA, pg, PROJ, PW);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_ahead_gate(
+    const __nv_bfloat16* Q, const __nv_bfloat16* KC, const __nv_bfloat16* VC, const int* POS0,
+    float* __restrict__ OUT, const int* IDS, const int* NKR, const int* SPR,
+    int H, int HK, int G, int CH, float SCALE, int IDW, int QSA,
+    const __nv_bfloat16* PROJ, int PW) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+    attn_chunks<2, false, true, false, true>(Q, KC, VC, POS0, OUT, nullptr, nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA, fn_attn::Pg{}, PROJ, PW);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_ahead_gate_paged(
+    const __nv_bfloat16* Q, const __nv_bfloat16* KC, const __nv_bfloat16* VC, const int* POS0,
+    float* __restrict__ OUT, const int* IDS, const int* NKR, const int* SPR,
+    int H, int HK, int G, int CH, float SCALE, int IDW, int QSA, fn_attn::Pg pg,
+    const __nv_bfloat16* PROJ, int PW) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+    attn_chunks<2, false, true, true, true>(Q, KC, VC, POS0, OUT, nullptr, nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA, pg, PROJ, PW);
 }
 """,
     encoding="utf-8",
@@ -6607,6 +7292,8 @@ patch_exact(
     half_below: usize = half_below_default,
     shared_down: [4]Function = undefined,
     shared_down_bf12: [4]Function = undefined,
+    hc_upmix_bf12: [3]Function = undefined, // BM=16/32/64 fused BF12 hc.up + dense_mix
+    half32_bf12_f32: Function = undefined, // BM=32 BN=32 STAGES=3 f32 (88-CTA hc.down for BM=32 decode)
     bf12_s2: [2]Function = undefined, // Out (bf16/f32), BM=16 BN=64 STAGES=2 plain (5 CTAs/SM for short-K per<=12)
     fuse_s: [4][2][2]Function = undefined, // by halfModeIndex, Out, bm=16/32 (PR #3475)
     fuse_split_n: usize = 0,
@@ -6640,6 +7327,16 @@ patch_exact(
         for (@import("qmmf_shared.zig").bf12_symbols, &l.shared_down_bf12) |name, *f| {
             f.* = try mod.function(name);
             try f.allowDynamicShared(sharedBytes(.bf12, 64));
+        }
+        inline for (.{ .{ "tf_qmmf_bf12_hc_upmix_16", 23040 }, .{ "tf_qmmf_bf12_hc_upmix_32", 30080 }, .{ "tf_qmmf_bf12_hc_upmix_64", 47360 } }, 0..) |spec, hi| {
+            const f = try mod.function(spec[0]);
+            try f.allowDynamicShared(spec[1]);
+            l.hc_upmix_bf12[hi] = f;
+        }
+        {
+            const f32h = try mod.function("_ZN7tf_qmmf11qmmf_kernelILi5ELi32ELi32ELi1ELi4ELi3ELb1ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii");
+            try f32h.allowDynamicShared(21888);
+            l.half32_bf12_f32 = f32h;
         }
         inline for (.{ Mode.mxfp8, Mode.bf16, Mode.bf12, Mode.int6 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ 16, 32 }, 0..) |bm, bi| {
             const f = try mod.function(symbol(mode, bm, false, true, wide));
@@ -6743,13 +7440,35 @@ patch_exact(
         _ = try l.matmulOutImpl(s, x, ldx, m, w, y, out, part, true, false);
     }
 
+    /// Fused bit-exact BF12 hc.up [4*D, 320] + fn_hc_dense_mix8 (eliminates s.hc_up R+W and 96 launches/round).
+    pub fn hcUpmixBf12(l: Lane, s: Stream, act: u64, w: Weight, norm: u64, mixed: u64, m: usize, d: usize) !void {
+        const ti: usize = if (m <= 16) 0 else if (m <= 32) 1 else 2;
+        const bm: usize = if (ti == 0) 16 else if (ti == 1) 32 else 64;
+        const smem: u32 = if (ti == 0) 23040 else if (ti == 1) 30080 else 47360;
+        var args: launch_.Args = .{};
+        args.add(act);
+        args.add(w.codes);
+        args.add(w.scales);
+        args.add(norm);
+        args.add(mixed);
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(d)));
+        try launch_.launch(l.hc_upmix_bf12[ti], .{
+            .grid = .{ .x = @intCast((m + bm - 1) / bm), .y = @intCast(d / 32), .z = 1 },
+            .block = .{ .x = 128, .y = 1, .z = 1 },
+            .shared = smem,
+            .pdl = l.pdl,
+        }, s, &args);
+    }
+
     /// Launch matmul leaving split-K FP32 partials in `part` (skipping reduce_kernel) and returning slice count (1 if already reduced in `y`).
     pub fn matmulRawPart(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64, allow_cluster: bool) !usize {
         return l.matmulOutImpl(s, x, ldx, m, w, y, out, part, allow_cluster, true);
     }
 
     fn matmulOutImpl(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64, allow_cluster: bool, skip_reduce: bool) !usize {
-        const p = planFor(m, w, l.clusters and allow_cluster);
+        const use_out_sk4 = skip_reduce and !allow_cluster and w.mode == .bf12 and w.n == 2560 and w.k >= 4096 and w.sk == 0 and m <= 64 and (if (std.c.getenv("TF_BF12_OUT_SK4")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false);
+        const p = if (use_out_sk4) planSlices(m, 4, false) else planFor(m, w, l.clusters and allow_cluster);
         if (p.reduce and part == 0) return error.MissingLanePart;
         const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
@@ -6759,16 +7478,19 @@ patch_exact(
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
-        const h_thr: usize = if (w.mode == .bf12) 32 else l.half_below;
+        const h_thr: usize = if (w.mode == .bf12) 64 else l.half_below;
         const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < h_thr;
+        const half32 = w.mode == .bf12 and out == .f32 and p.bm == 32 and !prompt and !p.fused and !p.cluster and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < h_thr;
         const s2_max: usize = if (std.c.getenv("TF_BF12_S2_MAX_PER")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 12) else 12;
-        const use_s2 = w.mode == .bf12 and !prompt and !half and !fs and !p.fused and !p.cluster and p.bm == 16 and (w.k / group) / p.sk <= s2_max;
+        const use_s2 = w.mode == .bf12 and !prompt and !half and !half32 and !fs and !p.fused and !p.cluster and p.bm == 16 and (w.k / group) / p.sk <= s2_max;
         const f = if (k32)
             l.prompt_k32.?[@backingInt(out)]
         else if (prompt)
             (if (w.mode == .bf12) l.prompt_bf12.?[@backingInt(out)][@intFromBool(p.fused)] else l.prompt.?[@backingInt(out)][@intFromBool(p.fused)])
         else if (half)
             l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)]
+        else if (half32)
+            l.half32_bf12_f32
         else if (fs)
             (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)])
         else if (p.fused)
@@ -6777,7 +7499,7 @@ patch_exact(
             l.bf12_s2[@backingInt(out)]
         else
             set[ti * 2 + @intFromBool(p.cluster)];
-        const cols: usize = if (prompt) 128 else if (half) 32 else bn;
+        const cols: usize = if (prompt) 128 else if (half or half32) 32 else bn;
         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
         var args: launch_.Args = .{};
         args.add(x);
@@ -6796,7 +7518,7 @@ patch_exact(
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else if (use_s2) 2 * 8320 else sharedBytes(w.mode, p.bm),
+            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf12) prompt_bf12_shared else prompt_shared) else if (half) halfShared(w.mode) else if (half32) 21888 else if (use_s2) 2 * 8320 else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
             .pdl = l.pdl and !prompt,
         }, s, &args);
@@ -7425,7 +8147,7 @@ patch_exact(
     const down = hc_w.down.native orelse return error.UnexpectedTensor;
     const up = hc_w.up.native orelse return error.UnexpectedTensor;
     if (n * hc_w.n_down * 4 > s.hc_part_bytes) return error.UnexpectedTensor; // one slice within hc_part (hcPartRows)
-    const hc_sk: usize = if (down.scale == 1.0)
+    const hc_sk: usize = if (down.scale == 1.0 or pass.tri.own != null)
         try pass.k.native_lane.matmulRawPart(pass.stream, norm, wide, n, down, s.hc_part, .f32, s.native_part, true)
     else blk: {
         try pass.k.nativeMatmul(pass.stream, norm, wide, n, down, s.hc_part, s.native_part, .f32);
@@ -7433,20 +8155,28 @@ patch_exact(
     };
     const part_src = if (hc_sk > 1) s.native_part else s.hc_part;
     const inj_ptr = if (hc_w.has_inj == 1) inj else act;
-    try pass.tri.hcReduceAct(part_src, act, 0, inj_ptr, hc_sk, n, streams, low, hc_w.n_down, hc_w.has_inj);
-    try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
-    const xsm_ptr: u64 = if (hc_w.has_inj == 1) 0 else s.xsm + r0 * (dims / 32) * 4;
-    try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, xsm_ptr, n, dims, streams);""",
+    if (down.scale != 1.0 and pass.tri.own != null and hc_sk > 1) {
+        try pass.tri.own.?.hcReduceActScaled(pass.stream, part_src, act, 0, inj_ptr, hc_sk, n, streams, low, hc_w.n_down, hc_w.has_inj, down.scale);
+    } else {
+        try pass.tri.hcReduceAct(part_src, act, 0, inj_ptr, hc_sk, n, streams, low, hc_w.n_down, hc_w.has_inj);
+    }
+    if (hc_w.has_inj == 1 and up.mode == .bf12 and up.n == streams * dims and up.k == low and dims == 2560 and streams == 4 and low == 320 and n <= 32) {
+        try pass.k.native_lane.hcUpmixBf12(pass.stream, act, up, norm, s.mixed + r0 * dims * 2, n, dims);
+    } else {
+        try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
+        const xsm_ptr: u64 = if (hc_w.has_inj == 1) 0 else s.xsm + r0 * (dims / 32) * 4;
+        try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, xsm_ptr, n, dims, streams);
+    }""",
 )
 patch_exact(
     root, "cuda_glue.zig",
     "    shared_swiglu: cuda.Function,\n    shared_scatter: cuda.Function,\n    down: cuda.Function,\n    reduce_act: cuda.Function,",
-    "    shared_swiglu: cuda.Function,\n    shared_reduce_swiglu: cuda.Function,\n    shared_swiglu_cat: cuda.Function,\n    shared_scatter: cuda.Function,\n    down: cuda.Function,\n    reduce_act: cuda.Function,\n    reduce_act_s1: cuda.Function,",
+    "    shared_swiglu: cuda.Function,\n    shared_reduce_swiglu: cuda.Function,\n    shared_swiglu_cat: cuda.Function,\n    shared_scatter: cuda.Function,\n    down: cuda.Function,\n    reduce_act: cuda.Function,\n    reduce_act_s1: cuda.Function,\n    reduce_act_s1_sc: cuda.Function,",
 )
 patch_exact(
     root, "cuda_glue.zig",
     "            .shared_swiglu = try g.hc.function(\"fn_shared_swiglu\"),\n            .shared_scatter = try g.hc.function(\"fn_shared_scatter\"),\n            .down = try g.hc.function(\"fn_hc_down\"),\n            .reduce_act = try g.hc.function(\"fn_hc_reduce_act\"),",
-    "            .shared_swiglu = try g.hc.function(\"fn_shared_swiglu\"),\n            .shared_reduce_swiglu = try g.hc.function(\"fn_shared_reduce_swiglu\"),\n            .shared_swiglu_cat = try g.hc.function(\"fn_shared_swiglu_cat\"),\n            .shared_scatter = try g.hc.function(\"fn_shared_scatter\"),\n            .down = try g.hc.function(\"fn_hc_down\"),\n            .reduce_act = try g.hc.function(\"fn_hc_reduce_act\"),\n            .reduce_act_s1 = try g.hc.function(\"fn_hc_reduce_act_s1\"),",
+    "            .shared_swiglu = try g.hc.function(\"fn_shared_swiglu\"),\n            .shared_reduce_swiglu = try g.hc.function(\"fn_shared_reduce_swiglu\"),\n            .shared_swiglu_cat = try g.hc.function(\"fn_shared_swiglu_cat\"),\n            .shared_scatter = try g.hc.function(\"fn_shared_scatter\"),\n            .down = try g.hc.function(\"fn_hc_down\"),\n            .reduce_act = try g.hc.function(\"fn_hc_reduce_act\"),\n            .reduce_act_s1 = try g.hc.function(\"fn_hc_reduce_act_s1\"),\n            .reduce_act_s1_sc = try g.hc.function(\"fn_hc_reduce_act_s1_sc\"),",
 )
 patch_exact(
     root, "cuda_glue.zig",
@@ -7479,8 +8209,17 @@ patch_exact(
 )
 patch_exact(
     root, "cuda_glue.zig",
-    "        try go(g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);",
-    "        try go(if (sk <= 16 and xs == 0 and cols <= 384) g.f.reduce_act_s1 else g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);",
+    "        try go(g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);\n    }",
+    """        try go(if (sk <= 16 and xs == 0 and cols <= 384) g.f.reduce_act_s1 else g.f.reduce_act, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);
+    }
+
+    pub fn hcReduceActScaled(g: *const Glue, s: cuda.Stream, part: u64, act: u64, xs: u64, inj: u64, sk: usize, rows: usize, streams: usize, low: usize, cols: usize, has_inj: usize, gscale: f32) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ part, act, xs, inj });
+        ints(&a, &.{ sk, rows, streams, low, has_inj, cols });
+        a.add(gscale);
+        try go(g.f.reduce_act_s1_sc, s, .{ rows, 1, 1 }, @intCast(cdiv(@max(cols, low / 32), 32) * 32), 0, &a);
+    }""",
 )
 patch_exact(
     root, "cuda_glue.zig",
@@ -8502,12 +9241,16 @@ patch_exact(
 
     pub fn topkPlanMany(g: *const Glue, s: cuda.Stream, logits: u64, rsk: usize, pick: u64, wts: u64, rows: usize, e_plan: usize, tile: usize, plan: cuda.grouped.Plan) !void {
         try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, wt.slots - 1, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts);
+    }
+
+    pub fn topkPlanManyK(g: *const Glue, s: cuda.Stream, logits: u64, rsk: usize, pick: u64, wts: u64, rows: usize, e_plan: usize, tile: usize, plan: cuda.grouped.Plan, top_k: usize) !void {
+        try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, top_k, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts);
     }""",
 )
 patch_exact(
     root, "cuda_prompt_load.zig",
     "    router: cuda.DeviceBuffer,\n    linear: bool,",
-    "    router: cuda.DeviceBuffer,\n    router_q: ?Q4 = null,\n    linear: bool,",
+    "    router: cuda.DeviceBuffer,\n    router_q: ?Q4 = null,\n    linear: bool,\n    is_mtp: bool = false,",
 )
 patch_exact(
     root, "cuda_prompt_load.zig",
@@ -8529,7 +9272,7 @@ patch_exact(
 patch_exact(
     root, "cuda_prompt_load.zig",
     "        .router = router_b,\n        .linear = linear,",
-    "        .router = router_b,\n        .router_q = router_q,\n        .linear = linear,",
+    "        .router = router_b,\n        .router_q = router_q,\n        .linear = linear,\n        .is_mtp = std.mem.startsWith(u8, base, \"language_model.mtp.\"),",
 )
 patch_exact(
     root, "cuda_batch.zig",
@@ -8571,7 +9314,15 @@ patch_exact(
     root, "cuda_moe_native.zig",
     """/// moeBlockKeep's native layer: each routed pair's fp32 row into y [pairs, dims], the shared slot's on rank 0.
 pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, plan: cuda.grouped.Plan) !void {""",
-    """/// World-1 NVFP4 decode fast path: lossless BF12 router + single-CTA fused reduce+top-k+4-bucket plan skipping global picks round-trip.
+    """/// Optional MTP-only routed-expert top-k cap (target 48 layers always keep full slots-1=10).
+fn mtpTopK() usize {
+    const std = @import("std");
+    const raw = std.c.getenv("TF_FLASHNEXT_MTP_TOPK") orelse return slots - 1;
+    const v = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return slots - 1;
+    return @min(v, slots - 1);
+}
+
+/// World-1 NVFP4 decode fast path: lossless BF12 router + single-CTA fused reduce+top-k+4-bucket plan skipping global picks round-trip.
 pub fn runFused(self: anytype, glue: anytype, lw: anytype, native: *const mixed.Owned, n: usize, pairs: usize, plan: cuda.grouped.Plan) !void {
     const s = self.s;
     const owned = &native.experts;
@@ -8587,20 +9338,24 @@ pub fn runFused(self: anytype, glue: anytype, lw: anytype, native: *const mixed.
     }
     const e = owned.count;
     const skip: i32 = @intCast(owned.count);
+    const active_k: usize = if (lw.is_mtp) mtpTopK() else slots - 1;
     const y_bytes = exchange.clearedRows(native.world, n) * slots * dims * 4;
     if (zs.clearsY(native.world, native.rank)) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
     if (lw.router_q) |rq| {
         const rsk = try self.k.native_lane.matmulRawPart(self.stream, s.mixed, dims, n, rq.native.?, s.router_l, .f32, s.native_part, false);
         const r_src = if (rsk > 1) s.native_part else s.router_l;
-        try glue.topkPlanMany(self.stream, r_src, rsk, s.picks, s.wts, n, e, pt, plan);
+        try glue.topkPlanManyK(self.stream, r_src, rsk, s.picks, s.wts, n, e, pt, plan, active_k);
     } else {
         try glue.routerMany(self.stream, s.mixed, lw.router.ptr, s.router_l, dims, n);
-        try glue.topkPlanMany(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan);
+        try glue.topkPlanManyK(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan, active_k);
     }
     const side = try shared.fork(self, native, n);
-    const items = cuda.grouped.maxItems(pairs, e, pt);
-    try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
-    try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+    if (active_k > 0) {
+        const active_pairs = n * active_k;
+        const items = @min(cuda.grouped.maxItems(pairs, e, pt), cuda.grouped.maxItems(active_pairs, e, pt));
+        try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
+        try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+    }
     if (side != null) try shared.join(self, side, native, n) else try @import("cuda_shared_split.zig").run(self, native, n);
 }
 
@@ -8616,7 +9371,12 @@ patch_exact(
 patch_exact(
     root, "cuda_lanes.zig",
     ".first_copy_rows = if (drafting) mtp.max_chain + 1 else 0,",
-    ".first_copy_rows = if (drafting) 16 else 0,",
+    ".first_copy_rows = if (drafting) 16 else 0,\n                    .root_copies = (if (std.c.getenv(\"TF_FLASHNEXT_ROOT_COPIES\")) |v| std.mem.eql(u8, std.mem.span(v), \"1\") else false),",
+)
+patch_exact(
+    root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "    if (!e.cfg.root_copies) return requests;",
+    "    if (!e.cfg.root_copies or !e.alone) return requests;",
 )
 patch_exact(
     root, "cuda_lanes_draft.zig",
@@ -8794,22 +9554,95 @@ patch_exact(
 patch_exact(
     root, "cuda_glue.zig",
     "    fused_paged: cuda.Function,\n};",
-    "    fused_paged: cuda.Function,\n    fused_ahead: cuda.Function,\n    fused_ahead_paged: cuda.Function,\n};",
+    "    fused_paged: cuda.Function,\n    fused_ahead: cuda.Function,\n    fused_ahead_paged: cuda.Function,\n    fused_gate: cuda.Function,\n    fused_gate_paged: cuda.Function,\n    fused_ahead_gate: cuda.Function,\n    fused_ahead_gate_paged: cuda.Function,\n};",
 )
 patch_exact(
     root, "cuda_glue.zig",
     "            .fused_paged = try g.attn.function(\"fn_attn_fused_paged\"),\n        };",
-    "            .fused_paged = try g.attn.function(\"fn_attn_fused_paged\"),\n            .fused_ahead = try g.attn.function(\"fn_attn_fused_ahead\"),\n            .fused_ahead_paged = try g.attn.function(\"fn_attn_fused_ahead_paged\"),\n        };",
+    "            .fused_paged = try g.attn.function(\"fn_attn_fused_paged\"),\n            .fused_ahead = try g.attn.function(\"fn_attn_fused_ahead\"),\n            .fused_ahead_paged = try g.attn.function(\"fn_attn_fused_ahead_paged\"),\n            .fused_gate = try g.attn.function(\"fn_attn_fused_gate\"),\n            .fused_gate_paged = try g.attn.function(\"fn_attn_fused_gate_paged\"),\n            .fused_ahead_gate = try g.attn.function(\"fn_attn_fused_ahead_gate\"),\n            .fused_ahead_gate_paged = try g.attn.function(\"fn_attn_fused_ahead_gate_paged\"),\n        };",
 )
 patch_exact(
     root, "cuda_glue.zig",
     "        try g.f.fused_paged.allowDynamicShared(oneSmem());\n        return g;",
-    "        try g.f.fused_paged.allowDynamicShared(oneSmem());\n        try g.f.fused_ahead.allowDynamicShared(chunkSmem(2));\n        try g.f.fused_ahead_paged.allowDynamicShared(chunkSmem(2));\n        return g;",
+    "        try g.f.fused_paged.allowDynamicShared(oneSmem());\n        try g.f.fused_ahead.allowDynamicShared(chunkSmem(2));\n        try g.f.fused_ahead_paged.allowDynamicShared(chunkSmem(2));\n        try g.f.fused_gate.allowDynamicShared(oneSmem());\n        try g.f.fused_gate_paged.allowDynamicShared(oneSmem());\n        try g.f.fused_ahead_gate.allowDynamicShared(chunkSmem(2));\n        try g.f.fused_ahead_gate_paged.allowDynamicShared(chunkSmem(2));\n        return g;",
 )
 patch_exact(
     root, "cuda_glue.zig",
-    "        try go(if (pg.pt != 0) g.f.fused_paged else g.f.fused, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);",
-    "        const ahead = rows <= ahead_rows;\n        const f = if (ahead) g.f.fused_ahead else g.f.fused;\n        const paged = if (ahead) g.f.fused_ahead_paged else g.f.fused_paged;\n        try go(if (pg.pt != 0) paged else f, s, .{ rows, kv, 1 }, 128, if (ahead) chunkSmem(2) else oneSmem(), &a);",
+    "        try go(if (pg.pt != 0) g.f.fused_paged else g.f.fused, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);\n    }",
+    """        const ahead = rows <= ahead_rows;
+        const f = if (ahead) g.f.fused_ahead else g.f.fused;
+        const paged = if (ahead) g.f.fused_ahead_paged else g.f.fused_paged;
+        try go(if (pg.pt != 0) paged else f, s, .{ rows, kv, 1 }, 128, if (ahead) chunkSmem(2) else oneSmem(), &a);
+    }
+
+    pub fn attnFusedGate(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, pg: Pg, proj: u64, pw: usize) !void {
+        const kv: usize = h.kv;
+        const group = h.q / kv;
+        if (group > tile_heads) return error.RowShape;
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ q, kc, vc, pos, out, ids, nk, sparse });
+        ints(&a, &.{ h.q, kv, group, 512 });
+        a.add(@as(f32, 0.0625));
+        ints(&a, &.{ wt.index_idw, 1 });
+        if (pg.pt != 0) a.add(pg);
+        a.add(proj);
+        a.add(@as(i32, @intCast(pw)));
+        const ahead = rows <= ahead_rows;
+        const f = if (ahead) g.f.fused_ahead_gate else g.f.fused_gate;
+        const paged = if (ahead) g.f.fused_ahead_gate_paged else g.f.fused_gate_paged;
+        try go(if (pg.pt != 0) paged else f, s, .{ rows, kv, 1 }, 128, if (ahead) chunkSmem(2) else oneSmem(), &a);
+    }""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """            if (self.lanes_attn) {
+                try batch_lanes.attn(self, lw, ai, pa);
+            } else if (self.lanes.len > 0) {
+                // shared rounds: each lane's rope, cache writes, selection and attention on its own stream's caches
+                const own_seq = self.seq;
+                const own_pos0 = self.pos0;
+                defer {
+                    self.seq = own_seq;
+                    self.pos0 = own_pos0;
+                }
+                var row0: usize = 0;
+                for (self.lanes, 0..) |l, i| {
+                    self.seq = l.seq;
+                    self.pos0 = l.pos;
+                    try self.attnRows(lw, ai, pa + row0 * pn * 2, l.rows, .{ .pos = s.pos + i * 16, .q = s.q + row0 * h.q * head_dim * 2, .iq = s.iq + row0 * index_heads * index_dim * 2, .ao = s.ao + row0 * h.q * head_dim * 2 });
+                    row0 += l.rows;
+                }
+            } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao });
+            const gated = if (keep.gated != 0) keep.gated else s.gated;
+            try self.tri.attnGate(s.ao, pa, gated, if (lw.out.native != null) @as(u64, 0) else s.gxs_attn, n, pn, h.q, head_dim);""",
+    """            const gated = if (keep.gated != 0) keep.gated else s.gated;
+            const inline_gate = !self.lanes_attn and lw.out.native != null and self.tri.fusedAttentionOwned() and self.tri.own != null;
+            if (self.lanes_attn) {
+                try batch_lanes.attn(self, lw, ai, pa);
+            } else if (self.lanes.len > 0) {
+                // shared rounds: each lane's rope, cache writes, selection and attention on its own stream's caches
+                const own_seq = self.seq;
+                const own_pos0 = self.pos0;
+                defer {
+                    self.seq = own_seq;
+                    self.pos0 = own_pos0;
+                }
+                var row0: usize = 0;
+                for (self.lanes, 0..) |l, i| {
+                    self.seq = l.seq;
+                    self.pos0 = l.pos;
+                    try self.attnRows(lw, ai, pa + row0 * pn * 2, l.rows, .{ .pos = s.pos + i * 16, .q = s.q + row0 * h.q * head_dim * 2, .iq = s.iq + row0 * index_heads * index_dim * 2, .ao = s.ao + row0 * h.q * head_dim * 2, .gated = if (inline_gate) gated + row0 * h.q * head_dim * 2 else 0, .pn = pn });
+                    row0 += l.rows;
+                }
+            } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao, .gated = if (inline_gate) gated else 0, .pn = pn });
+            if (!inline_gate) {
+                try self.tri.attnGate(s.ao, pa, gated, if (lw.out.native != null) @as(u64, 0) else s.gxs_attn, n, pn, h.q, head_dim);
+            }""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    "        const RowsAt = struct { pos: u64, q: u64, iq: u64, ao: u64 };",
+    "        const RowsAt = struct { pos: u64, q: u64, iq: u64, ao: u64, gated: u64 = 0, pn: usize = 0 };",
 )
 patch_exact(
     root, "cuda_batch.zig",
@@ -8817,16 +9650,440 @@ patch_exact(
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
                         try self.tri.attnChunks(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
                         try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * qr, s.qnk, s.qspr, m, h, true);
-                    }""",
+                    }
+                }
+                if (fused) try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);""",
     """                    if (!fused) {
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
                         if (chunks == 1 and self.tri.fusedAttentionOwned()) {
-                            try self.tri.attnFused(at.q + r0 * qr, kc, vc, pos, at.ao + r0 * qr, s.qids, s.qnk, s.qspr, m, h, pg);
+                            if (at.gated != 0) {
+                                try self.tri.own.?.attnFusedGate(self.stream, at.q + r0 * qr, kc, vc, pos, at.gated + r0 * qr, s.qids, s.qnk, s.qspr, m, h, pg, pa + r0 * at.pn * 2, at.pn);
+                            } else {
+                                try self.tri.attnFused(at.q + r0 * qr, kc, vc, pos, at.ao + r0 * qr, s.qids, s.qnk, s.qspr, m, h, pg);
+                            }
                         } else {
                             try self.tri.attnChunks(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
                             try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * qr, s.qnk, s.qspr, m, h, true);
+                            if (at.gated != 0) try self.tri.attnGate(at.ao + r0 * qr, pa + r0 * at.pn * 2, at.gated + r0 * qr, 0, m, at.pn, h.q, head_dim);
                         }
-                    }""",
+                    }
+                }
+                if (fused) {
+                    if (at.gated != 0) {
+                        try self.tri.own.?.attnFusedGate(self.stream, at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.gated + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg, pa + g0 * at.pn * 2, at.pn);
+                    } else {
+                        try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
+                    }
+                }""",
+)
+
+# 5q. Trial 60: Lossless 256B-aligned 5-bit NVFP4 Expert Scales (S5) for down_f32 (decode + prefill, STACK:0, +2.56% on down_f32, -0.94 GB VRAM)
+patch_exact(
+    cdir, "experts.zig",
+    """    shared_up: u64 = 0,
+    shared_down: u64 = 0,
+};""",
+    """    shared_up: u64 = 0,
+    shared_down: u64 = 0,
+    down_s5_meta: u64 = 0,
+    down_s5_esc: u64 = 0,
+};""",
+)
+patch_exact(
+    cdir, "experts.zig",
+    """    coop2_u4_fn: Function = undefined,
+    full_r8_fn: Function = undefined,
+    warps: usize = 4,""",
+    """    coop2_u4_fn: Function = undefined,
+    full_r8_fn: Function = undefined,
+    s5_down_1w_fn: Function = undefined,
+    s5_fact_down_fn: Function = undefined,
+    warps: usize = 4,""",
+)
+patch_exact(
+    cdir, "experts.zig",
+    """        var e: Nvfp4Experts = .{ .mod = mod, .fns = undefined, .resident = undefined, .prompt_fns = undefined, .fact_fns = undefined, .half4_fn = try mod.function("tf_nvfp4_half_coop4"), .half2_fn = try mod.function("tf_nvfp4_half_coop2"), .coop2_u4_fn = try mod.function("tf_nvfp4_coop2_u4"), .full_r8_fn = try mod.function("tf_nvfp4_full_r8"), .warps = warps };""",
+    """        var e: Nvfp4Experts = .{
+            .mod = mod,
+            .fns = undefined,
+            .resident = undefined,
+            .prompt_fns = undefined,
+            .fact_fns = undefined,
+            .half4_fn = try mod.function("tf_nvfp4_half_coop4"),
+            .half2_fn = try mod.function("tf_nvfp4_half_coop2"),
+            .coop2_u4_fn = try mod.function("tf_nvfp4_coop2_u4"),
+            .full_r8_fn = try mod.function("tf_nvfp4_full_r8"),
+            .s5_down_1w_fn = try mod.function("tf_nvfp4_s5_down_1w"),
+            .s5_fact_down_fn = try mod.function("tf_nvfp4_s5_fact_down_f32"),
+            .warps = warps,
+        };
+        try e.s5_fact_down_fn.allowDynamicShared(34048);""",
+)
+patch_exact(
+    cdir, "experts.zig",
+    """    pub fn run(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        const gate = epi == .up;
+        const kg = (if (gate) l.dims else l.width) / 32;
+        const nb = (if (gate) l.width else l.dims) / cols;""",
+    """    pub fn run(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        const gate = epi == .up;
+        const kg = (if (gate) l.dims else l.width) / 32;
+        const nb = (if (gate) l.width else l.dims) / cols;
+        if (!gate and epi == .down_f32 and l.down_s5_meta != 0) {
+            const grid = items * nb;
+            if (grid < 1) return;
+            var a: launch_.Args = .{};
+            a.add(in.x);
+            a.add(@as(i32, @intCast(in.stride)));
+            a.add(@as(i32, 0));
+            a.add(l.down);
+            a.add(l.down_scale);
+            a.add(l.down_s5_meta);
+            a.add(l.down_s5_esc);
+            a.add(@as(i32, @intCast(kg)));
+            a.add(@as(i32, @intCast(nb)));
+            for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+            a.add(@as(i32, @intCast(l.dims)));
+            a.add(@as(f32, 0.0));
+            a.add(skip);
+            return launch_.launch(e.s5_down_1w_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = true }, s, &a);
+        }""",
+)
+patch_exact(
+    cdir, "experts_waves.zig",
+    """    if (dyn and gate and !l.relu2) {""",
+    """    if (!gate and epi == .down_f32 and l.down_s5_meta != 0) {
+        return e.run(s, epi, in, l, p, out, items, skip);
+    }
+    if (dyn and gate and !l.relu2) {""",
+)
+patch_exact(
+    cdir, "experts_fact.zig",
+    """    if (items < 1) return;
+    var a: launch_.Args = .{};""",
+    """    if (items < 1) return;
+    if (!gate and l.down_s5_meta != 0) {
+        var a: launch_.Args = .{};
+        a.add(in.x);
+        a.add(@as(i32, @intCast(in.stride)));
+        a.add(@as(i32, 0));
+        a.add(l.down);
+        a.add(l.down_scale);
+        a.add(l.down_s5_meta);
+        a.add(l.down_s5_esc);
+        a.add(@as(i32, @intCast(l.width / 32)));
+        a.add(@as(i32, @intCast(nb)));
+        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+        a.add(@as(i32, @intCast(l.dims)));
+        a.add(@as(f32, 0.0));
+        a.add(skip);
+        const wn = Nvfp4Experts.fact_wn[1];
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(items * ((nb + wn - 1) / wn)), .y = 1, .z = 1 }, .block = .{ .x = @intCast(wn * 32), .y = 1, .z = 1 }, .shared = 34048 };
+        return launch_.launch(e.s5_fact_down_fn, cfg, s, &a);
+    }
+    var a: launch_.Args = .{};""",
+)
+patch_exact(
+    root, "cuda_nvfp4_tile.zig",
+    """    if (pt != 16) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.run(s, epi, in, l, p, out, items, skip);""",
+    """    if (pt != 16 and (epi == .up or l.down_s5_meta == 0)) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.run(s, epi, in, l, p, out, items, skip);""",
+)
+patch_exact(
+    root, "cuda_modelopt_experts.zig",
+    """    /// .nvfp4 (global scales a projection) or .fp8g (f32 128x128 block scales, cuda_fp8_experts_load.zig).
+    format: cuda.experts.Format = .nvfp4,
+
+    pub fn free(self: *Owned) void {
+        self.up.free();
+        self.down.free();
+        self.up_scale.free();
+        self.down_scale.free();
+        self.* = undefined;
+    }
+
+    pub fn view(self: *const Owned) cuda.experts.Layer {
+        return .{ .format = self.format, .up = self.up.ptr, .down = self.down.ptr, .up_scale = self.up_scale.ptr, .down_scale = self.down_scale.ptr, .width = self.width, .dims = self.dims, .experts = self.count };
+    }""",
+    """    /// .nvfp4 (global scales a projection) or .fp8g (f32 128x128 block scales, cuda_fp8_experts_load.zig).
+    format: cuda.experts.Format = .nvfp4,
+    down_s5_meta: ?cuda.DeviceBuffer = null,
+    down_s5_esc: ?cuda.DeviceBuffer = null,
+
+    pub fn free(self: *Owned) void {
+        self.up.free();
+        self.down.free();
+        self.up_scale.free();
+        self.down_scale.free();
+        if (self.down_s5_meta) |*b| b.free();
+        if (self.down_s5_esc) |*b| b.free();
+        self.* = undefined;
+    }
+
+    pub fn view(self: *const Owned) cuda.experts.Layer {
+        return .{
+            .format = self.format,
+            .up = self.up.ptr,
+            .down = self.down.ptr,
+            .up_scale = self.up_scale.ptr,
+            .down_scale = self.down_scale.ptr,
+            .width = self.width,
+            .dims = self.dims,
+            .experts = self.count,
+            .down_s5_meta = if (self.down_s5_meta) |b| b.ptr else 0,
+            .down_s5_esc = if (self.down_s5_esc) |b| b.ptr else 0,
+        };
+    }""",
+)
+patch_exact(
+    root, "cuda_modelopt_threads.zig",
+    """/// A layer's planes borrowed with their pages read ahead, then packed on `n` threads a chunk of experts at a time.
+pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize) !experts.Owned {
+    return loadChunked(a, d, store, prefix, dims, width, count, n, staging_bytes);
+}""",
+    """fn s5Enabled() bool {
+    const raw = std.c.getenv("TF_NVFP4_S5") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+fn bestSmin(scales: []const u8) u8 {
+    var hist: [256]u32 = @splat(0);
+    for (scales) |b| hist[b] += 1;
+    var cur: u32 = 0;
+    for (0..31) |i| cur += hist[i];
+    var best_sum: u32 = cur;
+    var best_s: u8 = 0;
+    for (1..226) |s| {
+        cur = cur + hist[s + 30] - hist[s - 1];
+        if (cur > best_sum) {
+            best_sum = cur;
+            best_s = @intCast(s);
+        }
+    }
+    return best_s;
+}
+
+fn packDownS5(
+    out_bytes: []u8,
+    codes: []const u8,
+    scales: []const u8,
+    n: usize,
+    k: usize,
+    esc_out: *std.ArrayListUnmanaged(u32),
+    alloc: std.mem.Allocator,
+) !u8 {
+    const nb = n / ex.cols;
+    const kg = k / 32;
+    const nblk = nb * kg;
+    const smin = bestSmin(scales);
+    for (0..nb) |cb| for (0..kg) |g| {
+        const blk_i = cb * kg + g;
+        const block_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_bytes[blk_i * 512 ..][0..512]));
+        for (0..8) |gq| for (0..4) |t| for (0..4) |j| {
+            const row = cb * ex.cols + j * 8 + gq;
+            var w: u32 = 0;
+            for (0..2) |h| for (0..4) |q| {
+                const input = g * 32 + h * 16 + t * 4 + q;
+                const byte = codes[row * (k / 2) + input / 2];
+                const nib: u32 = if (input & 1 == 0) byte & 0xF else byte >> 4;
+                w |= nib << ex.slot(h, q);
+            };
+            block_u32[(gq * 4 + t) * 4 + j] = w;
+        };
+        const lo_dst = out_bytes[nblk * 512 + blk_i * 32 ..][0..32];
+        const hi_dst = out_bytes[nblk * 544 + blk_i * 8 ..][0..8];
+        for (0..4) |t| {
+            var hi16: u16 = 0;
+            for (0..2) |h| for (0..4) |j| {
+                var lo_byte: u8 = 0;
+                for (0..2) |c| {
+                    const u = (h * 4 + j) * 2 + c;
+                    const row = cb * ex.cols + j * 8 + t * 2 + c;
+                    const raw = scales[row * (k / 16) + g * 2 + h];
+                    const s_idx = t * 16 + u;
+                    const key: u32 = @intCast(blk_i * 64 + s_idx);
+                    const q: u8 = if (raw >= smin and @as(usize, raw) <= @as(usize, smin) + 30)
+                        raw - smin
+                    else blk: {
+                        try esc_out.append(alloc, (key << 8) | raw);
+                        break :blk 31;
+                    };
+                    lo_byte |= (q & 0xF) << @intCast(c * 4);
+                    if ((q & 16) != 0) hi16 |= @as(u16, 1) << @intCast(u);
+                }
+                lo_dst[t * 8 + h * 4 + j] = lo_byte;
+            };
+            std.mem.writeInt(u16, hi_dst[t * 2 ..][0..2], hi16, .little);
+        }
+    };
+    return smin;
+}
+
+const S5DownRec = struct {
+    smin_d: u8 = 0,
+    esc_d: std.ArrayListUnmanaged(u32) = .empty,
+};
+
+const WorkS5Down = struct {
+    views: []const View,
+    up_words: []u32,
+    down_bytes_buf: []u8,
+    recs: []S5DownRec,
+    up_words_per: usize,
+    down_stride: usize,
+    width: usize,
+    dims: usize,
+    lo: usize,
+    hi: usize,
+    failed: ?(error{OutOfMemory} || core.nvfp4_csf.Error) = null,
+
+    fn run(w: *WorkS5Down) void {
+        w.pack() catch |err| {
+            w.failed = err;
+        };
+    }
+
+    fn pack(w: *WorkS5Down) !void {
+        const each = @max(w.width * (w.dims / 16), w.dims * (w.width / 16));
+        const bufs = try std.heap.page_allocator.alloc(u8, 3 * each);
+        defer std.heap.page_allocator.free(bufs);
+        const alloc = std.heap.page_allocator;
+        for (w.lo..w.hi) |i| {
+            const g = w.views[3 * i];
+            const u = w.views[3 * i + 1];
+            const o = w.views[3 * i + 2];
+            const gs = try scalesOf(g, w.width, w.dims, bufs[0..each]);
+            const us = try scalesOf(u, w.width, w.dims, bufs[each..][0..each]);
+            const os = try scalesOf(o, w.dims, w.width, bufs[2 * each ..][0..each]);
+            ex.packGateUp(w.up_words[i * w.up_words_per ..][0..w.up_words_per], .{ g.codes, gs }, .{ u.codes, us }, w.width, w.dims);
+            const dbuf = w.down_bytes_buf[i * w.down_stride ..][0..w.down_stride];
+            w.recs[i].smin_d = try packDownS5(dbuf, o.codes, os, w.dims, w.width, &w.recs[i].esc_d, alloc);
+        }
+    }
+};
+
+fn packS5Down(views: []const View, up_words: []u32, down_buf: []u8, recs: []S5DownRec, down_stride: usize, width: usize, dims: usize, n: usize) !void {
+    const count = views.len / 3;
+    const up_words_per = up_words.len / count;
+    const t_n = @max(1, @min(n, max_threads, count));
+    const per = (count + t_n - 1) / t_n;
+    var works: [max_threads]WorkS5Down = undefined;
+    var handles: [max_threads]?std.Thread = @splat(null);
+    for (0..t_n) |t| {
+        works[t] = .{
+            .views = views,
+            .up_words = up_words,
+            .down_bytes_buf = down_buf,
+            .recs = recs,
+            .up_words_per = up_words_per,
+            .down_stride = down_stride,
+            .width = width,
+            .dims = dims,
+            .lo = @min(count, t * per),
+            .hi = @min(count, (t + 1) * per),
+        };
+        handles[t] = std.Thread.spawn(.{}, WorkS5Down.run, .{&works[t]}) catch blk: {
+            works[t].run();
+            break :blk null;
+        };
+    }
+    for (handles[0..t_n]) |h| if (h) |th| th.join();
+    for (works[0..t_n]) |w| if (w.failed) |err| return err;
+}
+
+/// A layer's planes borrowed with their pages read ahead, then packed on `n` threads a chunk of experts at a time.
+pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize) !experts.Owned {
+    return loadChunked(a, d, store, prefix, dims, width, count, n, staging_bytes);
+}""",
+)
+patch_exact(
+    root, "cuda_modelopt_threads.zig",
+    """pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize, stage_cap: usize, comptime direct: bool) !experts.Owned {
+    const up_bytes = try experts.packedBytes(width, dims, 2);
+    const down_bytes = try experts.packedBytes(dims, width, 1);""",
+    """pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize, stage_cap: usize, comptime direct: bool) !experts.Owned {
+    const use_s5 = s5Enabled() and width % 32 == 0 and dims % 32 == 0 and ((dims / 32) * (width / 32)) % 32 == 0;
+    const up_bytes = try experts.packedBytes(width, dims, 2);
+    const down_bytes = if (use_s5) (dims / 32) * (width / 32) * 552 else try experts.packedBytes(dims, width, 1);""",
+)
+patch_exact(
+    root, "cuda_modelopt_threads.zig",
+    """    var lo: usize = 0;
+    var k: usize = 0;
+    while (lo < count) : ({
+        lo += chunk;
+        k += 1;
+    }) {
+        const m = @min(chunk, count - lo);
+        // the next chunk's gather runs while this one packs; the main thread allocates nothing from `a` meanwhile
+        defer pair.wait() catch {};
+        if (sources != null and lo + chunk < count) {
+            marker.k = k + 1;
+            const hook: core.direct_gather.Hook = .{ .ctx = &marker, .run = @TypeOf(marker).run };
+            const ahead = planes(views[3 * (lo + chunk) ..][0 .. 3 * @min(chunk, count - lo - chunk)], ptrs);
+            try pair.start(sources.?, ahead, hook);
+        }
+        const up_words = std.mem.bytesAsSlice(u32, stage[0 .. m * up_bytes]);
+        const down_words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, stage[m * up_bytes ..][0 .. m * down_bytes]));
+        try pack(views[3 * lo ..][0 .. 3 * m], up_words, down_words, width, dims, n);""",
+    """    const s5_recs: []S5DownRec = if (use_s5) try a.alloc(S5DownRec, count) else &.{};
+    defer {
+        for (s5_recs) |*r| r.esc_d.deinit(std.heap.page_allocator);
+        if (use_s5) a.free(s5_recs);
+    }
+    for (s5_recs) |*r| r.* = .{};
+    var lo: usize = 0;
+    var k: usize = 0;
+    while (lo < count) : ({
+        lo += chunk;
+        k += 1;
+    }) {
+        const m = @min(chunk, count - lo);
+        // the next chunk's gather runs while this one packs; the main thread allocates nothing from `a` meanwhile
+        defer pair.wait() catch {};
+        if (sources != null and lo + chunk < count) {
+            marker.k = k + 1;
+            const hook: core.direct_gather.Hook = .{ .ctx = &marker, .run = @TypeOf(marker).run };
+            const ahead = planes(views[3 * (lo + chunk) ..][0 .. 3 * @min(chunk, count - lo - chunk)], ptrs);
+            try pair.start(sources.?, ahead, hook);
+        }
+        const up_words = std.mem.bytesAsSlice(u32, stage[0 .. m * up_bytes]);
+        if (use_s5) {
+            try packS5Down(views[3 * lo ..][0 .. 3 * m], up_words, stage[m * up_bytes ..][0 .. m * down_bytes], s5_recs[lo..][0..m], down_bytes, width, dims, n);
+        } else {
+            const down_words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, stage[m * up_bytes ..][0 .. m * down_bytes]));
+            try pack(views[3 * lo ..][0 .. 3 * m], up_words, down_words, width, dims, n);
+        }""",
+)
+patch_exact(
+    root, "cuda_modelopt_threads.zig",
+    """    var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_globals));
+    errdefer us.free();
+    const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_globals));
+    return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };""",
+    """    var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_globals));
+    errdefer us.free();
+    var ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_globals));
+    errdefer ds.free();
+    if (use_s5) {
+        const dn_meta = try a.alloc([2]u32, count);
+        defer a.free(dn_meta);
+        var dn_esc_tot: usize = 0;
+        for (s5_recs) |r| dn_esc_tot += r.esc_d.items.len;
+        const dn_esc = try a.alloc(u32, @max(1, dn_esc_tot));
+        defer a.free(dn_esc);
+        dn_esc[0] = 0;
+        var doff: usize = 0;
+        for (s5_recs, 0..) |r, i| {
+            dn_meta[i] = .{ @as(u32, r.smin_d) | (@as(u32, @intCast(r.esc_d.items.len)) << 8), @intCast(doff) };
+            @memcpy(dn_esc[doff..][0..r.esc_d.items.len], r.esc_d.items);
+            doff += r.esc_d.items.len;
+        }
+        var dm = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_meta));
+        errdefer dm.free();
+        const de = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_esc));
+        return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .down_s5_meta = dm, .down_s5_esc = de };
+    }
+    return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };""",
 )
 PY
 }
@@ -8899,9 +10156,12 @@ PY
     export TF_FLASHNEXT_W1_KTOP="64"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_MTP_NVFP4="0"
-    export TF_FLASHNEXT_MTP_INT6="1"
+    export TF_FLASHNEXT_MTP_INT6="clean"
+    export TF_NVFP4_S5="1"
     export TF_FLASHNEXT_HEAD_NVFP4="w1"
-    export TF_FLASHNEXT_HEAD_W1_KTOP="192"
+    export TF_FLASHNEXT_HEAD_W1_KTOP="128"
+    export TF_FLASHNEXT_MTP_TOPK="10"
+    export TF_BF12_OUT_SK4="0"
     export TF_FLASHNEXT_TRUNK_BF12="1"
     export TF_FLASHNEXT_FUSED_SPLIT="0"
     export TF_FLASHNEXT_L2PF_MB="0"
@@ -8927,6 +10187,7 @@ PY
       export TF_FLASHNEXT_EXT_STAY="0.0"
       export TF_FLASHNEXT_EXT_TOK="0.0"
       export TF_FLASHNEXT_EXT_MIN="0"
+      export TF_FLASHNEXT_ROOT_COPIES="0"
       export TF_FLASHNEXT_P_CLIFF="0.0"
       export TF_FLASHNEXT_W2_MULTI="0"
       export TF_FLASHNEXT_ROUTER_BF12="0"
