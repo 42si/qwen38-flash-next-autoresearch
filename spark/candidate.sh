@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t144"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9599,7 +9599,7 @@ pub const W2 = struct {
     }
 
     pub fn projectFused(self: *const W2, stream: cuda.Stream, input: u64, dlogits: u64, best_out: u64, vocab_rows: usize) !void {
-        const v = @min(vocab_rows, 65536);
+        const v = vocab_rows;
         const nb = (v + 31) / 32;
         const n_blocks = (nb + 3) / 4;
         const sc = self.scratch.?.ptr;
@@ -11448,7 +11448,7 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp_pieces.zig",
     "            try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
-    "            if (hh.w2.ready()) try hh.w2.projectFused(pp.stream, ps.mixed, r.d.dlogits.ptr, r.d.best.ptr, hh.ids.len) else try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
+    "            if (hh.w2.ready()) try hh.w2.projectFused(pp.stream, ps.mixed, r.d.dlogits.ptr, r.d.best.ptr, if (r.input == r.d.out.ptr) @min(hh.ids.len, 65536) else hh.ids.len) else try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
 )
 patch_exact(
     root, "cuda_mtp_pieces.zig",
