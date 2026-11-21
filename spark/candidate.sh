@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t102"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -299,10 +299,23 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
-    __shared__ uint32_t sxu[2560];
+    // Quantize the activation within each 64-channel weight scale group.
+    __shared__ __align__(4) signed char quant_x[2560];
+    __shared__ float x_scale[40];
     const int tid = threadIdx.x;
-    for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+    const int qlane = tid & 31;
+    for (int group = tid >> 5; group < 40; group += 4) {
+        const int i = group * 64 + qlane;
+        const float a = __bfloat162float(X[i]);
+        const float b = __bfloat162float(X[i + 32]);
+        float peak = fmaxf(fabsf(a), fabsf(b));
+        const bool finite = __all_sync(0xffffffffu, isfinite(a) && isfinite(b));
+        for (int off = 16; off; off >>= 1)
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, off));
+        // Dividing by peak before scaling also covers subnormal BF16 groups.
+        quant_x[i] = (finite && peak > 0) ? __float2int_rn((a / peak) * 127.0f) : 0;
+        quant_x[i + 32] = (finite && peak > 0) ? __float2int_rn((b / peak) * 127.0f) : 0;
+        if (qlane == 0) x_scale[group] = finite ? peak / 127.0f : CUDART_NAN_F;
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -360,25 +373,23 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             const uint32_t whi[4] = {wa.y, wa.w, wb.y, wb.w};
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                const uint32_t* xg = sxu + (g4 * 4 + q) * 64;
-                const uint32_t w0 = wlo[q], w1 = whi[q];
-                float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+                const int group = g4 * 4 + q;
+                const int* ax = reinterpret_cast<const int*>(quant_x + group * 64);
+                int dot = 0;
                 #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[j + 0] ^ ((w0 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[j + 1] ^ ((w0 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[j + 2] ^ ((w0 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[j + 3] ^ ((w0 << (31 - (j + 3))) & 0x80000000u));
+                for (int half = 0; half < 2; ++half) {
+                    const uint32_t signs = half ? whi[q] : wlo[q];
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t nibble = (signs >> (4 * j)) & 15u;
+                        const uint32_t bits = (nibble * 0x00204081u) & 0x01010101u;
+                        const int coeff = static_cast<int>(0x01010101u ^ (bits * 254u));
+                        dot = __dp4a(ax[half * 8 + j], coeff, dot);
+                    }
                 }
-                #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[32 + j + 0] ^ ((w1 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[32 + j + 1] ^ ((w1 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
-                }
-                if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
-                else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
+                const float value = static_cast<float>(dot) * x_scale[group];
+                if (q & 1) acc1 = fmaf(sc[q], value, acc1);
+                else acc0 = fmaf(sc[q], value, acc0);
             }
             if (g4 + 1 < 10) {
                 wa = nwa;
