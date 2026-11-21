@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t143"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4374,35 +4374,52 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
     };
 
     constexpr unsigned tile = 4;
-    __shared__ float4 keys[tile][32], queries[tile][32];
-    __shared__ float values[tile][32];
-    __shared__ float2 gate_beta[tile];
+    __shared__ __align__(16) float4 keys[2][tile][32], queries[2][tile][32];
+    __shared__ float values[2][tile][32];
+    __shared__ float2 gate_beta[2][tile];
     const unsigned total = np + (unsigned)rows;
-    for (unsigned base = 0; base < total; base += tile) {
-        const unsigned load_p = base + (unsigned)(tid >> 5);
+    auto stage_tile = [&](unsigned base, unsigned bank) {
+        const unsigned slot = tid >> 5, vec = tid & 31;
+        const unsigned load_p = base + slot;
         if (load_p < total) {
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
-            const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
-            if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
-            keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
+            const float* v_src = vl + ((size_t)lr * NV + hv) * DV + blk * 32 + vec;
+            const float4* k_src = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK) + vec;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::
+                "r"((unsigned)__cvta_generic_to_shared(&values[bank][slot][vec])), "l"(v_src) : "memory");
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::
+                "r"((unsigned)__cvta_generic_to_shared(&keys[bank][slot][vec])), "l"(k_src) : "memory");
+            if (vec == 0) {
+                const float2* gb_src = reinterpret_cast<const float2*>(gl) + (size_t)lr * NV + hv;
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::
+                    "r"((unsigned)__cvta_generic_to_shared(&gate_beta[bank][slot])), "l"(gb_src) : "memory");
+            }
             if (load_p >= np) {
-                queries[tid >> 5][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
+                const float4* q_src = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK) + vec;
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::
+                    "r"((unsigned)__cvta_generic_to_shared(&queries[bank][slot][vec])), "l"(q_src) : "memory");
             }
         }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    stage_tile(0, 0);
+    for (unsigned base = 0; base < total; base += tile) {
+        const unsigned bank = (base / tile) & 1u;
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
+        if (base + tile < total) stage_tile(base + tile, bank ^ 1u);
         for (unsigned r = 0; r < tile && base + r < total; ++r) {
             const unsigned p = base + r;
             if (p == np && (int)np > store_above) store_tile(state_in);
-            const float vv = values[r][vr_local];
-            const float2 gb = gate_beta[r];
+            const float vv = values[bank][r][vr_local];
+            const float2 gb = gate_beta[bank][r];
             const float g = gb.x, beta = gb.y;
 
             float4 k[8];
             float d[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                k[j] = keys[r][t4 + 4 * j];
+                k[j] = keys[bank][r][t4 + 4 * j];
                 h[j].x *= g; h[j].y *= g; h[j].z *= g; h[j].w *= g;
                 d[j] = ((h[j].x * k[j].x + h[j].y * k[j].y) + h[j].z * k[j].z) + h[j].w * k[j].w;
             }
@@ -4418,7 +4435,7 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
                 float o[8];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const float4 q = queries[r][t4 + 4 * j];
+                    const float4 q = queries[bank][r][t4 + 4 * j];
                     o[j] = ((h[j].x * q.x + h[j].y * q.y) + h[j].z * q.z) + h[j].w * q.w;
                 }
                 float os = ((o[0] + o[4]) + (o[2] + o[6])) + ((o[1] + o[5]) + (o[3] + o[7]));
@@ -4430,7 +4447,6 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
                 }
             }
         }
-        __syncthreads();
     }
     if (state_out != nullptr) store_tile(state_out);
 }
