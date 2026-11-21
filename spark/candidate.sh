@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t110"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -302,7 +302,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float column_scale = G[((V + 31) & ~31) + i];
+        sxu[i] = __float_as_uint(__bfloat162float(X[i]) * column_scale);
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -775,7 +776,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float column_scale = G[((V + 31) & ~31) + i];
+        sxu[i] = __float_as_uint(__bfloat162float(X[i]) * column_scale);
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -9312,6 +9314,7 @@ const W1PackCtx = struct {
     per: usize,
     cal: f32,
     g64: bool,
+    channel_scale: []const f32,
 
     fn worker(ctx: *const W1PackCtx, tid: usize) void {
         const lo = @min(ctx.v, tid * ctx.per);
@@ -9333,13 +9336,13 @@ const W1PackCtx = struct {
                     for (0..32) |j| {
                         const bits = std.mem.readInt(u16, rb[(g * 64 + j) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
+                        sum_abs += @abs(f) / ctx.channel_scale[g * 64 + j];
                         if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
                     }
                     for (0..32) |j| {
                         const bits = std.mem.readInt(u16, rb[(g * 64 + 32 + j) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
+                        sum_abs += @abs(f) / ctx.channel_scale[g * 64 + 32 + j];
                         if (f < 0.0) w1 |= @as(u32, 1) << @intCast(j);
                     }
                     const s = sum_abs / 64.0;
@@ -9464,9 +9467,25 @@ pub const W2 = struct {
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
-            const globals_host = try gpa.alloc(f32, nb * 32);
+            const globals_host = try gpa.alloc(f32, nb * 32 + wt.dims);
             defer gpa.free(globals_host);
             @memset(globals_host, 0.0);
+            const channel_scale = globals_host[nb * 32 ..];
+            if (is_w1g64) {
+                const samples = @min(v, 1024);
+                for (0..samples) |sample| {
+                    const row: usize = ids[sample * v / samples];
+                    const bytes = tensor.bytes[row * wt.dims * 2 ..][0 .. wt.dims * 2];
+                    for (channel_scale, 0..) |*sum, i| {
+                        const bits = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+                        const weight: f32 = @bitCast(@as(u32, bits) << 16);
+                        sum.* += weight * weight;
+                    }
+                }
+                for (channel_scale) |*sum| {
+                    sum.* = @max(@sqrt(sum.* / @as(f32, @floatFromInt(@max(samples, 1)))), 1e-8);
+                }
+            }
 
             const n_threads: usize = 8;
             const ctx: W1PackCtx = .{
@@ -9478,6 +9497,7 @@ pub const W2 = struct {
                 .per = (v + n_threads - 1) / n_threads,
                 .cal = cal,
                 .g64 = is_w1g64,
+                .channel_scale = channel_scale,
             };
             var ths: [n_threads]?std.Thread = @splat(null);
             for (0..n_threads) |ti| ths[ti] = try std.Thread.spawn(.{}, W1PackCtx.worker, .{ &ctx, ti });
