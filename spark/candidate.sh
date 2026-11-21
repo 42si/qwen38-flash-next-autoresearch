@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t160"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4979,6 +4979,14 @@ static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 #endif
 }
 
+// Stream the next chunk's 1280-byte scale trailer while the current MMA tile runs.
+static __device__ __forceinline__ void s5_prefetch_scales(const uint4* next_chunk, int tid) {
+    if (tid < 10) {
+        const uint4* line = next_chunk + 1024 + 8 * tid;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(line));
+    }
+}
+
 static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
   const uint2 mm = __ldg(meta + midx);
@@ -5095,6 +5103,7 @@ static __device__ __noinline__ void s5_coop2_u4_wide(S5CoopSm* sm) {
       for (int j = 0; j < 2; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f;
     for (int ch = 0; ch < nchunks; ++ch) {
       const uint4* cb_ptr = sm->args.blk + (size_t)ch * CHUNK4;
+      if (ch + 1 < nchunks) s5_prefetch_scales(cb_ptr + CHUNK4, tid);
       sm->buf.lo[tid] = s5_ld4_256(cb_ptr + 1024 + tid);
       if (tid < 16) sm->buf.hi[tid] = s5_ld4_256(cb_ptr + 1088 + tid);
       __syncthreads();
@@ -5200,6 +5209,7 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
         struct L { uint4 w; uint2 xa[2]; };
         for (int ch = 0; ch < nchunks; ++ch) {
           const uint4* cb_ptr = blk + (size_t)ch * CHUNK4;
+          if (ch + 1 < nchunks) s5_prefetch_scales(cb_ptr + CHUNK4, tid);
           sm.buf.lo[tid] = s5_ld4_256(cb_ptr + 1024 + tid);
           if (tid < 16) sm.buf.hi[tid] = s5_ld4_256(cb_ptr + 1088 + tid);
           const int gbase = ch << 4;
