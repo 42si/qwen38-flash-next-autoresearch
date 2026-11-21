@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t96"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6965,7 +6965,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     __shared__ int sh_cnt[512];
     __shared__ int sh_off[512];
     __shared__ int sh_pick[32 * 12];
-    __shared__ uint64_t wsum[3][16];
+    __shared__ uint32_t wsum[2][16];
     if (tid < E_PLAN) sh_cnt[tid] = 0;
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
@@ -7066,51 +7066,50 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     const int b1 = (c > 0 && T > 8 && rem >= 3 && rem <= 8) ? 1 : ((c > 0 && T <= 8) ? tiles : 0);
     const int b2 = (c > 0 && T > 8 && rem == 2) ? 1 : 0;
     const int b3 = (c > 0 && T > 8 && rem == 1) ? 1 : 0;
-    uint64_t p0 = static_cast<uint64_t>(static_cast<uint32_t>(c)) | (static_cast<uint64_t>(static_cast<uint32_t>(c > 0)) << 32);
-    uint64_t p1 = static_cast<uint64_t>(static_cast<uint32_t>(b0)) | (static_cast<uint64_t>(static_cast<uint32_t>(b1)) << 32);
-    uint64_t p2 = static_cast<uint64_t>(static_cast<uint32_t>(b2)) | (static_cast<uint64_t>(static_cast<uint32_t>(b3)) << 32);
+    // At most 32 rows * 12 slots. No packed prefix sum can carry into
+    // the next 10-bit field, including at the last warp.
+    constexpr uint32_t mask = 1023u;
+    uint32_t p0 = (uint32_t)c | ((uint32_t)(c > 0) << 10) | ((uint32_t)b0 << 20);
+    uint32_t p1 = (uint32_t)b1 | ((uint32_t)b2 << 10) | ((uint32_t)b3 << 20);
     if (warp < 16) {
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
-            const uint64_t u0 = __shfl_up_sync(0xffffffffu, p0, o);
-            const uint64_t u1 = __shfl_up_sync(0xffffffffu, p1, o);
-            const uint64_t u2 = __shfl_up_sync(0xffffffffu, p2, o);
-            if (lane >= o) { p0 += u0; p1 += u1; p2 += u2; }
+            const uint32_t u0 = __shfl_up_sync(0xffffffffu, p0, o);
+            const uint32_t u1 = __shfl_up_sync(0xffffffffu, p1, o);
+            if (lane >= o) { p0 += u0; p1 += u1; }
         }
-        if (lane == 31) { wsum[0][warp] = p0; wsum[1][warp] = p1; wsum[2][warp] = p2; }
+        if (lane == 31) { wsum[0][warp] = p0; wsum[1][warp] = p1; }
     }
     __syncthreads();
     if (warp == 0) {
 #pragma unroll
-        for (int s = 0; s < 3; ++s) {
-            uint64_t v = (lane < 16) ? wsum[s][lane] : 0ull;
+        for (int word = 0; word < 2; ++word) {
+            uint32_t v = lane < 16 ? wsum[word][lane] : 0u;
 #pragma unroll
             for (int o = 1; o < 16; o <<= 1) {
-                const uint64_t u = __shfl_up_sync(0xffffffffu, v, o);
+                const uint32_t u = __shfl_up_sync(0xffffffffu, v, o);
                 if (lane >= o) v += u;
             }
-            if (lane < 16) wsum[s][lane] = v;
+            if (lane < 16) wsum[word][lane] = v;
         }
     }
     __syncthreads();
-    const uint64_t t1 = wsum[1][15], t2 = wsum[2][15];
-    const int tot0 = static_cast<int>(t1 & 0xFFFFFFFFu), tot1 = static_cast<int>(t1 >> 32);
-    const int tot2 = static_cast<int>(t2 & 0xFFFFFFFFu), tot3 = static_cast<int>(t2 >> 32);
+    const uint32_t t0 = wsum[0][15], t1 = wsum[1][15];
+    const int tot0 = t0 >> 20, tot1 = t1 & mask;
+    const int tot2 = (t1 >> 10) & mask, tot3 = t1 >> 20;
     if (tid == 0) {
         counts[0] = tot0 + tot1 + tot2 + tot3;
-        counts[1] = static_cast<int>(wsum[0][15] >> 32);
+        counts[1] = (t0 >> 10) & mask;
     }
     if (tid < E_PLAN) {
-        const uint64_t prev0 = warp ? wsum[0][warp - 1] : 0ull;
-        const int off = static_cast<int>(prev0 & 0xFFFFFFFFu) + static_cast<int>(p0 & 0xFFFFFFFFu) - c;
+        if (warp) { p0 += wsum[0][warp - 1]; p1 += wsum[1][warp - 1]; }
+        const int off = (int)(p0 & mask) - c;
         sh_off[tid] = off;
         if (c > 0) {
-            const uint64_t prev1 = warp ? wsum[1][warp - 1] : 0ull;
-            const uint64_t prev2 = warp ? wsum[2][warp - 1] : 0ull;
-            const int ioff0 = static_cast<int>(prev1 & 0xFFFFFFFFu) + static_cast<int>(p1 & 0xFFFFFFFFu) - b0;
-            const int ioff1 = static_cast<int>(prev1 >> 32) + static_cast<int>(p1 >> 32) - b1;
-            const int ioff2 = static_cast<int>(prev2 & 0xFFFFFFFFu) + static_cast<int>(p2 & 0xFFFFFFFFu) - b2;
-            const int ioff3 = static_cast<int>(prev2 >> 32) + static_cast<int>(p2 >> 32) - b3;
+            const int ioff0 = (int)(p0 >> 20) - b0;
+            const int ioff1 = (int)(p1 & mask) - b1;
+            const int ioff2 = (int)((p1 >> 10) & mask) - b2;
+            const int ioff3 = (int)(p1 >> 20) - b3;
             if (T > 8) {
                 for (int j = 0; j < b0; ++j) {
                     int* it = items + 3 * (ioff0 + j);
