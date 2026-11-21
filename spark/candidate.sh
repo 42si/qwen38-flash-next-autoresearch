@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t93"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5156,6 +5156,7 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
   const int units = (*counts) * NB;
   const int unit = blockIdx.x;
   __shared__ S5CoopSm sm;
+  __shared__ uint4 chunk_scales[16][2][4];
   if (unit < units) {
     const int it = unit / NB, cb = unit - it * NB;
     const int e = items[3 * it], first = items[3 * it + 1], cnt = items[3 * it + 2];
@@ -5176,9 +5177,15 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
         struct L { uint4 w; uint2 xa[2]; };
         for (int ch = 0; ch < nchunks; ++ch) {
           const uint4* cb_ptr = blk + (size_t)ch * CHUNK4;
-          sm.buf.lo[tid] = s5_ld4_256(cb_ptr + 1024 + tid);
-          if (tid < 16) sm.buf.hi[tid] = s5_ld4_256(cb_ptr + 1088 + tid);
           const int gbase = ch << 4;
+          // Each warp expands eight groups at once for its projection.
+          for (int rg = gq; rg < 16; rg += 8) {
+            const int packet = (rg * 2 + warp) * 4 + t;
+            const uint2 lo = reinterpret_cast<const uint2*>(cb_ptr + 1024)[packet];
+            const uint32_t hi = reinterpret_cast<const uint16_t*>(cb_ptr + 1088)[packet];
+            const uint32_t kb = (uint32_t)(cb * KG + gbase + rg) * 64u + t * 16u;
+            chunk_scales[rg][warp][t] = s5_unpack16(lo, hi, smin4, meta, esc, midx, kb);
+          }
           auto load = [&](L& st, int rg) {
             st.w = s5_ld4_256(cb_ptr + (rg * 2 + warp) * 32 + lane);
             const uint2 zero = make_uint2(0u, 0u);
@@ -5187,22 +5194,11 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
             st.xa[1] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16) : zero;
           };
           auto comp_s = [&](const L& st, int rg) {
-            if (gq == 0) {
-              const uint2 lo = reinterpret_cast<const uint2*>(sm.buf.lo)[(rg * 2 + warp) * 4 + t];
-              const uint32_t hi = reinterpret_cast<const uint16_t*>(sm.buf.hi)[(rg * 2 + warp) * 4 + t];
-              const uint32_t kb = ((uint32_t)(cb * KG + gbase + rg) * 64u) + (uint32_t)t * 16u;
-              uint4 sf;
-              sf.x = s5_unpack4(lo.x & 0xFFFFu, hi & 0xFu,        smin4, meta, esc, midx, kb);
-              sf.y = s5_unpack4(lo.x >> 16,     (hi >> 4) & 0xFu, smin4, meta, esc, midx, kb + 4u);
-              sf.z = s5_unpack4(lo.y & 0xFFFFu, (hi >> 8) & 0xFu, smin4, meta, esc, midx, kb + 8u);
-              sf.w = s5_unpack4(lo.y >> 16,     (hi >> 12) & 0xFu,smin4, meta, esc, midx, kb + 12u);
-              sm.buf.s[warp][t] = sf;
-            }
             if (warp == 0) sm.w[0][lane] = make_uint2(st.w.z, st.w.w);
             else           sm.w[1][lane] = make_uint2(st.w.x, st.w.y);
             __syncthreads();
             uint2 wm[2], smv[2];
-            const uint4 sf0 = sm.buf.s[0][t], sf1 = sm.buf.s[1][t];
+            const uint4 sf0 = chunk_scales[rg][0][t], sf1 = chunk_scales[rg][1][t];
             if (warp == 0) {
               wm[0] = make_uint2(st.w.x, st.w.y); wm[1] = sm.w[1][lane];
               smv[0] = make_uint2(sf0.x, sf0.z); smv[1] = make_uint2(sf1.x, sf1.z);
