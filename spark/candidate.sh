@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t90"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4990,8 +4990,8 @@ static __device__ __noinline__ uint32_t s5_fix4(
 static __device__ __forceinline__ uint32_t s5_unpack4(
     uint32_t lo16, uint32_t hi4, uint32_t smin4,
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key_base) {
-  const uint32_t q = (lo16 & 0xFu) | ((lo16 & 0xF0u) << 4) | ((lo16 & 0xF00u) << 8) | ((lo16 & 0xF000u) << 12);
-  const uint32_t h = ((hi4 & 1u) << 4) | ((hi4 & 2u) << 11) | ((hi4 & 4u) << 18) | ((hi4 & 8u) << 25);
+  const uint32_t q = __byte_perm(lo16, lo16 >> 4, 0x5140) & 0x0f0f0f0fu;
+  const uint32_t h = ((hi4 * 0x00204081u) & 0x01010101u) << 4;
   const uint32_t qh = q | h;
   uint32_t val = qh + smin4;
   const uint32_t eq31 = (qh + 0x01010101u) & 0x20202020u;
@@ -5013,8 +5013,8 @@ static __device__ __forceinline__ uint4 s5_unpack16(
     uint2 lo, uint32_t hi, uint32_t smin4,
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t kb) {
   auto u4 = [&](uint32_t l16, uint32_t h4, uint32_t& eq) -> uint32_t {
-    const uint32_t q = (l16 & 0xFu) | ((l16 & 0xF0u) << 4) | ((l16 & 0xF00u) << 8) | ((l16 & 0xF000u) << 12);
-    const uint32_t h = ((h4 & 1u) << 4) | ((h4 & 2u) << 11) | ((h4 & 4u) << 18) | ((h4 & 8u) << 25);
+    const uint32_t q = __byte_perm(l16, l16 >> 4, 0x5140) & 0x0f0f0f0fu;
+    const uint32_t h = ((h4 * 0x00204081u) & 0x01010101u) << 4;
     const uint32_t qh = q | h;
     eq = (qh + 0x01010101u) & 0x20202020u;
     return qh + smin4;
