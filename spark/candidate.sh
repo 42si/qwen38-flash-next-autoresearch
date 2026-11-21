@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t133"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13717,6 +13717,12 @@ EOF
       fi
       git -C "$SRC_DIR" checkout -q -f "$ENGINE_COMMIT"
       git -C "$SRC_DIR" clean -fdq -e .zig-cache
+
+      # The proposal table feeds both the gathered head rows and column-to-token mapping.
+      local_vocab="$stage/proposal-ids.txt.gz"
+      curl -fsSL --retry 2 "https://raw.githubusercontent.com/dime-online/qwen3.8-Flash-DGX-UltraFast/0c391a3e74b6a775cfe248691ca7fd855b1876a5/recipe/config/v16b/draft-vocab-ids-K65536.txt.gz" -o "$local_vocab"
+      echo "07696bf7eb9c1fdcc1d5ac7724192e523853d4a211ae973a370c7d8f3100927c  $local_vocab" | sha256sum -c -
+      gzip -dc "$local_vocab" > "$SRC_DIR/zig/src/families/flashnext/draft_vocab_default.txt"
 
       apply_patches
 
