@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t192"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -302,7 +302,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const int column = static_cast<int>(G[((V + 31) & ~31) + i]);
+        sxu[i] = __float_as_uint(__bfloat162float(X[column]));
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -775,7 +776,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const int column = static_cast<int>(G[((V + 31) & ~31) + i]);
+        sxu[i] = __float_as_uint(__bfloat162float(X[column]));
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -9319,6 +9321,11 @@ const W1PackCtx = struct {
     per: usize,
     cal: f32,
     g64: bool,
+    columns: []const u16,
+
+    fn byEnergy(energy: *const [wt.dims]f64, a: u16, b: u16) bool {
+        return energy[a] < energy[b] or (energy[a] == energy[b] and a < b);
+    }
 
     fn worker(ctx: *const W1PackCtx, tid: usize) void {
         const lo = @min(ctx.v, tid * ctx.per);
@@ -9340,14 +9347,14 @@ const W1PackCtx = struct {
                     var w0: u32 = 0;
                     var w1: u32 = 0;
                     for (0..32) |j| {
-                        const bits = std.mem.readInt(u16, rb[(g * 64 + j) * 2 ..][0..2], .little);
+                        const bits = std.mem.readInt(u16, rb[@as(usize, ctx.columns[g * 64 + j]) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
                         weight_energy += f * f;
                         if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
                     }
                     for (0..32) |j| {
-                        const bits = std.mem.readInt(u16, rb[(g * 64 + 32 + j) * 2 ..][0..2], .little);
+                        const bits = std.mem.readInt(u16, rb[@as(usize, ctx.columns[g * 64 + 32 + j]) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
                         weight_energy += f * f;
@@ -9478,11 +9485,29 @@ pub const W2 = struct {
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
-            const globals_host = try gpa.alloc(f32, nb * 32);
+            const globals_host = try gpa.alloc(f32, nb * 32 + @as(usize, if (is_w1g64) wt.dims else 0));
             defer gpa.free(globals_host);
             @memset(globals_host, 0.0);
 
             const n_threads: usize = 8;
+            // Pack similarly sized columns into the same 64-channel sign group.
+            var columns: [wt.dims]u16 = undefined;
+            if (is_w1g64) {
+                var energy: [wt.dims]f64 = @splat(0);
+                for (&columns, 0..) |*column, i| column.* = @intCast(i);
+                const samples = @min(v, 1024);
+                for (0..samples) |sample| {
+                    const row: usize = ids[sample * v / samples];
+                    const bytes = tensor.bytes[row * wt.dims * 2 ..][0 .. wt.dims * 2];
+                    for (&energy, 0..) |*total, i| {
+                        const bits = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+                        const value: f32 = @bitCast(@as(u32, bits) << 16);
+                        total.* += @as(f64, value) * value;
+                    }
+                }
+                std.mem.sort(u16, &columns, @as(*const [wt.dims]f64, &energy), W1PackCtx.byEnergy);
+                for (globals_host[nb * 32 ..], columns) |*value, column| value.* = @floatFromInt(column);
+            }
             const ctx: W1PackCtx = .{
                 .full_rows = tensor.bytes,
                 .ids = ids,
@@ -9492,6 +9517,7 @@ pub const W2 = struct {
                 .per = (v + n_threads - 1) / n_threads,
                 .cal = cal,
                 .g64 = is_w1g64,
+                .columns = &columns,
             };
             var ths: [n_threads]?std.Thread = @splat(null);
             for (0..n_threads) |ti| ths[ti] = try std.Thread.spawn(.{}, W1PackCtx.worker, .{ &ctx, ti });
