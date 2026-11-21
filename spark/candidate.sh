@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t162"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -12117,22 +12117,18 @@ pub const WhileCache = struct {
 /// The engine's graph caches, one per kind of pass.
 pub const Graphs = struct {
     window: Cache(Key) = .{},
-    window_b: Cache(Key) = .{},
     head: Cache(HeadKey) = .{},
     head_while: WhileCache = .{},
     rollback: Cache(RollbackKey) = .{},
     shared: Cache(SharedKey) = .{},
-    shared_b: Cache(SharedKey) = .{},
     head_many: Cache(HeadManyKey) = .{},
 
     pub fn clear(g: *Graphs, gpa: std.mem.Allocator) void {
         g.window.clear(gpa);
-        g.window_b.clear(gpa);
         g.head.clear(gpa);
         g.head_while.clear();
         g.rollback.clear(gpa);
         g.shared.clear(gpa);
-        g.shared_b.clear(gpa);
         g.head_many.clear(gpa);
     }
 };""",
@@ -13515,172 +13511,6 @@ patch_exact(
     return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };""",
 )
 
-# 5r. Trial 68: 2-piece pipelined verify graphs (Part A embed+L0..2 ~35us CPU / ~2.4ms GPU hides Part B L2..48+head ~700us cuGraphLaunch!)
-patch_exact(
-    root, "cuda_window_graph.zig",
-    """/// A pass over a window whose uploads stageWindow queued: Pass.chunk launches its kernels alone.
-pub fn Chunk(comptime P: type) type {
-    return struct {
-        p: *P,
-        ids: []const u32,
-        pos0: usize,
-
-        pub fn run(r: @This()) !void {
-            return r.p.chunk(r.ids, r.pos0, null);
-        }
-    };
-}""",
-    """/// A pass over a window whose uploads stageWindow queued: Pass.chunk launches its kernels alone.
-pub fn Chunk(comptime P: type) type {
-    return struct {
-        p: *P,
-        ids: []const u32,
-        pos0: usize,
-
-        pub fn run(r: @This()) !void {
-            return r.p.chunk(r.ids, r.pos0, null);
-        }
-    };
-}
-
-/// A sub-range of a staged window pass for 2-piece pipelined graph launch.
-pub fn ChunkPart(comptime P: type) type {
-    return struct {
-        p: *P,
-        ids: []const u32,
-        pos0: usize,
-        from: usize,
-        to: usize,
-        do_embed: bool,
-        do_head: bool,
-
-        pub fn run(r: @This()) !void {
-            return r.p.chunkRange(r.ids, r.pos0, null, r.from, r.to, r.do_embed, r.do_head);
-        }
-    };
-}""",
-)
-patch_exact(
-    root, "cuda_batch.zig",
-    """        /// One chunk of rows at positions pos0.. through every layer and the head.
-        pub fn chunk(self: *Self, ids: []const u32, pos0: usize, logits_host: ?[]u8) !void {
-            const s = self.s;
-            const n = ids.len;
-            const t0 = std.Io.Clock.awake.now(self.io).toNanoseconds();
-            defer if (Kernels.profile()) {
-                self.complete() catch {};
-                std.debug.print("batch: {d} rows at {d} in {d:.1} ms\\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
-            };
-            if (n == 0 or n > s.cap) return error.UnexpectedTensor;
-            if (self.lanes.len > 0) {
-                // shared rounds read every row's scores; a lane keeps its own rollback and hidden rows, nothing else
-                if (self.hooks.logits != .all or self.hooks.keep != null or self.hooks.streams != 0 or self.hooks.moe_add != null) return error.UnexpectedTensor;
-                try batch_lanes.checkLanes(self.lanes, n);
-            } else if (pos0 + n > self.seq.cap) return error.UnexpectedTensor;
-            self.rows = n;
-            self.pos0 = pos0;
-            self.pending = null;
-            self.pending_f32 = false;
-            // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
-            if (!self.prepared and !self.staged) try s.ready();
-            const emb = s.hostEmb(n);
-            const xs = s.hostXs(n);
-            var gather: Gather = .{ .ngram = self.m.ngram, .history = self.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = self.io, .lanes = self.lanes };
-            var thread: ?std.Thread = if (self.prepared or self.staged) null else try std.Thread.spawn(.{}, Gather.main, .{&gather});
-            defer if (thread) |th| th.join();
-            if (!self.staged) try self.stage(ids);
-            if (self.m.table_dense) {
-                try self.tri.embedDense(s.ids, self.m.table_w, s.h, dims, streams, n);
-            } else {
-                try self.tri.embed(s.ids, self.m.table_w, self.m.table_s, self.m.table_b, s.h, dims, streams, n);
-            }
-            try @import("cuda_media.zig").inject(self.seq.media, self.lanes, self.stream, s.h, self.pos0, n);
-            for (self.m.layers, 0..) |*lw, layer| {""",
-    """        /// One chunk of rows at positions pos0.. through every layer and the head.
-        pub fn chunk(self: *Self, ids: []const u32, pos0: usize, logits_host: ?[]u8) !void {
-            return self.chunkRange(ids, pos0, logits_host, 0, self.m.layers.len, true, true);
-        }
-
-        /// One chunk of rows through layers [start_layer, end_layer), optionally with embed prologue and head epilogue.
-        pub fn chunkRange(self: *Self, ids: []const u32, pos0: usize, logits_host: ?[]u8, start_layer: usize, end_layer: usize, do_embed: bool, do_head: bool) !void {
-            const s = self.s;
-            const n = ids.len;
-            const t0 = std.Io.Clock.awake.now(self.io).toNanoseconds();
-            defer if (do_head and Kernels.profile()) {
-                self.complete() catch {};
-                std.debug.print("batch: {d} rows at {d} in {d:.1} ms\\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
-            };
-            if (n == 0 or n > s.cap) return error.UnexpectedTensor;
-            if (do_embed) {
-                if (self.lanes.len > 0) {
-                    // shared rounds read every row's scores; a lane keeps its own rollback and hidden rows, nothing else
-                    if (self.hooks.logits != .all or self.hooks.keep != null or self.hooks.streams != 0 or self.hooks.moe_add != null) return error.UnexpectedTensor;
-                    try batch_lanes.checkLanes(self.lanes, n);
-                } else if (pos0 + n > self.seq.cap) return error.UnexpectedTensor;
-            }
-            self.rows = n;
-            self.pos0 = pos0;
-            if (do_embed) {
-                self.pending = null;
-                self.pending_f32 = false;
-            } else {
-                const prev = start_layer - 1;
-                const prev_keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[prev] else .{};
-                self.pending = prev;
-                self.pending_f32 = self.addAt(prev) != null or prev_keep.moe_branch != 0;
-            }
-            const emb = s.hostEmb(n);
-            const xs = s.hostXs(n);
-            var gather: Gather = .{ .ngram = self.m.ngram, .history = self.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = self.io, .lanes = self.lanes };
-            var thread: ?std.Thread = null;
-            defer if (thread) |th| th.join();
-            if (do_embed) {
-                // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
-                if (!self.prepared and !self.staged) try s.ready();
-                if (!self.prepared and !self.staged) thread = try std.Thread.spawn(.{}, Gather.main, .{&gather});
-                if (!self.staged) try self.stage(ids);
-                if (self.m.table_dense) {
-                    try self.tri.embedDense(s.ids, self.m.table_w, s.h, dims, streams, n);
-                } else {
-                    try self.tri.embed(s.ids, self.m.table_w, self.m.table_s, self.m.table_b, s.h, dims, streams, n);
-                }
-                try @import("cuda_media.zig").inject(self.seq.media, self.lanes, self.stream, s.h, self.pos0, n);
-            }
-            for (self.m.layers[start_layer..end_layer], start_layer..) |*lw, layer| {""",
-)
-patch_exact(
-    root, "cuda_batch.zig",
-    """                self.pending = layer;
-            }
-            try self.head(logits_host);
-        }""",
-    """                self.pending = layer;
-            }
-            if (do_head) try self.head(logits_host);
-        }""",
-)
-patch_exact(
-    root, "cuda_prompt_windows.zig",
-    """    try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });""",
-    """    const split: usize = 2;
-    if (p.m.layers.len > split) {
-        try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed, .from = 0, .to = split, .do_embed = true, .do_head = false });
-        try e.graphs.window_b.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed, .from = split, .to = p.m.layers.len, .do_embed = false, .do_head = true });
-    } else {
-        try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });
-    }""",
-)
-patch_exact(
-    root, "cuda_prompt_windows.zig",
-    """        try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });""",
-    """        const split: usize = 2;
-        if (p.m.layers.len > split) {
-            try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0, .from = 0, .to = split, .do_embed = true, .do_head = false });
-            try e.graphs.shared_b.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0, .from = split, .to = p.m.layers.len, .do_embed = false, .do_head = true });
-        } else {
-            try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
-        }""",
-)
 PY
 }
 
