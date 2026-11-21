@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t101"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2157,30 +2157,13 @@ extern "C" __global__ void __launch_bounds__(64) fn_bf16_to_w1(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
-    __nv_bfloat16* L,
-    int V,
-    long long ld,
-    int K,
-    int* __restrict__ out_c,
-    int skip_fill) {
-#if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.wait;\n" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
-#endif
-    const int r = blockIdx.x, t = threadIdx.x, nt = blockDim.x;
-    unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
-    int* oc = out_c + static_cast<long long>(r) * K;
-    __shared__ unsigned int hist[256];
-    __shared__ unsigned short cand_k[2048];
-    __shared__ int cand_c[2048];
-    __shared__ unsigned int pick_hi, pick_lo, above, n_gt, n_eq;
+__device__ __forceinline__ unsigned int head_order_key(unsigned short u) {
+    const unsigned short uk = (u == 0x8000u) ? 0u : u;
+    return (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
+}
 
-    auto okey = [](unsigned short u) -> unsigned int {
-        const unsigned short uk = (u == 0x8000u) ? 0u : u;
-        return (uk & 0x8000u) ? (~uk & 0xFFFFu) : (uk | 0x8000u);
-    };
-
+__device__ __forceinline__ unsigned int head_slice_max(
+    const unsigned short* row, int V, int t, int nt) {
     const bool aligned8 = ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) && ((V & 7) == 0);
     int bad = 0;
     unsigned int tmax = 0u;
@@ -2196,8 +2179,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
                 const unsigned short u1 = static_cast<unsigned short>(ws[w] >> 16);
                 bad |= ((u0 & 0x7FFFu) > 0x7F80u) | (u0 == 0x7F80u);
                 bad |= ((u1 & 0x7FFFu) > 0x7F80u) | (u1 == 0x7F80u);
-                const unsigned int k0 = okey(u0);
-                const unsigned int k1 = okey(u1);
+                const unsigned int k0 = head_order_key(u0);
+                const unsigned int k1 = head_order_key(u1);
                 if (k0 > tmax) tmax = k0;
                 if (k1 > tmax) tmax = k1;
             }
@@ -2206,11 +2189,58 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
         for (int i = t; i < V; i += nt) {
             const unsigned short u = row[i];
             bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
-            const unsigned int k = okey(u);
+            const unsigned int k = head_order_key(u);
             if (k > tmax) tmax = k;
         }
     }
-    const int row_bad = __syncthreads_or(bad);
+    return bad ? 0x10000u : tmax;
+}
+
+// Eight independent scans cover the same per-thread slices as the final selector.
+// An invalid logit sorts above all finite keys and propagates across partitions.
+extern "C" __global__ void __launch_bounds__(256) fn_head_max_parts(
+    const __nv_bfloat16* logits, int V, unsigned int* parts) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int r = blockIdx.y;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    const unsigned short* row = reinterpret_cast<const unsigned short*>(
+        logits + static_cast<size_t>(r) * V);
+    parts[static_cast<size_t>(r) * 8192 + i] = head_slice_max(row, V, i, 8192);
+}
+
+extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
+    __nv_bfloat16* L,
+    int V,
+    long long ld,
+    int K,
+    int* __restrict__ out_c,
+    int skip_fill,
+    const unsigned int* parts) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+    const int r = blockIdx.x, t = threadIdx.x, nt = blockDim.x;
+    unsigned short* row = reinterpret_cast<unsigned short*>(L + static_cast<long long>(r) * ld);
+    int* oc = out_c + static_cast<long long>(r) * K;
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned short cand_k[2048];
+    __shared__ int cand_c[2048];
+    __shared__ unsigned int pick_hi, pick_lo, above, n_gt, n_eq;
+
+    auto okey = [](unsigned short u) { return head_order_key(u); };
+    const bool aligned8 = ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) && ((V & 7) == 0);
+    unsigned int tmax = 0;
+    if (parts) {
+        const unsigned int* p = parts + static_cast<size_t>(r) * 8192 + t;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) tmax = max(tmax, p[i * 1024]);
+    } else {
+        tmax = head_slice_max(row, V, t, nt);
+    }
+    const int row_bad = __syncthreads_or(tmax == 0x10000u);
     if (row_bad) {
         if (t == 0) oc[0] = -1;
         return;
@@ -11503,6 +11533,16 @@ patch_exact(
             const k_top: usize = if (nw.mode == .w1) w1_k else 64;
             if (n * k_top * 4 > s.cap * (wt.experts_n + 1) * 4) return error.UnexpectedTensor;
             const direct = self.hooks.best_out != 0;
+            // The head projection has consumed native_part. Its 8 * cap * dims
+            // floats have room for 8192 maxima per verification row.
+            const max_parts: u64 = if (direct and s.native_part != 0 and n * 8192 <= 8 * s.cap * wt.dims) s.native_part else 0;
+            if (max_parts != 0) {
+                var ap: cuda.Args = .{};
+                ap.add(out);
+                ap.add(@as(c_int, vocab));
+                ap.add(max_parts);
+                try cuda.launch.launch(self.k.head_max_parts, .{ .grid = .{ .x = 32, .y = @intCast(n) }, .block = .{ .x = 256 } }, self.stream, &ap);
+            }
             var a1: cuda.Args = .{};
             a1.add(out);
             a1.add(@as(c_int, vocab));
@@ -11510,6 +11550,7 @@ patch_exact(
             a1.add(@as(c_int, @intCast(k_top)));
             a1.add(s.router_l);
             a1.add(@as(c_int, if (direct) 1 else 0));
+            a1.add(max_parts);
             try cuda.launch.launch(self.k.head_topk_floor, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 }, .pdl = true }, self.stream, &a1);
             var a2: cuda.Args = .{};
             a2.add(s.mixed);
@@ -11719,7 +11760,7 @@ patch_exact(
 patch_exact(
     root, "cuda_batch_kernels.zig",
     "    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,",
-    "    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,\n    l2_prefetch2_paced: cuda.Function,\n    l2pf_mb: usize = 10,\n    l2pf_pace_gbps: usize = 165,",
+    "    head_topk_floor: cuda.Function,\n    head_rescore: cuda.Function,\n    head_rescore_best: cuda.Function,\n    head_max_parts: cuda.Function,\n    l2_prefetch2_paced: cuda.Function,\n    l2pf_mb: usize = 10,\n    l2pf_pace_gbps: usize = 165,",
 )
 patch_exact(
     root, "cuda_batch_kernels.zig",
@@ -11727,6 +11768,7 @@ patch_exact(
     """        k.head_topk_floor = try k.batch.function("fn_head_topk_floor");
         k.head_rescore = try k.batch.function("fn_head_rescore");
         k.head_rescore_best = try k.batch.function("fn_head_rescore_best");
+        k.head_max_parts = try k.batch.function("fn_head_max_parts");
         k.l2_prefetch2_paced = try k.batch.function("fn_l2_prefetch2_paced");
         k.l2pf_mb = if (std.c.getenv("TF_FLASHNEXT_L2PF_MB")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 10) else 10;
         k.l2pf_pace_gbps = if (std.c.getenv("TF_FLASHNEXT_L2PF_PACE_GBPS")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 165) else 165;
