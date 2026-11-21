@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t107"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1377,6 +1377,65 @@ __device__ __forceinline__ uint16_t fn_bf16_ord(uint16_t u) {
     return (u & 0x8000u) ? static_cast<uint16_t>(~u) : static_cast<uint16_t>(u | 0x8000u);
 }
 
+// Find the kth largest BF16 order key by its two bytes. Every thread
+// participates, including threads with no local candidates.
+template <bool single>
+__device__ __forceinline__ unsigned int w2_radix_cut(
+    const uint16_t* keys, int count, unsigned int rank, unsigned int* hist,
+    unsigned int& prefix, unsigned int& remaining) {
+    const int t = threadIdx.x, lane = t & 31;
+    if (t == 0) { prefix = 0; remaining = rank; }
+    __syncthreads();
+#pragma unroll
+    for (int shift = 8; shift >= 0; shift -= 8) {
+        if (t < 256) hist[t] = 0;
+        __syncthreads();
+        if constexpr (single) {
+            const unsigned key = keys[0];
+            const unsigned byte = (key >> shift) & 255u;
+            const bool vote = count && (shift || (key >> 8) == prefix);
+            const unsigned mask = __ballot_sync(0xffffffffu, vote);
+            if (vote) {
+                const unsigned peers = __match_any_sync(mask, byte);
+                if (lane == __ffs(peers) - 1) atomicAdd(&hist[byte], __popc(peers));
+            }
+        } else {
+            for (int i = 0; i < count; ++i) {
+                const unsigned key = keys[i];
+                if (shift || (key >> 8) == prefix)
+                    atomicAdd(&hist[(key >> shift) & 255u], 1u);
+            }
+        }
+        __syncthreads();
+        if (t < 32) {
+            const int high = 255 - 8 * lane;
+            unsigned span = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) span += hist[high - k];
+            unsigned sum = span;
+            const unsigned want = remaining;
+            for (int step = 1; step < 32; step *= 2) {
+                const unsigned prev = __shfl_up_sync(0xffffffffu, sum, step);
+                if (lane >= step) sum += prev;
+            }
+            if (sum - span < want && want <= sum) {
+                unsigned pos = want - (sum - span);
+                for (int k = 0; k < 8; ++k) {
+                    const unsigned bin = hist[high - k];
+                    if (pos <= bin) {
+                        prefix = (prefix << 8) | static_cast<unsigned>(high - k);
+                        remaining = pos;
+                        break;
+                    }
+                    pos -= bin;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    return prefix;
+}
+
 extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
     const __nv_bfloat16* dlogits,
     const float4* stats,
@@ -1445,21 +1504,9 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         if (lane == 0) sgsum = ws;
     }
 
-    uint32_t hi = s_hi, lo = 0u;
-    for (int it = 0; it < 16 && lo < hi; ++it) {
-        const uint32_t mid = (lo + hi + 1u) >> 1;
-        const uint32_t m = __ballot_sync(0xffffffffu, (t < n_blocks) && (my_ord >= mid));
-        if (lane == 0) wcnt[warp] = __popc(m);
-        __syncthreads();
-        if (warp == 0) {
-            uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-            if (lane == 0) s_tot = c;
-        }
-        __syncthreads();
-        if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
-    }
-    const uint32_t blk_cut = lo;
+    __shared__ unsigned int radix_hist[256], radix_prefix, radix_remaining;
+    const uint32_t blk_cut = n_blocks >= k_top
+        ? w2_radix_cut<true>(&my_ord, t < n_blocks, k_top, radix_hist, radix_prefix, radix_remaining) : 0;
     float rmax = -CUDART_INF_F;
     int rcol = 0x7fffffff;
     if (t < n_blocks) {
@@ -1496,31 +1543,33 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         }
     }
     const int any_ovf = __syncthreads_or(ovf);
-    hi = s_hi;
-    lo = blk_cut;
-    for (int it = 0; it < 16 && lo < hi; ++it) {
-        const uint32_t mid = (lo + hi + 1u) >> 1;
-        uint32_t cnt = 0;
-        if (!any_ovf) {
-            for (int j = 0; j < n_loc; ++j) cnt += (loc_ord[j] >= mid);
-        } else {
+    uint32_t tok_cut;
+    if (V < k_top) {
+        tok_cut = 0;
+    } else if (!any_ovf) {
+        tok_cut = w2_radix_cut<false>(loc_ord, n_loc, k_top, radix_hist, radix_prefix, radix_remaining);
+    } else {
+        uint32_t hi = s_hi, lo = blk_cut;
+        for (int it = 0; it < 16 && lo < hi; ++it) {
+            const uint32_t mid = (lo + hi + 1u) >> 1;
+            uint32_t cnt = 0;
             for (int idx = t; idx < total_act; idx += 1024) {
                 const int i = (act_blk[idx >> 7] << 7) + (idx & 127);
                 if (i < V) cnt += (fn_bf16_ord(drow[i]) >= mid);
             }
+            for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
+            if (lane == 0) wcnt[warp] = cnt;
+            __syncthreads();
+            if (warp == 0) {
+                uint32_t c = wcnt[lane];
+                for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+                if (lane == 0) s_tot = c;
+            }
+            __syncthreads();
+            if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
         }
-        for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
-        if (lane == 0) wcnt[warp] = cnt;
-        __syncthreads();
-        if (warp == 0) {
-            uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-            if (lane == 0) s_tot = c;
-        }
-        __syncthreads();
-        if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
+        tok_cut = lo;
     }
-    const uint32_t tok_cut = lo;
     uint32_t gt_cnt = 0;
     if (!any_ovf) {
         for (int j = 0; j < n_loc; ++j) gt_cnt += (loc_ord[j] > tok_cut);
