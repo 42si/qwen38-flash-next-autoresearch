@@ -13687,7 +13687,7 @@ PY
 case "$ACTION" in
   meta)
     cat <<EOF
-{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
+{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}+fusedsplit","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
 EOF
     ;;
 
@@ -13774,7 +13774,7 @@ PY
     export TF_BF12_OUT_SK4="0"
     export TF_FLASHNEXT_TRUNK_BF12="1"
     export TF_FLASHNEXT_TRUNK_BF11="1"
-    export TF_FLASHNEXT_FUSED_SPLIT="0"
+    export TF_FLASHNEXT_FUSED_SPLIT="1"
     export TF_FLASHNEXT_L2PF_MB="0"
     export TF_FLASHNEXT_L2PF_PACE_GBPS="165"
     export TF_NVFP4_DECODE_WARPS="1"
