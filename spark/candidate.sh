@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t177"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -8597,6 +8597,9 @@ const Entry = struct {
     h1: i64,
     tok: u32,
     valid: u32,
+};
+
+const Row = struct {
     emb: [row_w]u16,
     xs: [xs_w]f32,
 };
@@ -8608,6 +8611,7 @@ const Set = struct {
 
 pub const Cache = struct {
     sets: []Set,
+    rows: [][ways]Row,
     locks: [n_locks]Lock = @splat(.{}),
 
     pub fn create(gpa: std.mem.Allocator) !*Cache {
@@ -8615,11 +8619,15 @@ pub const Cache = struct {
         errdefer gpa.free(sets);
         @memset(std.mem.sliceAsBytes(sets), 0);
         const c = try gpa.create(Cache);
-        c.* = .{ .sets = sets };
+        errdefer gpa.destroy(c);
+        const rows = try gpa.alloc([ways]Row, n_sets);
+        @memset(std.mem.sliceAsBytes(rows), 0);
+        c.* = .{ .sets = sets, .rows = rows };
         return c;
     }
 
     pub fn destroy(self: *Cache, gpa: std.mem.Allocator) void {
+        gpa.free(self.rows);
         gpa.free(self.sets);
         gpa.destroy(self);
     }
@@ -8649,10 +8657,11 @@ pub const Cache = struct {
         lk.acquire();
         defer lk.release();
         const set = &self.sets[idx];
-        for (&set.items) |*e| {
+        for (&set.items, 0..) |*e, way| {
             if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) {
-                @memcpy(emb_out, &e.emb);
-                @memcpy(xs_out, &e.xs);
+                const row = &self.rows[idx][way];
+                @memcpy(emb_out, &row.emb);
+                @memcpy(xs_out, &row.xs);
                 return true;
             }
         }
@@ -8675,8 +8684,9 @@ pub const Cache = struct {
         dst.h1 = h1;
         dst.tok = tok;
         dst.valid = 1;
-        @memcpy(&dst.emb, emb_in);
-        @memcpy(&dst.xs, xs_in);
+        const row = &self.rows[idx][way];
+        @memcpy(&row.emb, emb_in);
+        @memcpy(&row.xs, xs_in);
     }
 };
 ZIG
