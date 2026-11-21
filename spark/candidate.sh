@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t87"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5168,11 +5168,9 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
         const bool v0 = gq < cnt;
         const int pr0 = v0 ? members[first + gq] : 0;
         const __nv_bfloat16* x0 = X + (size_t)(slots ? pr0 / slots : pr0) * x_stride;
-        float acc[2][2][2];
-#pragma unroll
-        for (int m = 0; m < 2; ++m)
-#pragma unroll
-          for (int j = 0; j < 2; ++j) acc[m][j][0] = acc[m][j][1] = 0.f;
+        // Each warp owns one projection until both are ready for SwiGLU.
+        float acc[4][2] = {};
+        __shared__ float up_projection[4][2][32];
         struct L { uint4 w; uint2 xa[2]; };
         for (int ch = 0; ch < nchunks; ++ch) {
           const uint4* cb_ptr = blk + (size_t)ch * CHUNK4;
@@ -5187,47 +5185,29 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
             st.xa[1] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16) : zero;
           };
           auto comp_s = [&](const L& st, int rg) {
-            if (gq == 0) {
+            uint32_t packet = 0;
+            if (gq < 4) {
               const uint2 lo = reinterpret_cast<const uint2*>(sm.buf.lo)[(rg * 2 + warp) * 4 + t];
               const uint32_t hi = reinterpret_cast<const uint16_t*>(sm.buf.hi)[(rg * 2 + warp) * 4 + t];
-              const uint32_t kb = ((uint32_t)(cb * KG + gbase + rg) * 64u) + (uint32_t)t * 16u;
-              uint4 sf;
-              sf.x = s5_unpack4(lo.x & 0xFFFFu, hi & 0xFu,        smin4, meta, esc, midx, kb);
-              sf.y = s5_unpack4(lo.x >> 16,     (hi >> 4) & 0xFu, smin4, meta, esc, midx, kb + 4u);
-              sf.z = s5_unpack4(lo.y & 0xFFFFu, (hi >> 8) & 0xFu, smin4, meta, esc, midx, kb + 8u);
-              sf.w = s5_unpack4(lo.y >> 16,     (hi >> 12) & 0xFu,smin4, meta, esc, midx, kb + 12u);
-              sm.buf.s[warp][t] = sf;
-            }
-            if (warp == 0) sm.w[0][lane] = make_uint2(st.w.z, st.w.w);
-            else           sm.w[1][lane] = make_uint2(st.w.x, st.w.y);
-            __syncthreads();
-            uint2 wm[2], smv[2];
-            const uint4 sf0 = sm.buf.s[0][t], sf1 = sm.buf.s[1][t];
-            if (warp == 0) {
-              wm[0] = make_uint2(st.w.x, st.w.y); wm[1] = sm.w[1][lane];
-              smv[0] = make_uint2(sf0.x, sf0.z); smv[1] = make_uint2(sf1.x, sf1.z);
-            } else {
-              wm[0] = sm.w[0][lane]; wm[1] = make_uint2(st.w.z, st.w.w);
-              smv[0] = make_uint2(sf0.y, sf0.w); smv[1] = make_uint2(sf1.y, sf1.w);
+              const uint32_t kb = ((uint32_t)(cb * KG + gbase + rg) * 64u) + t * 16u;
+              const uint32_t low = (gq < 2 ? lo.x : lo.y) >> (16 * (gq & 1));
+              packet = s5_unpack4(low & 0xffffu, (hi >> (4 * gq)) & 15u,
+                                  smin4, meta, esc, midx, kb + gq * 4u);
             }
 #pragma unroll
-            for (int m = 0; m < 2; ++m)
+            for (int h = 0; h < 2; ++h) {
 #pragma unroll
-              for (int h = 0; h < 2; ++h) {
-                const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y;
-                const uint32_t sw = h == 0 ? smv[m].x : smv[m].y;
-#pragma unroll
-                for (int jj = 0; jj < 2; ++jj) {
-                  const uint32_t word = jj ? wm[m].y : wm[m].x;
-                  float p[4];
-                  qmm_frag::mma0(p, a0, 0u, a2, 0u, tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
-                  const uint32_t sp = tf_common::fp8pair_unit((sw >> (jj * 16)) & 0xFFFFu, 0x7B807B80u);
-                  const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
-                  acc[m][jj][0] = fmaf(p[0], s0, acc[m][jj][0]);
-                  acc[m][jj][1] = fmaf(p[1], s1, acc[m][jj][1]);
-                }
+              for (int j = 0; j < 4; ++j) {
+                const uint32_t word = comp(st.w, j);
+                const uint32_t sw = __shfl_sync(0xffffffffu, packet, t + 4 * (2 * h + (j >> 1)));
+                const uint32_t sp = tf_common::fp8pair_unit((sw >> (16 * (j & 1))) & 0xffffu, 0x7B807B80u);
+                float p[4];
+                qmm_frag::mma0(p, st.xa[h].x, 0u, st.xa[h].y, 0u,
+                               tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
+                acc[j][0] = fmaf(p[0], __uint_as_float((sp & 0xffffu) << 16), acc[j][0]);
+                acc[j][1] = fmaf(p[1], __uint_as_float(sp & 0xffff0000u), acc[j][1]);
               }
-            __syncthreads();
+            }
           };
           L st[3];
           load(st[0], 0); load(st[1], 1); load(st[2], 2);
@@ -5237,15 +5217,25 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
             if (rg + 1 < 16) { comp_s(st[1], rg + 1); if (rg + 4 < 16) load(st[1], rg + 4); }
             if (rg + 2 < 16) { comp_s(st[2], rg + 2); if (rg + 5 < 16) load(st[2], rg + 5); }
           }
+          // Both warps finish consuming this chunk before its scales are replaced.
+          __syncthreads();
         }
-        if (v0) {
-          const float g0 = __ldg(scale + e * 2), g1 = __ldg(scale + e * 2 + 1);
-          const size_t row = (size_t)pr0 * N;
+        if (warp == 1) {
 #pragma unroll
-          for (int j = 0; j < 2; ++j) {
-            const float o0 = swiglu(acc[0][j][0] * g0, acc[1][j][0] * g1, limit);
-            const float o1 = swiglu(acc[0][j][1] * g0, acc[1][j][1] * g1, limit);
-            *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + cb * COLS + 16 * warp + 8 * j + 2 * t) =
+          for (int j = 0; j < 4; ++j) {
+            up_projection[j][0][lane] = acc[j][0];
+            up_projection[j][1][lane] = acc[j][1];
+          }
+        }
+        __syncthreads();
+        if (warp == 0 && v0) {
+          const float g0 = __ldg(scale + e * 2), g1 = __ldg(scale + e * 2 + 1);
+          const size_t base = (size_t)pr0 * N + cb * COLS + 2 * t;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const float o0 = swiglu(acc[j][0] * g0, up_projection[j][0][lane] * g1, limit);
+            const float o1 = swiglu(acc[j][1] * g0, up_projection[j][1][lane] * g1, limit);
+            *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + base + 8 * j) =
                 __floats2bfloat162_rn(o0, o1);
           }
         }
