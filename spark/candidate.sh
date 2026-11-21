@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t157"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4982,14 +4982,14 @@ static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
   const uint2 mm = __ldg(meta + midx);
-  uint32_t lo = 0u, hi = mm.x >> 8;
-  const uint32_t off = mm.y;
+  const uint32_t page = mm.y + (key >> 10);
+  uint32_t lo = __ldg(esc + page), hi = __ldg(esc + page + 1);
   while (lo < hi) {
     const uint32_t mid = (lo + hi) >> 1;
-    const uint32_t k = __ldg(esc + off + mid) >> 8;
+    const uint32_t k = __ldg(esc + mid) >> 8;
     if (k < key) lo = mid + 1u; else hi = mid;
   }
-  return __ldg(esc + off + lo) & 0xFFu;
+  return __ldg(esc + lo) & 0xFFu;
 }
 
 static __device__ __noinline__ uint32_t s5_fix4(
@@ -9984,9 +9984,11 @@ fn loadNvfp4(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix
             @memcpy(up_esc[uoff..][0..r.esc_u.items.len], r.esc_u.items);
             uoff += r.esc_u.items.len;
         }
+        const up_indexed = try s5t.indexExceptions(a, up_meta, up_esc);
+        defer a.free(up_indexed);
         var um = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_meta));
         errdefer um.free();
-        var ue = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_esc));
+        var ue = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_indexed));
         errdefer ue.free();
 
         const dn_meta = try a.alloc([2]u32, count);
@@ -10002,9 +10004,11 @@ fn loadNvfp4(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix
             @memcpy(dn_esc[doff..][0..r.esc_d.items.len], r.esc_d.items);
             doff += r.esc_d.items.len;
         }
+        const dn_indexed = try s5t.indexExceptions(a, dn_meta, dn_esc);
+        defer a.free(dn_indexed);
         var dm = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_meta));
         errdefer dm.free();
-        const de = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_esc));
+        const de = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_indexed));
         return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .format = .nvfp4, .up_s5_meta = um, .up_s5_esc = ue, .down_s5_meta = dm, .down_s5_esc = de };
     }
     return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .format = .nvfp4 };
@@ -13165,7 +13169,37 @@ patch_exact(
 pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize) !experts.Owned {
     return loadChunked(a, d, store, prefix, dims, width, count, n, staging_bytes);
 }""",
-    """pub fn s5Enabled() bool {
+    """// Each directory entry points to the first exception in its range of 1024 keys.
+pub fn indexExceptions(a: std.mem.Allocator, meta: [][2]u32, flat: []const u32) ![]u32 {
+    var size: usize = 0;
+    for (meta) |m| {
+        const count: usize = m[0] >> 8;
+        if (count == 0) continue;
+        const last = flat[@as(usize, m[1]) + count - 1];
+        size += count + @as(usize, last >> 18) + 2;
+    }
+    const indexed = try a.alloc(u32, @max(size, 1));
+    indexed[0] = 0;
+    var cursor: usize = 0;
+    for (meta) |*m| {
+        const count: usize = m[0] >> 8;
+        const values = flat[m[1]..][0..count];
+        m[1] = @intCast(cursor);
+        if (count == 0) continue;
+        const pages: usize = @as(usize, values[count - 1] >> 18) + 1;
+        const data = cursor + pages + 1;
+        var first: usize = 0;
+        for (0..(pages + 1)) |page| {
+            while (first < count and (values[first] >> 18) < page) first += 1;
+            indexed[cursor + page] = @intCast(data + first);
+        }
+        @memcpy(indexed[data..][0..count], values);
+        cursor = data + count;
+    }
+    return indexed;
+}
+
+pub fn s5Enabled() bool {
     const raw = std.c.getenv("TF_NVFP4_S5") orelse return false;
     return std.mem.eql(u8, std.mem.span(raw), "1");
 }
@@ -13489,9 +13523,11 @@ patch_exact(
             @memcpy(up_esc[uoff..][0..r.esc_u.items.len], r.esc_u.items);
             uoff += r.esc_u.items.len;
         }
+        const up_indexed = try indexExceptions(a, up_meta, up_esc);
+        defer a.free(up_indexed);
         var um = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_meta));
         errdefer um.free();
-        var ue = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_esc));
+        var ue = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_indexed));
         errdefer ue.free();
 
         const dn_meta = try a.alloc([2]u32, count);
@@ -13507,9 +13543,11 @@ patch_exact(
             @memcpy(dn_esc[doff..][0..r.esc_d.items.len], r.esc_d.items);
             doff += r.esc_d.items.len;
         }
+        const dn_indexed = try indexExceptions(a, dn_meta, dn_esc);
+        defer a.free(dn_indexed);
         var dm = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_meta));
         errdefer dm.free();
-        const de = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_esc));
+        const de = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dn_indexed));
         return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .up_s5_meta = um, .up_s5_esc = ue, .down_s5_meta = dm, .down_s5_esc = de };
     }
     return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };""",
