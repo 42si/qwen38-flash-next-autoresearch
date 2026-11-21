@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t95"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4367,28 +4367,20 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    __shared__ float4 sk4[32], sq4[32];
     const unsigned total = np + (unsigned)rows;
     for (unsigned p = 0; p < total; ++p) {
         if (p == np && (int)np > store_above) store_tile(state_in);
         const size_t lr = (first + p) % (unsigned)log_rows;
-        if (tid < 32) {
-            sk4[tid] = *reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK + tid * 4);
-        }
-        if (p >= np && tid >= 32 && tid < 64) {
-            const int r = (int)(p - np);
-            sq4[tid - 32] = *reinterpret_cast<const float4*>(qn + ((size_t)r * NK + hk) * DK + (tid - 32) * 4);
-        }
+        const float4* key = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK);
         const float vv = vl[lr * NV * DV + hv * DV + vrow];
         const float g = gl[(lr * NV + hv) * 2];
         const float beta = gl[(lr * NV + hv) * 2 + 1];
-        __syncthreads();
 
         float4 k[8];
         float d[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            k[j] = sk4[t4 + 4 * j];
+            k[j] = __ldg(key + t4 + 4 * j);
             h[j].x *= g; h[j].y *= g; h[j].z *= g; h[j].w *= g;
             d[j] = ((h[j].x * k[j].x + h[j].y * k[j].y) + h[j].z * k[j].z) + h[j].w * k[j].w;
         }
@@ -4401,10 +4393,11 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
             h[j].x += k[j].x * delta; h[j].y += k[j].y * delta; h[j].z += k[j].z * delta; h[j].w += k[j].w * delta;
         }
         if (p >= np) {
+            const float4* query = reinterpret_cast<const float4*>(qn + ((size_t)(p - np) * NK + hk) * DK);
             float o[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const float4 q = sq4[t4 + 4 * j];
+                const float4 q = __ldg(query + t4 + 4 * j);
                 o[j] = ((h[j].x * q.x + h[j].y * q.y) + h[j].z * q.z) + h[j].w * q.w;
             }
             float os = ((o[0] + o[4]) + (o[2] + o[6])) + ((o[1] + o[5]) + (o[3] + o[7]));
@@ -4415,7 +4408,6 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
                 ys_out[((size_t)r * NV + hv) * DV + vrow] = bf(os);
             }
         }
-        __syncthreads();
     }
     if (state_out != nullptr) store_tile(state_out);
 }
