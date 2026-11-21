@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t79"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4999,6 +4999,15 @@ static __device__ __forceinline__ uint32_t s5_unpack4(
   return val;
 }
 
+// Lanes with the same t share sixteen scales. Each quartet of lanes
+// unpacks a different group of four instead of serializing on quartet zero.
+static __device__ __forceinline__ uint32_t s5_unpack_piece(
+    uint2 lo, uint32_t hi, unsigned piece, uint32_t smin4,
+    const uint2* meta, const uint32_t* esc, int midx, uint32_t kb) {
+  const uint32_t low = ((piece < 2 ? lo.x : lo.y) >> (16 * (piece & 1))) & 0xffffu;
+  return s5_unpack4(low, (hi >> (4 * piece)) & 15u, smin4, meta, esc, midx, kb + 4u * piece);
+}
+
 static __device__ __noinline__ uint4 s5_fix16(
     uint4 sf, uint32_t emask, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
     int midx, uint32_t kb) {
@@ -5187,16 +5196,11 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
             st.xa[1] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16) : zero;
           };
           auto comp_s = [&](const L& st, int rg) {
-            if (gq == 0) {
+            if (gq < 4) {
               const uint2 lo = reinterpret_cast<const uint2*>(sm.buf.lo)[(rg * 2 + warp) * 4 + t];
               const uint32_t hi = reinterpret_cast<const uint16_t*>(sm.buf.hi)[(rg * 2 + warp) * 4 + t];
               const uint32_t kb = ((uint32_t)(cb * KG + gbase + rg) * 64u) + (uint32_t)t * 16u;
-              uint4 sf;
-              sf.x = s5_unpack4(lo.x & 0xFFFFu, hi & 0xFu,        smin4, meta, esc, midx, kb);
-              sf.y = s5_unpack4(lo.x >> 16,     (hi >> 4) & 0xFu, smin4, meta, esc, midx, kb + 4u);
-              sf.z = s5_unpack4(lo.y & 0xFFFFu, (hi >> 8) & 0xFu, smin4, meta, esc, midx, kb + 8u);
-              sf.w = s5_unpack4(lo.y >> 16,     (hi >> 12) & 0xFu,smin4, meta, esc, midx, kb + 12u);
-              sm.buf.s[warp][t] = sf;
+              reinterpret_cast<uint32_t*>(&sm.buf.s[warp][t])[gq] = s5_unpack_piece(lo, hi, gq, smin4, meta, esc, midx, kb);
             }
             if (warp == 0) sm.w[0][lane] = make_uint2(st.w.z, st.w.w);
             else           sm.w[1][lane] = make_uint2(st.w.x, st.w.y);
@@ -5352,20 +5356,17 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
         st.xa[1] = v0 ? *reinterpret_cast<const uint2*>(x0 + k0 + 16) : zero;
       };
       auto comp_s = [&](const S& st, int g) {
-        uint32_t sx = 0u, sy = 0u, sz = 0u, sw = 0u;
-        if (gq == 0) {
+        uint32_t piece = 0u;
+        if (gq < 4) {
           const uint2 lo = reinterpret_cast<const uint2*>(sh_lo)[g * 4 + t];
           const uint32_t hi = reinterpret_cast<const uint16_t*>(sh_hi)[g * 4 + t];
           const uint32_t kb = ((uint32_t)(cb * KG + g) * 64u) + (uint32_t)t * 16u;
-          sx = s5_unpack4(lo.x & 0xFFFFu, hi & 0xFu,        smin4, meta, esc, e, kb);
-          sy = s5_unpack4(lo.x >> 16,     (hi >> 4) & 0xFu, smin4, meta, esc, e, kb + 4u);
-          sz = s5_unpack4(lo.y & 0xFFFFu, (hi >> 8) & 0xFu, smin4, meta, esc, e, kb + 8u);
-          sw = s5_unpack4(lo.y >> 16,     (hi >> 12) & 0xFu,smin4, meta, esc, e, kb + 12u);
+          piece = s5_unpack_piece(lo, hi, gq, smin4, meta, esc, e, kb);
         }
-        sx = __shfl_sync(0xffffffffu, sx, t);
-        sy = __shfl_sync(0xffffffffu, sy, t);
-        sz = __shfl_sync(0xffffffffu, sz, t);
-        sw = __shfl_sync(0xffffffffu, sw, t);
+        const uint32_t sx = __shfl_sync(0xffffffffu, piece, t);
+        const uint32_t sy = __shfl_sync(0xffffffffu, piece, 4 + t);
+        const uint32_t sz = __shfl_sync(0xffffffffu, piece, 8 + t);
+        const uint32_t sw = __shfl_sync(0xffffffffu, piece, 12 + t);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y;
