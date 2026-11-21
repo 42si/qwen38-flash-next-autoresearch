@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t114"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9763,7 +9763,28 @@ fn quantizeFp8ToNvfp4(lut: *const [256]f32, fp8_bytes: []const u8, blk_scales: [
                 const u = b & 0x7f;
                 if (u != 0x7f and u > m7) m7 = u;
             }
-            const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(lut[m7] * abs_bs * inv_global / 6.0, 0.0, 448.0));
+            const absmax_scale = std.math.clamp(lut[m7] * abs_bs * inv_global / 6.0, 0.0, 448.0);
+            var sc_code = core.exlr8.codec.e4m3FromF32(absmax_scale);
+            if (sc_code != 0 and abs_bs > 0) {
+                const levels = [_]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+                const factors = [_]f32{ 1.0, 0.875, 0.75, 1.125 };
+                var best_error = std.math.inf(f32);
+                for (factors) |factor| {
+                    const candidate = core.exlr8.codec.e4m3FromF32(@min(absmax_scale * factor, 448.0));
+                    if (candidate == 0) continue;
+                    const step = lut[candidate] * global;
+                    var error_sum: f32 = 0;
+                    for (seg) |byte| {
+                        const weight = lut[byte & 0x7f] * abs_bs;
+                        const diff = weight - levels[e2m1(weight / step) & 7] * step;
+                        error_sum += diff * diff;
+                    }
+                    if (error_sum < best_error) {
+                        best_error = error_sum;
+                        sc_code = candidate;
+                    }
+                }
+            }
             scales[r * kg16 + g] = sc_code;
             const denom = lut[sc_code] * global;
             const out_c = codes[r * (k / 2) + g * 8 ..][0..8];
