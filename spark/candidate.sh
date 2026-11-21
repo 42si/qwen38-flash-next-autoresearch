@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t127"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4369,21 +4369,22 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    constexpr unsigned tile = 4;
+    constexpr unsigned tile = 8;
     __shared__ float4 keys[tile][32], queries[tile][32];
     __shared__ float values[tile][32];
     __shared__ float2 gate_beta[tile];
     const unsigned total = np + (unsigned)rows;
     for (unsigned base = 0; base < total; base += tile) {
-        const unsigned load_p = base + (unsigned)(tid >> 5);
-        if (load_p < total) {
+        for (unsigned slot = tid >> 5; slot < tile; slot += 4) {
+            const unsigned load_p = base + slot;
+            if (load_p >= total) break;
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
             const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
-            if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
-            keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
+            values[slot][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
+            if (vec == 0) gate_beta[slot] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
+            keys[slot][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
             if (load_p >= np) {
-                queries[tid >> 5][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
+                queries[slot][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
             }
         }
         __syncthreads();
@@ -12922,7 +12923,7 @@ patch_exact(
     """                    if (!fused) {
                         const mtp_sk: usize = if (lw.is_mtp and m == 1 and at.gated != 0 and pg.pt != 0 and h.q / h.kv <= 8 and self.tri.own != null) (if (std.c.getenv("TF_FLASHNEXT_MTP_ATTN_SK")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0) else 0) else 0;
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
-                        if (mtp_sk > 1 and mtp_sk <= 16) {
+                        if (chunks > 1 and mtp_sk > 1 and mtp_sk <= 16) {
                             try self.tri.own.?.attnSplitGatePaged(self.stream, at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, at.gated + r0 * qr, s.qids, s.qnk, s.qspr, m, h, mtp_sk, pg, pa + r0 * at.pn * 2, at.pn);
                         } else if (chunks == 1 and self.tri.fusedAttentionOwned()) {
                             if (at.gated != 0) {
@@ -13761,7 +13762,7 @@ PY
     export TF_NVFP4_S5="${TF_NVFP4_S5:-1}"
     export TF_FLASHNEXT_ROUTER_BF11="${TF_FLASHNEXT_ROUTER_BF11:-0}"
     export TF_FLASHNEXT_MTP_S5="${TF_FLASHNEXT_MTP_S5:-0}"
-    export TF_FLASHNEXT_MTP_ATTN_SK="${TF_FLASHNEXT_MTP_ATTN_SK:-0}"
+    export TF_FLASHNEXT_MTP_ATTN_SK="${TF_FLASHNEXT_MTP_ATTN_SK:-4}"
     export TF_QMMF_M1_MIN_N="${TF_QMMF_M1_MIN_N:-64}"
     export TF_QMMF_M1_MAX_N="${TF_QMMF_M1_MAX_N:-16384}"
     export TF_FLASHNEXT_HEAD_NVFP4="w1"
