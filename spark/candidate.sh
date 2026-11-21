@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t152"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -11100,7 +11100,7 @@ patch_exact(
                 .p_cliff = stop_cfg.p_cliff,
                 .alpha = stop_cfg.alpha,
                 .decay = stop_cfg.decay,
-                .gamma = stop_cfg.gamma,
+                .gamma = stop_cfg.gamma * std.math.clamp(1.0 - 2.0 * d.calibration_error, 0.65, 1.5),
                 .start_pos = @intCast(d.len),
                 .max_steps = @intCast(max_steps),
                 .vocab_n = @intCast(h.ids.len),
@@ -11137,6 +11137,27 @@ patch_exact(
 
         pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
             out.n = 0;
+            const observe = !mtp.isSampled(sm) and confidence < 0.0;
+            if (observe and d.calibration_n > 0 and position >= next.len and position - next.len == d.calibration_pos) {
+                var error_sum: f64 = 0.0;
+                var observations: usize = 0;
+                for (0..@min(next.len, d.calibration_n)) |idx| {
+                    const hit = next[idx] == d.calibration_ids[idx];
+                    error_sum += @as(f64, @floatFromInt(@intFromBool(hit))) - d.calibration_probs[idx];
+                    observations += 1;
+                    if (!hit) break;
+                }
+                d.calibration_error = 0.75 * d.calibration_error + 0.25 * error_sum / @as(f64, @floatFromInt(observations + 1));
+            } else d.calibration_error = 0.0;
+            d.calibration_n = 0;
+            defer {
+                if (observe) {
+                    d.calibration_n = out.n;
+                    d.calibration_pos = position;
+                    @memcpy(d.calibration_ids[0..out.n], out.tokens[0..out.n]);
+                    @memcpy(d.calibration_probs[0..out.n], out.probs[0..out.n]);
+                }
+            }
             try o.absorb(d, next, rows, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
             const max_steps = @min(count, max_chain);
@@ -11145,6 +11166,7 @@ patch_exact(
                 if (try o.draftWhile(d, max_steps, confidence, out)) return;
             }
             var stop: mtp.Stop = mtp.Stop.init(confidence);
+            stop.gamma *= std.math.clamp(1.0 - 2.0 * d.calibration_error, 0.65, 1.5);
             var j: usize = 0;
             while (j < max_steps) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
@@ -12338,7 +12360,7 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp_draft.zig",
     "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
-    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,\n    calibration_pos: u64 = 0,\n    calibration_n: usize = 0,\n    calibration_ids: [max_chain]u32 = undefined,\n    calibration_probs: [max_chain]f64 = undefined,\n    calibration_error: f64 = 0.0,",
 )
 patch_exact(
     root, "cuda_lanes_verify.zig",
