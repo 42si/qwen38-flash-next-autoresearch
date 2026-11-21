@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t195"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10841,7 +10841,36 @@ patch_exact(
                 n_miss += 1;
             }
         }
+        g.warmMisses(miss_h0[0..n_miss], miss_h1[0..n_miss], miss_tok[0..n_miss]);
+    }
+
+    /// The completed graph returns all draft IDs together. Gather their missing rows in one call.
+    pub fn warmChain(g: *const Ngram, history: *[2]i64, tokens: []const u32) void {
+        const cache = g.cache orelse return;
+        if (tokens.len > 32 or g.width() != ple_cache.row_w or g.hash.n != 3) {
+            for (tokens) |token| g.warmToken(history, token);
+            return;
+        }
+        var miss_h0: [32]i64 = undefined;
+        var miss_h1: [32]i64 = undefined;
+        var miss_tok: [32]u32 = undefined;
+        var count: usize = 0;
+        for (tokens) |token| {
+            if (!cache.has(history[0], history[1], token)) {
+                miss_h0[count] = history[0];
+                miss_h1[count] = history[1];
+                miss_tok[count] = token;
+                count += 1;
+            }
+            history.* = .{ history[1], token };
+        }
+        g.warmMisses(miss_h0[0..count], miss_h1[0..count], miss_tok[0..count]);
+    }
+
+    fn warmMisses(g: *const Ngram, miss_h0: []const i64, miss_h1: []const i64, miss_tok: []const u32) void {
+        const n_miss = miss_tok.len;
         if (n_miss == 0) return;
+        const cache = g.cache orelse return;
         const heads = g.hash.heads;
         const items = n_miss * heads;
         const ids = g.gpa.alloc(i64, items) catch return;
@@ -11129,9 +11158,7 @@ patch_exact(
                 out.tokens[i] = out_host.tokens[i];
                 out.probs[i] = out_host.probs[i];
             }
-            for (0..@min(drafted, n)) |i| {
-                o.e.ngram.warmToken(&d.draft_hist, out.tokens[i]);
-            }
+            o.e.ngram.warmChain(&d.draft_hist, out.tokens[0..@min(drafted, n)]);
             return true;
         }
 
