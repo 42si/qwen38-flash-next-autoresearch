@@ -13749,6 +13749,7 @@ PY
     export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     export TF_FLASHNEXT_MTP_WHILE="1"
+    export TF_FLASHNEXT_ROOT_COPIES="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       export TF_FLASHNEXT_DRAFTS="6"
@@ -13768,7 +13769,6 @@ PY
       export TF_FLASHNEXT_EXT_TOK="${TF_FLASHNEXT_EXT_TOK:-0.0}"
       export TF_FLASHNEXT_EXT_MIN="${TF_FLASHNEXT_EXT_MIN:-0}"
       export TF_FLASHNEXT_FACT_ROWS="${TF_FLASHNEXT_FACT_ROWS:-256}"
-      export TF_FLASHNEXT_ROOT_COPIES="0"
       export TF_FLASHNEXT_P_CLIFF="0.0"
       export TF_FLASHNEXT_W2_MULTI="1"
       export TF_FLASHNEXT_ROUTER_BF12="0"
