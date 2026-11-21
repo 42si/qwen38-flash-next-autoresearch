@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t190"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10791,7 +10791,95 @@ patch_exact(
         const heads = g.hash.heads;
         const w = g.width();
         if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;""",
-    """    /// Synchronously warm one 3-gram row into the in-RAM cache while GPU runs MTP forwardHead.
+    """    pub const Segment = struct { history: []i64, count: usize };
+
+    pub fn cachedRows(g: *const Ngram, segments: []const Segment, tokens: []const u32, out: []u16, xs: []f32) !bool {
+        const cache = g.cache orelse return false;
+        if (g.hash.n != 3 or g.width() != ple_cache.row_w or tokens.len == 0) return false;
+        const heads = g.hash.heads;
+        var total: usize = 0;
+        for (segments) |segment| {
+            if (segment.history.len != 2) return false;
+            total += segment.count;
+        }
+        if (total != tokens.len or out.len != total * ple_cache.row_w or xs.len != total * ple_cache.xs_w) return error.UnexpectedTensor;
+        var stack_idx: [64]usize = undefined;
+        var stack_h0: [64]i64 = undefined;
+        var stack_h1: [64]i64 = undefined;
+        const dyn = tokens.len > stack_idx.len;
+        const miss_idx = if (dyn) try g.gpa.alloc(usize, tokens.len) else stack_idx[0..tokens.len];
+        defer if (dyn) g.gpa.free(miss_idx);
+        const miss_h0 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h0[0..tokens.len];
+        defer if (dyn) g.gpa.free(miss_h0);
+        const miss_h1 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h1[0..tokens.len];
+        defer if (dyn) g.gpa.free(miss_h1);
+        var n_miss: usize = 0;
+        var start: usize = 0;
+        for (segments) |segment| {
+            var hist2: [2]i64 = .{ segment.history[0], segment.history[1] };
+            for (tokens[start..][0..segment.count], start..) |tok, t| {
+                const out_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                const xs_row: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                if (!cache.get(hist2[0], hist2[1], tok, out_row, xs_row)) {
+                    miss_idx[n_miss] = t;
+                    miss_h0[n_miss] = hist2[0];
+                    miss_h1[n_miss] = hist2[1];
+                    n_miss += 1;
+                }
+                hist2 = .{ hist2[1], tok };
+            }
+            start += segment.count;
+        }
+        if (n_miss > 0) {
+            const miss_items = n_miss * heads;
+            const miss_ids = try g.gpa.alloc(i64, miss_items);
+            defer g.gpa.free(miss_ids);
+            const miss_emb = try g.gpa.alloc(u16, n_miss * ple_cache.row_w);
+            defer g.gpa.free(miss_emb);
+            for (0..n_miss) |m| {
+                const t = miss_idx[m];
+                const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
+                try lastIds(g.hash, &mh, @intCast(tokens[t]), miss_ids[m * heads ..][0..heads]);
+            }
+            const nt = @min(ple_pool.max_parts, miss_items / 4);
+            if (g.format != .mlx and miss_items > 1) {
+                try @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb);
+            } else if (nt <= 1 or g.pool == null) {
+                try g.fill(miss_ids, miss_emb, 0, miss_items);
+            } else {
+                const split_m: Split = .{ .g = g, .ids = miss_ids, .out = miss_emb, .per = (miss_items + nt - 1) / nt };
+                try g.pool.?.run(nt, .{ .ctx = &split_m, .run = Split.part });
+            }
+            for (0..n_miss) |m| {
+                const t = miss_idx[m];
+                const src_row = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
+                if (g.format == .mlx and g.scale != 1) {
+                    for (src_row) |*v| {
+                        const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                        v.* = toBf16(f * g.scale);
+                    }
+                }
+                const dst_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
+                const dst_xs: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
+                @memcpy(dst_row, src_row);
+                sumGroups(dst_row, dst_xs);
+                cache.put(miss_h0[m], miss_h1[m], tokens[t], dst_row, dst_xs);
+            }
+        }
+        // Commit each stream's history after all rows have been gathered successfully.
+        var at: usize = 0;
+        for (segments) |segment| {
+            const ids = tokens[at..][0..segment.count];
+            if (ids.len != 0) {
+                segment.history[0] = if (ids.len == 1) segment.history[1] else ids[ids.len - 2];
+                segment.history[1] = ids[ids.len - 1];
+            }
+            at += ids.len;
+        }
+        return true;
+    }
+
+    /// Synchronously warm one 3-gram row into the in-RAM cache while GPU runs MTP forwardHead.
     pub fn warmToken(g: *const Ngram, hist: *[2]i64, tok: u32) void {
         const cache = g.cache orelse return;
         const h0 = hist[0];
@@ -10876,70 +10964,7 @@ patch_exact(
         const heads = g.hash.heads;
         const w = g.width();
         if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;
-        if (g.cache) |cache| if (history.len == 2 and w == ple_cache.row_w and tokens.len > 0) {
-            var hist2: [2]i64 = .{ history[0], history[1] };
-            var stack_idx: [64]usize = undefined;
-            var stack_h0: [64]i64 = undefined;
-            var stack_h1: [64]i64 = undefined;
-            const dyn = tokens.len > stack_idx.len;
-            const miss_idx = if (dyn) try g.gpa.alloc(usize, tokens.len) else stack_idx[0..tokens.len];
-            defer if (dyn) g.gpa.free(miss_idx);
-            const miss_h0 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h0[0..tokens.len];
-            defer if (dyn) g.gpa.free(miss_h0);
-            const miss_h1 = if (dyn) try g.gpa.alloc(i64, tokens.len) else stack_h1[0..tokens.len];
-            defer if (dyn) g.gpa.free(miss_h1);
-            var n_miss: usize = 0;
-            for (tokens, 0..) |tok, t| {
-                const out_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
-                const xs_row: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
-                if (!cache.get(hist2[0], hist2[1], tok, out_row, xs_row)) {
-                    miss_idx[n_miss] = t;
-                    miss_h0[n_miss] = hist2[0];
-                    miss_h1[n_miss] = hist2[1];
-                    n_miss += 1;
-                }
-                hist2 = .{ hist2[1], tok };
-            }
-            if (n_miss > 0) {
-                const miss_items = n_miss * heads;
-                const miss_ids = try g.gpa.alloc(i64, miss_items);
-                defer g.gpa.free(miss_ids);
-                const miss_emb = try g.gpa.alloc(u16, n_miss * ple_cache.row_w);
-                defer g.gpa.free(miss_emb);
-                for (0..n_miss) |m| {
-                    const t = miss_idx[m];
-                    const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
-                    try lastIds(g.hash, &mh, @intCast(tokens[t]), miss_ids[m * heads ..][0..heads]);
-                }
-                const nt = @min(ple_pool.max_parts, miss_items / 4);
-                if (g.format != .mlx and miss_items > 1) {
-                    try @import("cuda_ple_gather.zig").run(g, miss_ids, miss_emb);
-                } else if (nt <= 1 or g.pool == null) {
-                    try g.fill(miss_ids, miss_emb, 0, miss_items);
-                } else {
-                    const split_m: Split = .{ .g = g, .ids = miss_ids, .out = miss_emb, .per = (miss_items + nt - 1) / nt };
-                    try g.pool.?.run(nt, .{ .ctx = &split_m, .run = Split.part });
-                }
-                for (0..n_miss) |m| {
-                    const t = miss_idx[m];
-                    const src_row = miss_emb[m * ple_cache.row_w ..][0..ple_cache.row_w];
-                    if (g.format == .mlx and g.scale != 1) {
-                        for (src_row) |*v| {
-                            const f: f32 = @bitCast(@as(u32, v.*) << 16);
-                            v.* = toBf16(f * g.scale);
-                        }
-                    }
-                    const dst_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
-                    const dst_xs: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
-                    @memcpy(dst_row, src_row);
-                    sumGroups(dst_row, dst_xs);
-                    cache.put(miss_h0[m], miss_h1[m], tokens[t], dst_row, dst_xs);
-                }
-            }
-            history[0] = hist2[0];
-            history[1] = hist2[1];
-            return;
-        };""",
+        if (try g.cachedRows(&.{.{ .history = history, .count = tokens.len }}, tokens, out, xs)) return;""",
 )
 patch_exact(
     root, "cuda_mtp_draft.zig",
@@ -11498,6 +11523,24 @@ patch_exact(
     root, "cuda_lanes_load.zig",
     "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);",
     "        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);\n        own.head.?.w2.bf16_ptr = own.engine.head_q.b.ptr;",
+)
+
+patch_exact(
+    root, "cuda_batch_state.zig",
+    """        var row0: usize = 0;
+        for (g.lanes) |l| {
+            g.ngram.rows(l.seq.history[0..],""",
+    """        var segments: [64]ple.Ngram.Segment = undefined;
+        if (g.lanes.len > 1 and g.lanes.len <= segments.len) {
+            for (g.lanes, 0..) |l, i| segments[i] = .{ .history = l.seq.history[0..], .count = l.rows };
+            if (g.ngram.cachedRows(segments[0..g.lanes.len], g.ids, g.emb, g.xs) catch |err| {
+                g.failed = err;
+                return;
+            }) return;
+        }
+        var row0: usize = 0;
+        for (g.lanes) |l| {
+            g.ngram.rows(l.seq.history[0..],""",
 )
 
 # 5g. cuda_lanes_bytes.zig: reflect NVFP4 MTP expert size in budget check
