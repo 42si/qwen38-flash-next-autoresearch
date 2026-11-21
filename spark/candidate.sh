@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t209"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4982,14 +4982,15 @@ static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
   const uint2 mm = __ldg(meta + midx);
-  uint32_t lo = 0u, hi = mm.x >> 8;
-  const uint32_t off = mm.y;
-  while (lo < hi) {
-    const uint32_t mid = (lo + hi) >> 1;
-    const uint32_t k = __ldg(esc + off + mid) >> 8;
-    if (k < key) lo = mid + 1u; else hi = mid;
+  const uint32_t count = mm.x >> 8;
+  // The packing pass stores every key marked as an escape, so count is positive.
+  uint32_t index = 0;
+  for (uint32_t step = 1u << (31 - __clz(count)); step; step >>= 1) {
+    const uint32_t probe = min(index + step, count - 1);
+    const uint32_t candidate = __ldg(esc + mm.y + probe);
+    if ((candidate >> 8) <= key) index = probe;
   }
-  return __ldg(esc + off + lo) & 0xFFu;
+  return __ldg(esc + mm.y + index) & 0xffu;
 }
 
 static __device__ __noinline__ uint32_t s5_fix4(
