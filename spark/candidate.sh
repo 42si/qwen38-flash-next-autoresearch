@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t150"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -11137,7 +11137,23 @@ patch_exact(
 
         pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
             out.n = 0;
-            try o.absorb(d, next, rows, count > 0);
+            const greedy = !mtp.isSampled(sm) and o.main == null and d.media == null;
+            var reused: usize = 0;
+            if (greedy and position >= next.len and d.proposal_pos == position - next.len) {
+                // Refresh the last two rows from target hidden states before proposing again.
+                const limit = @min(next.len -| 2, d.drafted, d.proposal_n);
+                while (reused < limit and next[reused] == d.proposal_ids[reused]) reused += 1;
+            }
+            d.proposal_n = 0;
+            defer {
+                if (greedy) {
+                    d.proposal_pos = position;
+                    d.proposal_n = out.n;
+                    @memcpy(d.proposal_ids[0..out.n], out.tokens[0..out.n]);
+                }
+            }
+            d.drafted -= reused;
+            try o.absorb(d, next[reused..], rows + reused * wide * 2, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
             const max_steps = @min(count, max_chain);
             const wg = @import("cuda_window_graph.zig");
@@ -12338,7 +12354,7 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp_draft.zig",
     "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
-    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,\n    proposal_pos: u64 = 0,\n    proposal_n: usize = 0,\n    proposal_ids: [max_chain]u32 = undefined,",
 )
 patch_exact(
     root, "cuda_lanes_verify.zig",
