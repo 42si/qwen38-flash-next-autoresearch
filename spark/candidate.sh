@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t128"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -3544,13 +3544,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmmf_m1_int6_4x1_f32(
     const __nv_bfloat16* x, const uint32_t* __restrict__ w, const uint8_t* __restrict__ bs, float scale, void* __restrict__ out, int N, int K) {
     qmmf_m1_int6_coop_body<4, 1, true>(x, w, bs, scale, out, N, K);
 }
-extern "C" __global__ void __launch_bounds__(128) tf_qmmf_m1_int6_1x4_bf16(
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_m1_int6_2x2_bf16(
     const __nv_bfloat16* x, const uint32_t* __restrict__ w, const uint8_t* __restrict__ bs, float scale, void* __restrict__ out, int N, int K) {
-    qmmf_m1_int6_coop_body<1, 4, false>(x, w, bs, scale, out, N, K);
+    qmmf_m1_int6_coop_body<2, 2, false>(x, w, bs, scale, out, N, K);
 }
-extern "C" __global__ void __launch_bounds__(128) tf_qmmf_m1_int6_1x4_f32(
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_m1_int6_2x2_f32(
     const __nv_bfloat16* x, const uint32_t* __restrict__ w, const uint8_t* __restrict__ bs, float scale, void* __restrict__ out, int N, int K) {
-    qmmf_m1_int6_coop_body<1, 4, true>(x, w, bs, scale, out, N, K);
+    qmmf_m1_int6_coop_body<2, 2, true>(x, w, bs, scale, out, N, K);
 }
 extern "C" __global__ void __launch_bounds__(256) tf_qmmf_m1_int6_1x8_bf16(
     const __nv_bfloat16* x, const uint32_t* __restrict__ w, const uint8_t* __restrict__ bs, float scale, void* __restrict__ out, int N, int K) {
@@ -4369,21 +4369,22 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    constexpr unsigned tile = 4;
+    constexpr unsigned tile = 8;
     __shared__ float4 keys[tile][32], queries[tile][32];
     __shared__ float values[tile][32];
     __shared__ float2 gate_beta[tile];
     const unsigned total = np + (unsigned)rows;
     for (unsigned base = 0; base < total; base += tile) {
-        const unsigned load_p = base + (unsigned)(tid >> 5);
-        if (load_p < total) {
+        for (unsigned slot = tid >> 5; slot < tile; slot += 4) {
+            const unsigned load_p = base + slot;
+            if (load_p >= total) break;
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
             const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
-            if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
-            keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
+            values[slot][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
+            if (vec == 0) gate_beta[slot] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
+            keys[slot][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
             if (load_p >= np) {
-                queries[tid >> 5][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
+                queries[slot][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
             }
         }
         __syncthreads();
@@ -10239,7 +10240,7 @@ patch_exact(
     bf11_s2: [2]Function = undefined, // Out (bf16/f32), BM=16 BN=64 STAGES=2 plain for BF11 (6 CTAs/SM)
     m1_int6: [2]Function = undefined, // Out (bf16/f32), M=1 1-warp GEMV
     m1_int6_4x1: [2]Function = undefined,
-    m1_int6_1x4: [2]Function = undefined,
+    m1_int6_2x2: [2]Function = undefined,
     m1_int6_1x8: [2]Function = undefined,
     m1_mxfp8: [2]Function = undefined, // Out (bf16/f32), M=1 1-warp GEMV
     m1_mxfp8_1x4: [2]Function = undefined,
@@ -10332,8 +10333,8 @@ patch_exact(
         l.m1_int6[1] = try mod.function("tf_qmmf_m1_int6_f32");
         l.m1_int6_4x1[0] = try mod.function("tf_qmmf_m1_int6_4x1_bf16");
         l.m1_int6_4x1[1] = try mod.function("tf_qmmf_m1_int6_4x1_f32");
-        l.m1_int6_1x4[0] = try mod.function("tf_qmmf_m1_int6_1x4_bf16");
-        l.m1_int6_1x4[1] = try mod.function("tf_qmmf_m1_int6_1x4_f32");
+        l.m1_int6_2x2[0] = try mod.function("tf_qmmf_m1_int6_2x2_bf16");
+        l.m1_int6_2x2[1] = try mod.function("tf_qmmf_m1_int6_2x2_f32");
         l.m1_int6_1x8[0] = try mod.function("tf_qmmf_m1_int6_1x8_bf16");
         l.m1_int6_1x8[1] = try mod.function("tf_qmmf_m1_int6_1x8_f32");
         l.m1_mxfp8[0] = try mod.function("tf_qmmf_m1_mxfp8_bf16");
@@ -10491,7 +10492,7 @@ patch_exact(
                 if (w.n < 512) {
                     try launch_.launch(l.m1_int6_1x8[oi], .{ .grid = .{ .x = @intCast(n8), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 }, .shared = 0, .pdl = l.pdl }, s, &ma);
                 } else if (w.n <= 4096) {
-                    try launch_.launch(l.m1_int6_1x4[oi], .{ .grid = .{ .x = @intCast(n8), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = 0, .pdl = l.pdl }, s, &ma);
+                    try launch_.launch(l.m1_int6_2x2[oi], .{ .grid = .{ .x = @intCast((n8 + 1) / 2), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = 0, .pdl = l.pdl }, s, &ma);
                 } else {
                     try launch_.launch(l.m1_int6_4x1[oi], .{ .grid = .{ .x = @intCast((n8 + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = 0, .pdl = l.pdl }, s, &ma);
                 }
