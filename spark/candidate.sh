@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t145"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1687,17 +1687,20 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
             float best_v = (lane == 0) ? po->rmax : -CUDART_INF_F;
             int best_c = (lane == 0) ? po->rcol : 0x7fffffff;
             float sub_old = 0.0f;
+            float logit_shift = 0.0f;
             int bad_new = 0;
             for (int k = lane; k < K; k += 32) {
                 const float nv = po->cand_new[k];
                 bad_new |= !isfinite(nv);
                 fn_mtp::better(best_v, best_c, nv, po->cand_col[k]);
                 sub_old += expf(po->cand_old[k] - gmax);
+                logit_shift += fminf(2.0f, fmaxf(-2.0f, nv - po->cand_old[k]));
             }
             const unsigned int any_bad = __ballot_sync(0xffffffffu, bad_new != 0);
             for (int o = 16; o; o >>= 1) {
                 fn_mtp::better(best_v, best_c, __shfl_xor_sync(0xffffffffu, best_v, o), __shfl_xor_sync(0xffffffffu, best_c, o));
                 sub_old += __shfl_xor_sync(0xffffffffu, sub_old, o);
+                logit_shift += __shfl_xor_sync(0xffffffffu, logit_shift, o);
             }
             const float new_max = __shfl_sync(0xffffffffu, best_v, 0);
             const float rest_sum = fmaxf(sgsum - sub_old, 0.0f) * expf(gmax - new_max);
@@ -1713,10 +1716,9 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
                     best_out[2] = 0.0f;
                     best_out[3] = 0.0f;
                 } else {
-                    // Convert both shortlist masses to the same logit origin before estimating the tail.
-                    const float old_mass = sub_old * expf(gmax - new_max);
-                    const float tail_scale = old_mass > 0.0f
-                        ? sqrtf(fminf(2.0f, fmaxf(0.5f, add_new / old_mass))) : 1.0f;
+                    // Infer a tail offset from the typical rescored token's logit shift.
+                    const float mean_shift = logit_shift / static_cast<float>(K);
+                    const float tail_scale = expf(0.5f * fminf(0.69314718f, fmaxf(-0.69314718f, mean_shift)));
                     const float tot_sum = fmaxf(rest_sum * tail_scale + add_new, 1.0f);
                     best_out[0] = new_max;
                     best_out[1] = new_max + logf(tot_sum);
