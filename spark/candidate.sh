@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t201"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -8167,8 +8167,9 @@ pub fn wantProj(prefix: []const u8) bool {
         // Keep fc_hidden in MXFP8 (30.6 dB vs 24.5 dB); all other MTP linears are 28.8-32.3 dB in INT6.
         return !std.mem.eql(u8, prefix, "language_model.mtp.fc_hidden");
     }
-    if (std.mem.eql(u8, m, "no_vh")) {
-        return !std.mem.eql(u8, prefix, "language_model.mtp.fc_hidden") and
+    if ((std.mem.eql(u8, m, "no_vh") or std.mem.eql(u8, m, "attention_mxfp8"))) {
+        const keep_attention = std.mem.eql(u8, m, "attention_mxfp8") and std.mem.endsWith(u8, prefix, ".self_attn");
+        return !keep_attention and !std.mem.eql(u8, prefix, "language_model.mtp.fc_hidden") and
             !std.mem.endsWith(u8, prefix, ".v_proj");
     }
     if (std.mem.eql(u8, m, "big_only") or std.mem.eql(u8, m, "big_hcd")) {
@@ -8205,7 +8206,7 @@ pub fn wantProj(prefix: []const u8) bool {
 pub fn wantHcDown(prefix: []const u8) bool {
     const m = mode();
     if (!std.mem.startsWith(u8, prefix, "language_model.mtp.")) return false;
-    if (std.mem.eql(u8, m, "1") or std.mem.eql(u8, m, "all") or std.mem.eql(u8, m, "no_hcup") or std.mem.eql(u8, m, "no_hc") or std.mem.eql(u8, m, "no_vh")) return true;
+    if (std.mem.eql(u8, m, "1") or std.mem.eql(u8, m, "all") or std.mem.eql(u8, m, "no_hcup") or std.mem.eql(u8, m, "no_hc") or (std.mem.eql(u8, m, "no_vh") or std.mem.eql(u8, m, "attention_mxfp8"))) return true;
     if (std.mem.eql(u8, m, "clean") or std.mem.eql(u8, m, "qo") or std.mem.eql(u8, m, "safe") or std.mem.eql(u8, m, "big_hcd")) {
         // Keep hyper_connection_mixer.down (crest=76.4) in MXFP8; attn_hc/mlp_hc.down are clean.
         return std.mem.startsWith(u8, prefix, "language_model.mtp.layers.0.");
@@ -8217,7 +8218,7 @@ pub fn wantHcUp(prefix: []const u8) bool {
     const m = mode();
     if (!std.mem.startsWith(u8, prefix, "language_model.mtp.")) return false;
     if (std.mem.eql(u8, m, "1") or std.mem.eql(u8, m, "all")) return true;
-    if (std.mem.eql(u8, m, "clean") or std.mem.eql(u8, m, "no_hcup") or std.mem.eql(u8, m, "no_vh")) {
+    if (std.mem.eql(u8, m, "clean") or std.mem.eql(u8, m, "no_hcup") or (std.mem.eql(u8, m, "no_vh") or std.mem.eql(u8, m, "attention_mxfp8"))) {
         // Keep mlp_hyper_connection.up (28.39 dB) and hyper_connection_mixer.up (29.06 dB) in MXFP8.
         return std.mem.indexOf(u8, prefix, ".attn_hyper_connection") != null;
     }
@@ -13759,7 +13760,7 @@ PY
     export TF_FLASHNEXT_W1_HOT_KTOP="${TF_FLASHNEXT_W1_HOT_KTOP:-32}"
     export TF_FLASHNEXT_W1_HOT_P="${TF_FLASHNEXT_W1_HOT_P:-0.90}"
     export TF_FLASHNEXT_W1_HOT_LOGIT="${TF_FLASHNEXT_W1_HOT_LOGIT:-0.0}"
-    export TF_FLASHNEXT_MTP_INT6="no_vh"
+    export TF_FLASHNEXT_MTP_INT6="attention_mxfp8"
     export TF_FLASHNEXT_MTP_SHARED_INT6="1"
     export TF_FLASHNEXT_HC_BF11="1"
     export TF_NVFP4_S5="${TF_NVFP4_S5:-1}"
