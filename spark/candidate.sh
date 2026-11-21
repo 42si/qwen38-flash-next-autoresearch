@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t113"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4340,6 +4340,32 @@ static __device__ __forceinline__ float4 gdn4t_ld256(const float4* p) {
 #endif
 }
 
+template <bool Add>
+static __device__ __forceinline__ float2 gdn_pair(float2 a, float2 b) {
+#if __CUDA_ARCH__ >= 1000
+    float2 r;
+    if constexpr (Add) {
+        asm("{ .reg .b64 x,y,z; mov.b64 x,{%2,%3}; mov.b64 y,{%4,%5}; "
+            "add.rn.f32x2 z,x,y; mov.b64 {%0,%1},z; }"
+            : "=f"(r.x), "=f"(r.y) : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y));
+    } else {
+        asm("{ .reg .b64 x,y,z; mov.b64 x,{%2,%3}; mov.b64 y,{%4,%5}; "
+            "mul.rn.f32x2 z,x,y; mov.b64 {%0,%1},z; }"
+            : "=f"(r.x), "=f"(r.y) : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y));
+    }
+    return r;
+#else
+    return Add ? make_float2(a.x + b.x, a.y + b.y) : make_float2(a.x * b.x, a.y * b.y);
+#endif
+}
+
+template <bool Add = false>
+static __device__ __forceinline__ float4 gdn_vec(float4 a, float4 b) {
+    const float2 lo = gdn_pair<Add>(make_float2(a.x, a.y), make_float2(b.x, b.y));
+    const float2 hi = gdn_pair<Add>(make_float2(a.z, a.w), make_float2(b.z, b.w));
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
 static __device__ __forceinline__ void gdn_rows_late_4t(
         const float* __restrict__ qn, const float* __restrict__ log, const unsigned* __restrict__ ctl, int log_rows,
         int store_above, float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
@@ -4389,8 +4415,9 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             k[j] = sk4[t4 + 4 * j];
-            h[j].x *= g; h[j].y *= g; h[j].z *= g; h[j].w *= g;
-            d[j] = ((h[j].x * k[j].x + h[j].y * k[j].y) + h[j].z * k[j].z) + h[j].w * k[j].w;
+            h[j] = gdn_vec(h[j], make_float4(g, g, g, g));
+            const float4 terms = gdn_vec(h[j], k[j]);
+            d[j] = ((terms.x + terms.y) + terms.z) + terms.w;
         }
         float s = ((d[0] + d[4]) + (d[2] + d[6])) + ((d[1] + d[5]) + (d[3] + d[7]));
         s = s + __shfl_xor_sync(0xffffffffu, s, 2);
@@ -4398,14 +4425,16 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         const float delta = (vv - s) * beta;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            h[j].x += k[j].x * delta; h[j].y += k[j].y * delta; h[j].z += k[j].z * delta; h[j].w += k[j].w * delta;
+            const float4 change = gdn_vec(k[j], make_float4(delta, delta, delta, delta));
+            h[j] = gdn_vec<true>(h[j], change);
         }
         if (p >= np) {
             float o[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const float4 q = sq4[t4 + 4 * j];
-                o[j] = ((h[j].x * q.x + h[j].y * q.y) + h[j].z * q.z) + h[j].w * q.w;
+                const float4 terms = gdn_vec(h[j], q);
+                o[j] = ((terms.x + terms.y) + terms.z) + terms.w;
             }
             float os = ((o[0] + o[4]) + (o[2] + o[6])) + ((o[1] + o[5]) + (o[3] + o[7]));
             os = os + __shfl_xor_sync(0xffffffffu, os, 2);
