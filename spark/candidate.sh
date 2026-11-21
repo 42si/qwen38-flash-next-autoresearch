@@ -13687,7 +13687,7 @@ PY
 case "$ACTION" in
   meta)
     cat <<EOF
-{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
+{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}+fastcores","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
 EOF
     ;;
 
@@ -13819,7 +13819,22 @@ PY
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
     fi
-    exec "$ENGINE_BIN" serve "$MODEL_DIR" \
+    # Keep CPU dispatch and embedding workers on the fastest available cluster.
+    exec python3 -c '
+import os
+import sys
+from pathlib import Path
+
+allowed = os.sched_getaffinity(0)
+cpu_root = Path("/sys/devices/system/cpu")
+max_khz = {
+    cpu: int((cpu_root / f"cpu{cpu}/cpufreq/cpuinfo_max_freq").read_text())
+    for cpu in allowed
+}
+fastest = max(max_khz.values())
+os.sched_setaffinity(0, {cpu for cpu in allowed if max_khz[cpu] == fastest})
+os.execv(sys.argv[1], sys.argv[1:])
+' "$ENGINE_BIN" serve "$MODEL_DIR" \
       --host 127.0.0.1 \
       --port "$PORT" \
       --name Qwen3.8-Flash-Next \
