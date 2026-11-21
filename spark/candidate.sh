@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t151"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4982,14 +4982,14 @@ static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
   const uint2 mm = __ldg(meta + midx);
-  uint32_t lo = 0u, hi = mm.x >> 8;
-  const uint32_t off = mm.y;
-  while (lo < hi) {
-    const uint32_t mid = (lo + hi) >> 1;
-    const uint32_t k = __ldg(esc + off + mid) >> 8;
-    if (k < key) lo = mid + 1u; else hi = mid;
+  const uint32_t count = mm.x >> 8;
+  for (uint32_t node = 0; node < count;) {
+    const uint32_t entry = __ldg(esc + mm.y + node);
+    const uint32_t pivot = entry >> 8;
+    if (key == pivot) return entry & 0xffu;
+    node = 2u * node + 1u + (key > pivot);
   }
-  return __ldg(esc + off + lo) & 0xFFu;
+  return 0u; // The packer inserts every key that is marked as an exception.
 }
 
 static __device__ __noinline__ uint32_t s5_fix4(
@@ -13187,6 +13187,22 @@ fn bestSmin(scales: []const u8) u8 {
     return best_s;
 }
 
+fn placeEscapeNode(dst: []u32, sorted: []const u32, node: usize, cursor: *usize) void {
+    if (node >= dst.len) return;
+    placeEscapeNode(dst, sorted, 2 * node + 1, cursor);
+    dst[node] = sorted[cursor.*];
+    cursor.* += 1;
+    placeEscapeNode(dst, sorted, 2 * node + 2, cursor);
+}
+
+fn arrangeEscapes(entries: []u32, alloc: std.mem.Allocator) !void {
+    if (entries.len < 2) return;
+    const sorted = try alloc.dupe(u32, entries);
+    defer alloc.free(sorted);
+    var cursor: usize = 0;
+    placeEscapeNode(entries, sorted, 0, &cursor);
+}
+
 pub fn packGateUpS5(
     out_bytes: []u8,
     g_codes: []const u8,
@@ -13259,6 +13275,8 @@ pub fn packGateUpS5(
             }
         }
     };
+    try arrangeEscapes(esc_g.items, alloc);
+    try arrangeEscapes(esc_u.items, alloc);
 }
 
 pub fn packDownS5(
@@ -13315,6 +13333,7 @@ pub fn packDownS5(
             }
         }
     }
+    try arrangeEscapes(esc_out.items, alloc);
     return smin;
 }
 
