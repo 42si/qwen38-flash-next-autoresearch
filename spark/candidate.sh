@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t111"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9763,7 +9763,25 @@ fn quantizeFp8ToNvfp4(lut: *const [256]f32, fp8_bytes: []const u8, blk_scales: [
                 const u = b & 0x7f;
                 if (u != 0x7f and u > m7) m7 = u;
             }
-            const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(lut[m7] * abs_bs * inv_global / 6.0, 0.0, 448.0));
+            const absmax_scale = std.math.clamp(lut[m7] * abs_bs * inv_global / 6.0, 0.0, 448.0);
+            const full = core.exlr8.codec.e4m3FromF32(absmax_scale);
+            const clipped = core.exlr8.codec.e4m3FromF32(absmax_scale * 0.875);
+            var sc_code = full;
+            if (full != clipped and clipped != 0 and abs_bs > 0) {
+                const levels = [_]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+                const full_step = lut[full] * global;
+                const clipped_step = lut[clipped] * global;
+                var full_err: f32 = 0;
+                var clipped_err: f32 = 0;
+                for (seg) |byte| {
+                    const w = lut[byte & 0x7f] * abs_bs;
+                    const diff_full = w - levels[e2m1(w / full_step) & 7] * full_step;
+                    const diff_clipped = w - levels[e2m1(w / clipped_step) & 7] * clipped_step;
+                    full_err += diff_full * diff_full;
+                    clipped_err += diff_clipped * diff_clipped;
+                }
+                if (clipped_err < full_err) sc_code = clipped;
+            }
             scales[r * kg16 + g] = sc_code;
             const denom = lut[sc_code] * global;
             const out_c = codes[r * (k / 2) + g * 8 ..][0..8];
@@ -13713,7 +13731,7 @@ PY
   start)
     export LD_LIBRARY_PATH="${RELEASE_LIB}:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
-    export TF_FLASHNEXT_MTP_W2="w1g64"
+    export TF_FLASHNEXT_MTP_W2="w1"
     export TF_FLASHNEXT_W1_CAL="1.15"
     export TF_FLASHNEXT_W1_KTOP="${TF_FLASHNEXT_W1_KTOP:-64}"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
