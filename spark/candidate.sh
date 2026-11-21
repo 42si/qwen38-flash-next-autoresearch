@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t182"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6990,6 +6990,8 @@ static __device__ __forceinline__ void route_topk_plan_impl(
 #endif
     __syncthreads();
 
+    int selected = -1;
+    float weight = 0.0f;
     if (warp < M) {
         const long long slice_stride = static_cast<long long>(M) * NL;
         const float* row0 = L + static_cast<long long>(warp) * NL;
@@ -7055,8 +7057,10 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         const int r_slots = shared ? (SLOTS - 1) : SLOTS;
         if (lane < r_slots) {
             if (lane < TOPK) {
+                selected = pick;
+                weight = __fdiv_rn(mine, total);
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
-                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
+                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(weight);
                 sh_pick[warp * SLOTS + lane] = pick;
                 if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
             } else {
@@ -7076,6 +7080,35 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         }
     }
     __syncthreads();
+
+    if (M > 1 && shared && E_PLAN == NE && TOPK == 10) {
+        if (warp < M) {
+            const bool singleton = lane >= 6 && lane < TOPK &&
+                                   selected >= 0 && selected < NE && sh_cnt[selected] == 1;
+            float tail = singleton ? weight : 0.0f;
+            // Only the four tail ranks can carry singleton mass.
+            tail += __shfl_down_sync(0xffffffffu, tail, 1);
+            tail += __shfl_down_sync(0xffffffffu, tail, 2);
+            const bool eligible = singleton && tail <= 0.08f;
+            const unsigned eligible_mask = __ballot_sync(0xffffffffu, eligible);
+            const bool drop = eligible && __popc(eligible_mask) >= 2;
+            const unsigned dropped = __ballot_sync(0xffffffffu, drop);
+            const int first = dropped ? __ffs(dropped) - 1 : 0;
+            const float dropped_suffix = __shfl_sync(0xffffffffu, tail, first);
+            const float removed = dropped ? dropped_suffix : 0.0f;
+            const int slot = warp * SLOTS + lane;
+            if (drop) {
+                // This expert has exactly one reader. NE is the plan's existing unused-slot sentinel.
+                sh_cnt[selected] = 0;
+                sh_pick[slot] = NE;
+                PICK[slot] = NE;
+                WTS[slot] = 0.0f;
+            } else if (lane < TOPK && removed > 0.0f) {
+                WTS[slot] = rbf(__fdiv_rn(weight, 1.0f - removed));
+            }
+        }
+        __syncthreads();
+    }
 
     const int c = (tid < E_PLAN) ? sh_cnt[tid] : 0;
     const int tiles = (c + T - 1) / T;
