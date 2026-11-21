@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t142"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -310,7 +310,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
-        const uint4* bp = WS + static_cast<size_t>(blk) * 720;
+        const uint4* bp = WS + static_cast<size_t>(blk) * 752;
         auto ld4_256 = [](const uint4* p) -> uint4 {
             uint4 v;
 #if __CUDA_ARCH__ >= 900
@@ -386,7 +386,14 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                 s4 = ns4;
             }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        float acc = (acc0 + acc1) * __ldg(G + row);
+        const uint4 packed = ld4_256(bp + 720 + lane);
+        const uint32_t corrections[4] = {packed.x, packed.y, packed.z, packed.w};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t v = corrections[k];
+            acc = fmaf(__uint_as_float(v & 0xffff0000u), __uint_as_float(sxu[v & 0xffffu]), acc);
+        }
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -784,7 +791,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
-        const uint4* bp = WS + static_cast<size_t>(blk) * 720;
+        const uint4* bp = WS + static_cast<size_t>(blk) * 752;
         auto ld4_256 = [](const uint4* p) -> uint4 {
             uint4 v;
 #if __CUDA_ARCH__ >= 900
@@ -856,7 +863,14 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
             }
             if (g4 + 1 < 10) { wa = nwa; wb = nwb; s4 = ns4; }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        float acc = (acc0 + acc1) * __ldg(G + row);
+        const uint4 packed = ld4_256(bp + 720 + lane);
+        const uint32_t corrections[4] = {packed.x, packed.y, packed.z, packed.w};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t v = corrections[k];
+            acc = fmaf(__uint_as_float(v & 0xffff0000u), __uint_as_float(sxu[v & 0xffffu]), acc);
+        }
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -9365,8 +9379,26 @@ const W1PackCtx = struct {
                 // Match the row-specific RMS loss, relative to the Gaussian sign-quantizer ratio.
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
                 ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
+                // Keep the largest omitted weight component in each quarter of the row.
+                for (0..4) |quarter| {
+                    var correction: f32 = 0.0;
+                    var channel: u32 = 0;
+                    for (quarter * 640..(quarter + 1) * 640) |i| {
+                        const bits = std.mem.readInt(u16, rb[i * 2 ..][0..2], .little);
+                        const w: f32 = @bitCast(@as(u32, bits) << 16);
+                        const scale = g_scales[i / 64];
+                        const residual = w - (if (w < 0) -scale else scale);
+                        if (@abs(residual) > @abs(correction)) {
+                            correction = residual;
+                            channel = @intCast(i);
+                        }
+                    }
+                    const scaled: u32 = @bitCast(correction * ctx.cal * adjust);
+                    const rounded = scaled +% (0x7fff + ((scaled >> 16) & 1));
+                    ctx.ws[(blk * 752 + 720 + lane) * 4 + quarter] = (rounded & 0xffff0000) | channel;
+                }
                 for (0..10) |g4| {
-                    const base_u4 = blk * 720 + g4 * 72;
+                    const base_u4 = blk * 752 + g4 * 72;
                     const idx_a = (base_u4 + lane) * 4;
                     ctx.ws[idx_a + 0] = g_w0[g4 * 4 + 0];
                     ctx.ws[idx_a + 1] = g_w1[g4 * 4 + 0];
@@ -9474,7 +9506,7 @@ pub const W2 = struct {
         if (is_w1g64 or is_w1g32) {
             const cal: f32 = if (std.c.getenv("TF_FLASHNEXT_W1_CAL")) |cv| (std.fmt.parseFloat(f32, std.mem.span(cv)) catch 1.15) else 1.15;
             const k_top_v: c_int = if (std.c.getenv("TF_FLASHNEXT_W1_KTOP")) |kv| (std.fmt.parseInt(c_int, std.mem.span(kv), 10) catch 64) else 64;
-            const u4_per_blk: usize = if (is_w1g64) 720 else 800;
+            const u4_per_blk: usize = if (is_w1g64) 752 else 800;
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
