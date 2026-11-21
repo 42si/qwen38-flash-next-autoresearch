@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t104"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -289,6 +289,16 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g32_gemv_fused(
     }
 }
 
+// With the unnormalized weight transform, H/8 on activations preserves the dot product.
+__device__ __forceinline__ float w1_hadamard8(float value, int tid) {
+#pragma unroll
+    for (int stride = 1; stride <= 4; stride <<= 1) {
+        const float peer = __shfl_xor_sync(0xffffffffu, value, stride);
+        value = (tid & stride) ? (peer - value) : (value + peer);
+    }
+    return value * 0.125f;
+}
+
 extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     const __nv_bfloat16* X,
     const uint4* __restrict__ WS,
@@ -302,7 +312,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        sxu[i] = __float_as_uint(w1_hadamard8(__bfloat162float(X[i]), tid));
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -775,7 +785,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        sxu[i] = __float_as_uint(w1_hadamard8(__bfloat162float(X[i]), tid));
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -9330,17 +9340,36 @@ const W1PackCtx = struct {
                     var sum_abs: f32 = 0.0;
                     var w0: u32 = 0;
                     var w1: u32 = 0;
-                    for (0..32) |j| {
-                        const bits = std.mem.readInt(u16, rb[(g * 64 + j) * 2 ..][0..2], .little);
-                        const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
-                        if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
-                    }
-                    for (0..32) |j| {
-                        const bits = std.mem.readInt(u16, rb[(g * 64 + 32 + j) * 2 ..][0..2], .little);
-                        const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
-                        if (f < 0.0) w1 |= @as(u32, 1) << @intCast(j);
+                    // Encode each eight-channel group in the same Hadamard basis
+                    // used by the binary projection. Its BF16 rescorer uses the original weights.
+                    for (0..8) |tile| {
+                        var coeff: [8]f32 = undefined;
+                        for (&coeff, 0..) |*value, j| {
+                            const idx = (g * 64 + tile * 8 + j) * 2;
+                            const bits = std.mem.readInt(u16, rb[idx..][0..2], .little);
+                            value.* = @bitCast(@as(u32, bits) << 16);
+                        }
+                        inline for (.{ 1, 2, 4 }) |stride| {
+                            for (0..8) |j| {
+                                if ((j & stride) != 0) continue;
+                                const lo_val = coeff[j];
+                                const hi_val = coeff[j + stride];
+                                coeff[j] = lo_val + hi_val;
+                                coeff[j + stride] = lo_val - hi_val;
+                            }
+                        }
+                        for (coeff, 0..) |value, j| {
+                            const k = tile * 8 + j;
+                            sum_abs += @abs(value);
+                            if (value < 0.0) {
+                                const mask = @as(u32, 1) << @intCast(k % 32);
+                                if (k < 32) {
+                                    w0 |= mask;
+                                } else {
+                                    w1 |= mask;
+                                }
+                            }
+                        }
                     }
                     const s = sum_abs / 64.0;
                     g_scales[g] = s;
