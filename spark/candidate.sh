@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t86"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -3405,6 +3405,7 @@ __device__ __forceinline__ void qmmf_m1_int6_coop_body(
     float acc = 0.0f;
     if (active) {
         for (int g = wk; g < KG; g += NW_K) {
+            const uint32_t activation_pair = __ldg(reinterpret_cast<const uint32_t*>(x + g * 64) + lane);
             uint32_t nw0, nw1, nw2;
             uint16_t ns_cur;
             if (g + NW_K < KG) {
@@ -3428,9 +3429,9 @@ __device__ __forceinline__ void qmmf_m1_int6_coop_body(
                     const float q1 = __uint_as_float(0x43000000u | ((((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4)) << 16)) - 159.5f;
                     const float q2 = __uint_as_float(0x43000000u | ((((lo4 >> 8) & 0xFu) | (((hi2 >> 4) & 0x3u) << 4)) << 16)) - 159.5f;
                     const float q3 = __uint_as_float(0x43000000u | ((((lo4 >> 12) & 0xFu) | (((hi2 >> 6) & 0x3u) << 4)) << 16)) - 159.5f;
-                    const int k0 = g * 64 + kt * 16 + sub * 2;
-                    const uint32_t xv0 = __ldg(reinterpret_cast<const uint32_t*>(x + k0));
-                    const uint32_t xv1 = __ldg(reinterpret_cast<const uint32_t*>(x + k0 + 8));
+                    const int src = kt * 8 + sub;
+                    const uint32_t xv0 = __shfl_sync(0xffffffffu, activation_pair, src);
+                    const uint32_t xv1 = __shfl_sync(0xffffffffu, activation_pair, src + 4);
                     d = fmaf(q0, __uint_as_float((xv0 & 0xFFFFu) << 16), d);
                     d = fmaf(q1, __uint_as_float(xv0 & 0xFFFF0000u), d);
                     d = fmaf(q2, __uint_as_float((xv1 & 0xFFFFu) << 16), d);
@@ -3485,6 +3486,7 @@ __device__ __forceinline__ void qmmf_m1_mxfp8_coop_body(
     float acc = 0.0f;
     if (active) {
         for (int g = warp; g < KG; g += NW_K) {
+            const uint32_t activation_pair = __ldg(reinterpret_cast<const uint32_t*>(x + g * 64) + lane);
             uint4 nwq; uint16_t ns_cur;
             if (g + NW_K < KG) {
                 nwq = m1_ld4_256(w + (t_base + g + NW_K) * 256 + jj * 32 + lane);
@@ -3501,9 +3503,9 @@ __device__ __forceinline__ void qmmf_m1_mxfp8_coop_body(
                     const uint32_t wd = words[kt];
                     const uint32_t b0 = fp8pair(wd & 0xFFFFu);
                     const uint32_t b1 = fp8pair(wd >> 16);
-                    const int k0 = g * 64 + kt * 16 + sub * 2;
-                    const uint32_t xv0 = __ldg(reinterpret_cast<const uint32_t*>(x + k0));
-                    const uint32_t xv1 = __ldg(reinterpret_cast<const uint32_t*>(x + k0 + 8));
+                    const int src = kt * 8 + sub;
+                    const uint32_t xv0 = __shfl_sync(0xffffffffu, activation_pair, src);
+                    const uint32_t xv1 = __shfl_sync(0xffffffffu, activation_pair, src + 4);
                     d = fmaf(__uint_as_float((b0 & 0xFFFFu) << 16), __uint_as_float((xv0 & 0xFFFFu) << 16), d);
                     d = fmaf(__uint_as_float(b0 & 0xFFFF0000u),     __uint_as_float(xv0 & 0xFFFF0000u), d);
                     d = fmaf(__uint_as_float((b1 & 0xFFFFu) << 16), __uint_as_float((xv1 & 0xFFFFu) << 16), d);
