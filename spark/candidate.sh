@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t155"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6990,6 +6990,8 @@ static __device__ __forceinline__ void route_topk_plan_impl(
 #endif
     __syncthreads();
 
+    int selected = -1;
+    float weight = 0.0f;
     if (warp < M) {
         const long long slice_stride = static_cast<long long>(M) * NL;
         const float* row0 = L + static_cast<long long>(warp) * NL;
@@ -7055,10 +7057,16 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         const int r_slots = shared ? (SLOTS - 1) : SLOTS;
         if (lane < r_slots) {
             if (lane < TOPK) {
+                selected = pick;
+                weight = __fdiv_rn(mine, total);
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
-                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
+                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(weight);
                 sh_pick[warp * SLOTS + lane] = pick;
-                if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
+                if (pick >= 0 && pick < E_PLAN) {
+                    const bool eligible = M > 1 && shared && E_PLAN == NE && TOPK == 10 &&
+                                          lane == 9 && weight <= 0.08f;
+                    atomicAdd(&sh_cnt[pick], 1 + (eligible ? 1024 : 0));
+                }
             } else {
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = NE;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = 0.0f;
@@ -7077,7 +7085,23 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     }
     __syncthreads();
 
-    const int c = (tid < E_PLAN) ? sh_cnt[tid] : 0;
+    // The low ten bits count uses. Only one eligible last-ranked use encodes 1025.
+    if (M > 1 && shared && E_PLAN == NE && TOPK == 10 && warp < M) {
+        const bool omit = lane == 9 && selected >= 0 && selected < NE && sh_cnt[selected] == 1025;
+        const float removed = __shfl_sync(0xffffffffu, omit ? weight : -1.0f, 9);
+        if (lane < TOPK && removed >= 0.0f) {
+            const int slot = warp * SLOTS + lane;
+            if (omit) {
+                PICK[slot] = NE;
+                WTS[slot] = 0.0f;
+                sh_pick[slot] = NE;
+            } else {
+                WTS[slot] = rbf(__fdiv_rn(weight, 1.0f - removed));
+            }
+        }
+    }
+    const int tagged = (tid < E_PLAN) ? sh_cnt[tid] : 0;
+    const int c = tagged == 1025 ? 0 : (tagged & 1023);
     const int tiles = (c + T - 1) / T;
     const int rem = c > 0 ? (c - T * (tiles - 1)) : 0;
     const int b0 = (c > 0 && T > 8) ? ((tiles - 1) + (rem > 8 ? 1 : 0)) : 0;
