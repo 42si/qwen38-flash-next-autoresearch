@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t161"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -289,6 +289,18 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g32_gemv_fused(
     }
 }
 
+static __device__ __forceinline__ float2 w1_add_pair(float2 acc, float a, float b) {
+#if __CUDA_ARCH__ >= 1000
+    float2 r;
+    asm("{ .reg .b64 x,y,z; mov.b64 x,{%2,%3}; mov.b64 y,{%4,%5}; "
+        "add.rn.f32x2 z,x,y; mov.b64 {%0,%1},z; }"
+        : "=f"(r.x), "=f"(r.y) : "f"(acc.x), "f"(acc.y), "f"(a), "f"(b));
+    return r;
+#else
+    return make_float2(acc.x + a, acc.y + b);
+#endif
+}
+
 extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     const __nv_bfloat16* X,
     const uint4* __restrict__ WS,
@@ -362,21 +374,22 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             for (int q = 0; q < 4; ++q) {
                 const uint32_t* xg = sxu + (g4 * 4 + q) * 64;
                 const uint32_t w0 = wlo[q], w1 = whi[q];
-                float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+                float2 even = make_float2(0.0f, 0.0f), odd = make_float2(0.0f, 0.0f);
                 #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[j + 0] ^ ((w0 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[j + 1] ^ ((w0 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[j + 2] ^ ((w0 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[j + 3] ^ ((w0 << (31 - (j + 3))) & 0x80000000u));
+                for (int half = 0; half < 2; ++half) {
+                    const uint32_t bits = half ? w1 : w0;
+                    const uint32_t* x = xg + half * 32;
+                    #pragma unroll
+                    for (int j = 0; j < 32; j += 4) {
+                        const uint32_t m0 = (bits << (31 - j)) & 0x80000000u;
+                        const uint32_t m1 = (bits << (30 - j)) & 0x80000000u;
+                        const uint32_t m2 = (bits << (29 - j)) & 0x80000000u;
+                        const uint32_t m3 = (bits << (28 - j)) & 0x80000000u;
+                        even = w1_add_pair(even, __uint_as_float(x[j] ^ m0), __uint_as_float(x[j+1] ^ m1));
+                        odd = w1_add_pair(odd, __uint_as_float(x[j+2] ^ m2), __uint_as_float(x[j+3] ^ m3));
+                    }
                 }
-                #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[32 + j + 0] ^ ((w1 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[32 + j + 1] ^ ((w1 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
-                }
+                const float d0 = even.x, d1 = even.y, d2 = odd.x, d3 = odd.y;
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
             }
