@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t77"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -299,10 +299,17 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
-    __shared__ uint32_t sxu[2560];
+    // All rows in a block share the input. Precompute the sixteen signed
+    // sums for each four BF16 activations, indexed by their weight bits.
+    __shared__ float signed_sum[640][16];
     const int tid = threadIdx.x;
-    for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+    for (int i = tid; i < 640 * 16; i += 128) {
+        const int group = i >> 4, mask = i & 15;
+        const __nv_bfloat16* x = X + group * 4;
+        const float a = __bfloat162float(x[0]), b = __bfloat162float(x[1]);
+        const float c = __bfloat162float(x[2]), d = __bfloat162float(x[3]);
+        signed_sum[group][mask] = ((mask & 1 ? -a : a) + (mask & 2 ? -b : b))
+                                + ((mask & 4 ? -c : c) + (mask & 8 ? -d : d));
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
@@ -360,22 +367,14 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             const uint32_t whi[4] = {wa.y, wa.w, wb.y, wb.w};
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                const uint32_t* xg = sxu + (g4 * 4 + q) * 64;
-                const uint32_t w0 = wlo[q], w1 = whi[q];
+                const int group = (g4 * 4 + q) * 16;
                 float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
                 #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[j + 0] ^ ((w0 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[j + 1] ^ ((w0 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[j + 2] ^ ((w0 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[j + 3] ^ ((w0 << (31 - (j + 3))) & 0x80000000u));
-                }
-                #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[32 + j + 0] ^ ((w1 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[32 + j + 1] ^ ((w1 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
+                for (int j = 0; j < 8; j += 2) {
+                    d0 += signed_sum[group + j][(wlo[q] >> (4 * j)) & 15u];
+                    d1 += signed_sum[group + j + 1][(wlo[q] >> (4 * (j + 1))) & 15u];
+                    d2 += signed_sum[group + 8 + j][(whi[q] >> (4 * j)) & 15u];
+                    d3 += signed_sum[group + 9 + j][(whi[q] >> (4 * (j + 1))) & 15u];
                 }
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
