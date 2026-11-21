@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t208"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -301,10 +301,18 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
 #endif
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float partial = 0.0f;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float x = __bfloat162float(X[i]);
+        sxu[i] = __float_as_uint(x);
+        partial += x;
     }
+    for (int offset = 16; offset; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
     __syncthreads();
+    const float activation_sum = (warp_sums[0] + warp_sums[1]) + (warp_sums[2] + warp_sums[3]);
     const int warp = tid >> 5, lane = tid & 31;
     const int blk = blockIdx.x * 4 + warp;
     const int row = blk * 32 + lane;
@@ -386,7 +394,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                 s4 = ns4;
             }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const float2 correction = __ldg(reinterpret_cast<const float2*>(G) + row);
+        const float acc = fmaf(correction.y, activation_sum, (acc0 + acc1) * correction.x);
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -774,10 +783,18 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     }
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float partial = 0.0f;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float x = __bfloat162float(X[i]);
+        sxu[i] = __float_as_uint(x);
+        partial += x;
     }
+    for (int offset = 16; offset; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
     __syncthreads();
+    const float activation_sum = (warp_sums[0] + warp_sums[1]) + (warp_sums[2] + warp_sums[3]);
     const int warp = tid >> 5, lane = tid & 31;
     const int bidx = blk_offset + blockIdx.x;
     const int blk = bidx * 4 + warp;
@@ -856,7 +873,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
             }
             if (g4 + 1 < 10) { wa = nwa; wb = nwb; s4 = ns4; }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const float2 correction = __ldg(reinterpret_cast<const float2*>(G) + row);
+        const float acc = fmaf(correction.y, activation_sum, (acc0 + acc1) * correction.x);
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -9334,6 +9352,7 @@ const W1PackCtx = struct {
                 var g_w1: [40]u32 = undefined;
                 var rmax: f32 = 0.0;
                 var weight_energy: f32 = 0.0;
+                var row_sum: f32 = 0.0;
                 var binary_energy: f32 = 0.0;
                 for (0..40) |g| {
                     var sum_abs: f32 = 0.0;
@@ -9344,6 +9363,7 @@ const W1PackCtx = struct {
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
                         weight_energy += f * f;
+                        row_sum += f;
                         if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
                     }
                     for (0..32) |j| {
@@ -9351,6 +9371,7 @@ const W1PackCtx = struct {
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
                         weight_energy += f * f;
+                        row_sum += f;
                         if (f < 0.0) w1 |= @as(u32, 1) << @intCast(j);
                     }
                     const s = sum_abs / 64.0;
@@ -9364,7 +9385,16 @@ const W1PackCtx = struct {
                 const inv_gsc: f32 = 1.0 / gsc;
                 // Match the row-specific RMS loss, relative to the Gaussian sign-quantizer ratio.
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
-                ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
+                const gain = gsc * ctx.cal * adjust;
+                var reconstructed_sum: f32 = 0;
+                for (0..40) |g| {
+                    const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(g_scales[g] * inv_gsc, 0.0, 448.0));
+                    const negatives = @as(i32, @popCount(g_w0[g])) + @as(i32, @popCount(g_w1[g]));
+                    const balance: f32 = @floatFromInt(64 - 2 * negatives);
+                    reconstructed_sum += balance * core.exlr8.codec.e4m3Value(sc_code) * gain;
+                }
+                ctx.globals[2 * r] = gain;
+                ctx.globals[2 * r + 1] = (row_sum - reconstructed_sum) / @as(f32, @floatFromInt(wt.dims));
                 for (0..10) |g4| {
                     const base_u4 = blk * 720 + g4 * 72;
                     const idx_a = (base_u4 + lane) * 4;
@@ -9478,7 +9508,7 @@ pub const W2 = struct {
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
-            const globals_host = try gpa.alloc(f32, nb * 32);
+            const globals_host = try gpa.alloc(f32, nb * @as(usize, if (is_w1g64) 64 else 32));
             defer gpa.free(globals_host);
             @memset(globals_host, 0.0);
 
