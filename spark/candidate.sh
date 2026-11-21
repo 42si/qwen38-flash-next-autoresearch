@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t112"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6966,7 +6966,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     __shared__ int sh_off[512];
     __shared__ int sh_pick[32 * 12];
     __shared__ uint64_t wsum[3][16];
-    if (tid < E_PLAN) sh_cnt[tid] = 0;
+    if (blockDim.x != 32 && tid < E_PLAN) sh_cnt[tid] = 0;
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
@@ -7040,7 +7040,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
                 sh_pick[warp * SLOTS + lane] = pick;
-                if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
+                if (blockDim.x != 32 && pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
             } else {
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = NE;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = 0.0f;
@@ -7055,6 +7055,36 @@ static __device__ __forceinline__ void route_topk_plan_impl(
             WTS[static_cast<long long>(warp) * SLOTS + s_slot] = rbf(tf_sigmoid(rbf(sg)));
             sh_pick[warp * SLOTS + s_slot] = NE;
             if (NE < E_PLAN) atomicAdd(&sh_cnt[NE], 1);
+        }
+        if (blockDim.x == 32) {
+            // A single row fits each expert in one tile. Match identical picks
+            // before writing, including any invalid or repeated router entries.
+            const unsigned full_mask = 0xffffffffu;
+            const int expert = lane < TOPK && pick >= 0 && pick < E_PLAN ? pick : -1;
+            const unsigned peers = __match_any_sync(full_mask, expert);
+            const int n = __popc(peers), leader = __ffs(peers) - 1;
+            const int bucket = T <= 8 ? 1 : (n > 8 ? 0 : (n > 2 ? 1 : (n == 2 ? 2 : 3)));
+            const bool emit = expert >= 0 && leader == lane;
+            const unsigned emit_mask = __ballot_sync(full_mask, emit);
+            int member_offset = 0, item_index = 0;
+            for (int i = 0; i < TOPK; ++i) {
+                const int other = __shfl_sync(full_mask, expert, i);
+                const int other_bucket = __shfl_sync(full_mask, bucket, i);
+                member_offset += other >= 0 && other < expert;
+                item_index += ((emit_mask >> i) & 1u) &&
+                    (other_bucket < bucket || (other_bucket == bucket && other < expert));
+            }
+            if (expert >= 0) members[member_offset + __popc(peers & ((1u << lane) - 1))] = lane;
+            if (emit) {
+                items[3 * item_index] = expert;
+                items[3 * item_index + 1] = member_offset;
+                items[3 * item_index + 2] = n;
+            }
+            if (lane == 0) counts[0] = counts[1] = __popc(emit_mask);
+#if __CUDA_ARCH__ >= 900
+            asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+            return;
         }
     }
     __syncthreads();
@@ -12380,7 +12410,8 @@ patch_exact(
         a.add(l);
         for ([_]usize{ ld, experts, top_k, rows, slots, @intFromBool(shared), e_plan, tile, rsk }) |v| a.add(@as(i32, @intCast(v)));
         for ([_]u64{ picks, wts, members, items, counts }) |p| a.add(p);
-        const blk: u32 = if (rows <= 16) 512 else 1024;
+        const solo = rows == 1 and e_plan == experts and tile >= slots;
+        const blk: u32 = if (solo) 32 else if (rows <= 16) 512 else 1024;
         const f = if (rows <= 16) g.topk_plan_512_fn else g.topk_plan_fn;
         try launch_.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = blk }, .pdl = true }, s, &a);
     }
