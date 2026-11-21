@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t130"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4369,21 +4369,22 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    constexpr unsigned tile = 4;
+    constexpr unsigned tile = 8;
     __shared__ float4 keys[tile][32], queries[tile][32];
     __shared__ float values[tile][32];
     __shared__ float2 gate_beta[tile];
     const unsigned total = np + (unsigned)rows;
     for (unsigned base = 0; base < total; base += tile) {
-        const unsigned load_p = base + (unsigned)(tid >> 5);
-        if (load_p < total) {
+        for (unsigned slot = tid >> 5; slot < tile; slot += 4) {
+            const unsigned load_p = base + slot;
+            if (load_p >= total) break;
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
             const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
-            if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
-            keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
+            values[slot][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
+            if (vec == 0) gate_beta[slot] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
+            keys[slot][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
             if (load_p >= np) {
-                queries[tid >> 5][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
+                queries[slot][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
             }
         }
         __syncthreads();
@@ -7019,14 +7020,11 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         float top = 0.0f, my_bv = -INFINITY;
         int pick = 0;
         for (int k = 0; k < TOPK; ++k) {
-            float bv = cur_v;
-            int bi = cur_i;
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-            }
+            const uint32_t bits = __float_as_uint(cur_v == 0.0f ? 0.0f : cur_v);
+            const uint32_t ordered = bits ^ (bits >> 31 ? 0xffffffffu : 0x80000000u);
+            const uint32_t peak = __reduce_max_sync(0xffffffffu, ordered);
+            const int bi = __reduce_min_sync(0xffffffffu, ordered == peak ? cur_i : 0x7fffffff);
+            const float bv = __uint_as_float(peak ^ (peak >> 31 ? 0x80000000u : 0xffffffffu));
             if (k == 0) top = bv;
             if (lane == k) { my_bv = bv; pick = bi; }
             if (cur_i == bi && k + 1 < TOPK) {
