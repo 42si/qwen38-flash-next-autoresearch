@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t163"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1367,8 +1367,6 @@ struct W2PickOut {
     float cand_new[64];
     float gmax;
     float gsum;
-    float rmax;
-    int rcol;
     int K;
     unsigned int done_cnt;
 };
@@ -1390,7 +1388,6 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
 #endif
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     __shared__ float sv[32], ss[32];
-    __shared__ int si[32];
     __shared__ uint32_t wcnt[32];
     __shared__ int act_blk[1024];
     __shared__ float sgmax, sgsum;
@@ -1472,14 +1469,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
     }
     const uint32_t blk_cut = lo;
-    float rmax = -CUDART_INF_F;
-    int rcol = 0x7fffffff;
-    if (t < n_blocks) {
-        if (my_ord >= blk_cut) {
-            act_blk[atomicAdd(&n_act_blk, 1u)] = t;
-        } else {
-            fn_mtp::better(rmax, rcol, my_st.x, __float_as_int(my_st.z));
-        }
+    if (t < n_blocks && my_ord >= blk_cut) {
+        act_blk[atomicAdd(&n_act_blk, 1u)] = t;
     }
     __syncthreads();
 
@@ -1502,8 +1493,6 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                 } else {
                     ovf = 1;
                 }
-            } else {
-                fn_mtp::better(rmax, rcol, __uint_as_float(static_cast<uint32_t>(u) << 16), i);
             }
         }
     }
@@ -1568,11 +1557,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                 if (slot < k_lim) {
                     po->cand_col[slot] = i;
                     po->cand_old[slot] = v;
-                } else {
-                    fn_mtp::better(rmax, rcol, v, i);
                 }
-            } else {
-                fn_mtp::better(rmax, rcol, v, i);
             }
         }
     } else {
@@ -1589,43 +1574,27 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                     if (slot < k_lim) {
                         po->cand_col[slot] = i;
                         po->cand_old[slot] = v;
-                    } else {
-                        fn_mtp::better(rmax, rcol, v, i);
                     }
-                } else {
-                    fn_mtp::better(rmax, rcol, v, i);
                 }
             }
         }
     }
-    for (int o = 16; o; o >>= 1) {
-        fn_mtp::better(rmax, rcol, __shfl_xor_sync(0xffffffffu, rmax, o), __shfl_xor_sync(0xffffffffu, rcol, o));
-    }
-    if (lane == 0) {
-        sv[warp] = rmax;
-        si[warp] = rcol;
-    }
     __syncthreads();
-    if (warp == 0) {
-        rmax = sv[lane];
-        rcol = si[lane];
-        for (int o = 16; o; o >>= 1) {
-            fn_mtp::better(rmax, rcol, __shfl_xor_sync(0xffffffffu, rmax, o), __shfl_xor_sync(0xffffffffu, rcol, o));
-        }
-        if (lane == 0) {
-            const int K = static_cast<int>(min(n_cand, k_lim));
-            po->gmax = gmax;
-            po->gsum = sgsum;
-            po->rmax = rmax;
-            po->rcol = rcol;
-            po->K = K;
-            if (K == 0) {
-                const float tot_sum = fmaxf(sgsum * expf(gmax - rmax), 1.0f);
-                best_out[0] = rmax;
-                best_out[1] = rmax + logf(tot_sum);
-                best_out[2] = __int_as_float(rcol);
-                best_out[3] = 0.0f;
+    if (t == 0) {
+        po->gmax = gmax;
+        po->gsum = sgsum;
+        po->K = static_cast<int>(min(n_cand, k_lim));
+        if (!po->K) {
+            float peak = -CUDART_INF_F;
+            int col = 0x7fffffff;
+            for (int i = 0; i < n_blocks; ++i) {
+                const float4 block = stats[i];
+                fn_mtp::better(peak, col, block.x, __float_as_int(block.z));
             }
+            best_out[0] = peak;
+            best_out[1] = peak + logf(fmaxf(sgsum, 1.0f));
+            best_out[2] = __int_as_float(col);
+            best_out[3] = 0.0f;
         }
     }
 #if __CUDA_ARCH__ >= 900
@@ -1684,8 +1653,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
         if (s_is_last && warp == 0) {
             const float gmax = po->gmax;
             const float sgsum = po->gsum;
-            float best_v = (lane == 0) ? po->rmax : -CUDART_INF_F;
-            int best_c = (lane == 0) ? po->rcol : 0x7fffffff;
+            float best_v = -CUDART_INF_F;
+            int best_c = 0x7fffffff;
             float sub_old = 0.0f;
             int bad_new = 0;
             for (int k = lane; k < K; k += 32) {
@@ -1700,7 +1669,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
                 sub_old += __shfl_xor_sync(0xffffffffu, sub_old, o);
             }
             const float new_max = __shfl_sync(0xffffffffu, best_v, 0);
-            const float rest_sum = fmaxf(sgsum - sub_old, 0.0f) * expf(gmax - new_max);
+            const float rest_sum = fmaxf(sgsum - sub_old, 0.0f);
             float add_new = 0.0f;
             for (int k = lane; k < K; k += 32) {
                 add_new += expf(po->cand_new[k] - new_max);
@@ -1713,13 +1682,16 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
                     best_out[2] = 0.0f;
                     best_out[3] = 0.0f;
                 } else {
-                    // Convert both shortlist masses to the same logit origin before estimating the tail.
-                    const float old_mass = sub_old * expf(gmax - new_max);
-                    const float tail_scale = old_mass > 0.0f
-                        ? sqrtf(fminf(2.0f, fmaxf(0.5f, add_new / old_mass))) : 1.0f;
-                    const float tot_sum = fmaxf(rest_sum * tail_scale + add_new, 1.0f);
+                    const float log_short = new_max + logf(add_new);
+                    float log_total = log_short;
+                    if (rest_sum > 0.0f) {
+                        const float log_old = gmax + logf(sub_old);
+                        const float log_scale = 0.5f * fminf(0.69314718f, fmaxf(-0.69314718f, log_short - log_old));
+                        const float log_tail = gmax + logf(rest_sum) + log_scale;
+                        log_total = fmaxf(log_short, log_tail) + log1pf(expf(-fabsf(log_short - log_tail)));
+                    }
                     best_out[0] = new_max;
-                    best_out[1] = new_max + logf(tot_sum);
+                    best_out[1] = log_total;
                     best_out[2] = __int_as_float(best_c);
                     best_out[3] = 0.0f;
                 }
