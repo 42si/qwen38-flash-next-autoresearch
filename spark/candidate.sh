@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t200"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13681,6 +13681,16 @@ patch_exact(
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
         }""",
 )
+# Require a substantial in-request continuation before skipping the neural head.
+patch_exact(root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "got.len >= least and p.lastMatch() >= e.cfg.enter_match",
+    "got.len >= @max(least, 8) and p.lastMatch() >= e.cfg.enter_match")
+patch_exact(root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "(try win.copyProposal(e, s)).tokens.len > 0",
+    """blk: {
+            const offer = try win.copyProposal(e, s);
+            break :blk !offer.recalled and offer.tokens.len >= 8;
+        }""")
 PY
 }
 
@@ -13783,6 +13793,7 @@ PY
     export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     export TF_FLASHNEXT_MTP_WHILE="1"
+    export TF_FLASHNEXT_ROOT_COPIES="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       export TF_FLASHNEXT_DRAFTS="6"
@@ -13802,7 +13813,6 @@ PY
       export TF_FLASHNEXT_EXT_TOK="${TF_FLASHNEXT_EXT_TOK:-0.0}"
       export TF_FLASHNEXT_EXT_MIN="${TF_FLASHNEXT_EXT_MIN:-0}"
       export TF_FLASHNEXT_FACT_ROWS="${TF_FLASHNEXT_FACT_ROWS:-256}"
-      export TF_FLASHNEXT_ROOT_COPIES="0"
       export TF_FLASHNEXT_P_CLIFF="0.0"
       export TF_FLASHNEXT_W2_MULTI="1"
       export TF_FLASHNEXT_ROUTER_BF12="0"
