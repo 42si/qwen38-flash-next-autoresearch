@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t176"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1874,7 +1874,8 @@ __device__ __forceinline__ void mtp_stop_take(
         const double dyn_thr = (ctl->alpha > 0.0) ? ((*step_cost) * (1.0 + (*exp_acc)) / (*cost_acc)) : 0.0;
         const double thr = (dyn_thr > -c) ? dyn_thr : -c;
         if (prod < thr) {
-            propose = (j == 0);
+            // The last proposal is already scored. Extension cost only decides whether to continue.
+            propose = (j == 0) || (prod >= -c);
             more = false;
             return;
         }
@@ -11373,7 +11374,7 @@ pub const Stop = struct {
             const dyn_thr: f64 = if (s.alpha > 0.0) (s.step_cost * (1.0 + s.exp_acc) / s.cost_acc) else 0.0;
             const thr: f64 = @max(dyn_thr, -s.c);
             // below the line it ends the chain: no later product can reach it again
-            if (s.product < thr) return .{ .propose = j == 0, .more = false };
+            if (s.product < thr) return .{ .propose = j == 0 or s.product >= -s.c, .more = false };
             s.exp_acc += s.product;
             s.cost_acc += s.step_cost;
             s.step_cost *= s.decay;
