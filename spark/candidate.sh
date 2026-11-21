@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t105"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1869,6 +1869,16 @@ __device__ __forceinline__ void mtp_stop_take(
             propose = true;
             more = false;
             return;
+        }
+        // Estimate whether another proposal can clear the next renewal threshold.
+        // Shrinking the last confidence toward one favors continuing uncertain cases.
+        if (ctl->alpha > 0.0 && j >= 1 && j < 14) {
+            const double next_thr = fmax(-c, *step_cost * (1.0 + *exp_acc) / *cost_acc);
+            if (prod * (0.5 + 0.5 * p) < next_thr) {
+                propose = true;
+                more = false;
+                return;
+            }
         }
         if (j == 14 && ctl->ext_enter > 0.0 && (prod < ctl->ext_enter || p < ctl->ext_tok)) {
             propose = true;
@@ -11345,6 +11355,10 @@ pub const Stop = struct {
             s.cost_acc += s.step_cost;
             s.step_cost *= s.decay;
             if (j >= 1 and s.p_cliff < 0 and p < -s.p_cliff) return .{ .propose = true, .more = false };
+            if (s.alpha > 0.0 and j >= 1 and j < 14) {
+                const next_thr = @max(-s.c, s.step_cost * (1.0 + s.exp_acc) / s.cost_acc);
+                if (s.product * (0.5 + 0.5 * p) < next_thr) return .{ .propose = true, .more = false };
+            }
             if (j == 14 and s.ext_enter > 0 and (s.product < s.ext_enter or p < s.ext_tok)) return .{ .propose = true, .more = false };
         }
         return .{ .propose = true, .more = true };
