@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t186"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6990,6 +6990,8 @@ static __device__ __forceinline__ void route_topk_plan_impl(
 #endif
     __syncthreads();
 
+    int selected = -1;
+    float weight = 0.0f;
     if (warp < M) {
         const long long slice_stride = static_cast<long long>(M) * NL;
         const float* row0 = L + static_cast<long long>(warp) * NL;
@@ -7055,8 +7057,10 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         const int r_slots = shared ? (SLOTS - 1) : SLOTS;
         if (lane < r_slots) {
             if (lane < TOPK) {
+                selected = pick;
+                weight = __fdiv_rn(mine, total);
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
-                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
+                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(weight);
                 sh_pick[warp * SLOTS + lane] = pick;
                 if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
             } else {
@@ -7076,6 +7080,33 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         }
     }
     __syncthreads();
+
+    if (M > 1 && shared && E_PLAN == NE && TOPK == 10) {
+        if (warp < M) {
+            const bool singleton = lane >= 6 && lane < TOPK &&
+                                   selected >= 0 && selected < NE && sh_cnt[selected] == 1;
+            float tail = singleton ? weight : 0.0f;
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const float more = __shfl_down_sync(0xffffffffu, tail, offset);
+                if (lane + offset < 32) tail += more;
+            }
+            const bool drop = singleton && tail <= 0.08f;
+            float removed = drop ? weight : 0.0f;
+            for (int offset = 16; offset; offset >>= 1)
+                removed += __shfl_xor_sync(0xffffffffu, removed, offset);
+            const int slot = warp * SLOTS + lane;
+            if (drop) {
+                // This expert has exactly one reader. NE is the plan's existing unused-slot sentinel.
+                sh_cnt[selected] = 0;
+                sh_pick[slot] = NE;
+                PICK[slot] = NE;
+                WTS[slot] = 0.0f;
+            } else if (lane < TOPK && removed > 0.0f) {
+                WTS[slot] = rbf(__fdiv_rn(weight, 1.0f - removed));
+            }
+        }
+        __syncthreads();
+    }
 
     const int c = (tid < E_PLAN) ? sh_cnt[tid] : 0;
     const int tiles = (c + T - 1) / T;
@@ -7563,6 +7594,17 @@ for _gdn_call in (
     asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
 #endif""",
     )
+# The same page lookup is used by attention, index keys and pooled rows.
+patch_k(
+    "flashnext_pages.cuh",
+    "    return static_cast<long long>(pg.pt[p / per]) * pg.ps + static_cast<long long>(p % per) * row;",
+    """    if (p >= 0 && per > 0 && (per & (per - 1)) == 0) {
+        const int page = p >> (__ffs(per) - 1);
+        return static_cast<long long>(pg.pt[page]) * pg.ps + static_cast<long long>(p & (per - 1)) * row;
+    }
+    return static_cast<long long>(pg.pt[p / per]) * pg.ps + static_cast<long long>(p % per) * row;""",
+)
+
 # State-first PDL on fn_gdn_rows_late: griddepcontrol.wait is now INSIDE gdn_rows_late_4t AFTER 3.15MB state_in prefetch!
 patch_k(
     "flashnext_batch.cu",
