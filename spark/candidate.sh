@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t158"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1362,9 +1362,9 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best_cond(
 
 
 struct W2PickOut {
-    int cand_col[64];
-    float cand_old[64];
-    float cand_new[64];
+    int cand_col[96];
+    float cand_old[96];
+    float cand_new[96];
     float gmax;
     float gsum;
     float rmax;
@@ -1555,7 +1555,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         }
     }
     __syncthreads();
-    const uint32_t k_lim = static_cast<uint32_t>(min(k_top, 64));
+    const uint32_t k_lim = static_cast<uint32_t>(min(k_top, 96));
     const uint32_t eq_lim = (k_lim > s_tot) ? (k_lim - s_tot) : 0u;
     if (!any_ovf) {
         for (int j = 0; j < n_loc; ++j) {
@@ -9653,7 +9653,7 @@ pub const W2 = struct {
             af.add(sc);
             af.add(@as(c_int, @intCast(n_blocks)));
             af.add(@as(c_int, @intCast(v)));
-            af.add(self.k_top);
+            af.add(@min(self.k_top, @as(c_int, 64)));
             af.add(best_out);
             af.add(flag_ptr);
             try cuda.launch.launch(self.cond_fn.?, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .pdl = true }, stream, &af);
@@ -9669,7 +9669,7 @@ pub const W2 = struct {
         a1.add(@as(c_int, @intCast(v)));
         try cuda.launch.launch(self.gemv_fn.?, .{ .grid = .{ .x = @intCast(n_blocks) }, .block = .{ .x = 128 }, .pdl = true }, stream, &a1);
 
-        if (self.use_multi and n_blocks <= 1024 and self.k_top > 0 and self.k_top <= 64 and self.pick_fn != null and self.multi_fn != null) {
+        if (self.use_multi and n_blocks <= 1024 and self.k_top > 0 and self.k_top <= 96 and self.pick_fn != null and self.multi_fn != null) {
             const po = sc + 16384;
             var ap: cuda.Args = .{};
             ap.add(dlogits);
@@ -9700,7 +9700,7 @@ pub const W2 = struct {
         a2.add(sc);
         a2.add(@as(c_int, @intCast(n_blocks)));
         a2.add(@as(c_int, @intCast(v)));
-        a2.add(self.k_top);
+        a2.add(@min(self.k_top, @as(c_int, 64)));
         a2.add(best_out);
         try cuda.launch.launch(self.rescore_fn.?, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .pdl = true }, stream, &a2);
     }
@@ -13749,7 +13749,7 @@ PY
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
     export TF_FLASHNEXT_MTP_W2="w1g64"
     export TF_FLASHNEXT_W1_CAL="1.15"
-    export TF_FLASHNEXT_W1_KTOP="${TF_FLASHNEXT_W1_KTOP:-64}"
+    export TF_FLASHNEXT_W1_KTOP="${TF_FLASHNEXT_W1_KTOP:-96}"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
     export TF_FLASHNEXT_MTP_NVFP4="${TF_FLASHNEXT_MTP_NVFP4:-0}"
     export TF_FLASHNEXT_SHARED_EARLY="${TF_FLASHNEXT_SHARED_EARLY:-0}"
