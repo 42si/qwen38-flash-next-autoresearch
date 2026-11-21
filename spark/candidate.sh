@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t178"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9387,6 +9387,8 @@ const W1PackCtx = struct {
                 var g_scales: [80]f32 = undefined;
                 var g_w: [80]u32 = undefined;
                 var rmax: f32 = 0.0;
+                var weight_energy: f32 = 0.0;
+                var binary_energy: f32 = 0.0;
                 for (0..80) |g| {
                     var sum_abs: f32 = 0.0;
                     var w0: u32 = 0;
@@ -9394,16 +9396,19 @@ const W1PackCtx = struct {
                         const bits = std.mem.readInt(u16, rb[(g * 32 + j) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
+                        weight_energy += f * f;
                         if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
                     }
                     const s = sum_abs / 32.0;
+                    binary_energy += 32.0 * s * s;
                     g_scales[g] = s;
                     g_w[g] = w0;
                     if (s > rmax) rmax = s;
                 }
                 const gsc: f32 = if (rmax > 0.0) rmax / 448.0 else 1.0;
                 const inv_gsc: f32 = 1.0 / gsc;
-                ctx.globals[blk * 32 + lane] = gsc * ctx.cal;
+                const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
+                ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
                 for (0..20) |g4| {
                     const base_u4 = blk * 800 + g4 * 40;
                     const idx_w = (base_u4 + lane) * 4;
@@ -13747,7 +13752,7 @@ PY
   start)
     export LD_LIBRARY_PATH="${RELEASE_LIB}:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
-    export TF_FLASHNEXT_MTP_W2="w1g64"
+    export TF_FLASHNEXT_MTP_W2="w1"
     export TF_FLASHNEXT_W1_CAL="1.15"
     export TF_FLASHNEXT_W1_KTOP="${TF_FLASHNEXT_W1_KTOP:-64}"
     export TF_FLASHNEXT_MTP_EXPERTS="nvfp4"
