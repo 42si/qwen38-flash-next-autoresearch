@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t131"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4369,21 +4369,22 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    constexpr unsigned tile = 4;
+    constexpr unsigned tile = 8;
     __shared__ float4 keys[tile][32], queries[tile][32];
     __shared__ float values[tile][32];
     __shared__ float2 gate_beta[tile];
     const unsigned total = np + (unsigned)rows;
     for (unsigned base = 0; base < total; base += tile) {
-        const unsigned load_p = base + (unsigned)(tid >> 5);
-        if (load_p < total) {
+        for (unsigned slot = tid >> 5; slot < tile; slot += 4) {
+            const unsigned load_p = base + slot;
+            if (load_p >= total) break;
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
             const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
-            if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
-            keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
+            values[slot][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
+            if (vec == 0) gate_beta[slot] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
+            keys[slot][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
             if (load_p >= np) {
-                queries[tid >> 5][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
+                queries[slot][vec] = reinterpret_cast<const float4*>(qn + ((size_t)(load_p - np) * NK + hk) * DK)[vec];
             }
         }
         __syncthreads();
@@ -9743,7 +9744,7 @@ fn e2m1(v: f32) u8 {
     return sign | mag;
 }
 
-fn quantizeFp8ToNvfp4(lut: *const [256]f32, fp8_bytes: []const u8, blk_scales: []const f32, n: usize, k: usize, codes: []u8, scales: []u8) f32 {
+fn quantizeFp8ToNvfp4(lut: *const [256]f32, fp8_bytes: []const u8, blk_scales: []const f32, n: usize, k: usize, codes: []u8, scales: []u8, match_group_mean: bool) f32 {
     const kb = k / blk;
     var max_abs: f32 = 0;
     for (0..n) |r| {
@@ -9784,14 +9785,21 @@ fn quantizeFp8ToNvfp4(lut: *const [256]f32, fp8_bytes: []const u8, blk_scales: [
                 const clipped_step = lut[clipped] * global;
                 var full_err: f32 = 0;
                 var clipped_err: f32 = 0;
+                var full_bias: f32 = 0;
+                var clipped_bias: f32 = 0;
                 for (seg) |byte| {
                     const w = lut[byte & 0x7f] * abs_bs;
                     const diff_full = w - levels[e2m1(w / full_step) & 7] * full_step;
                     const diff_clipped = w - levels[e2m1(w / clipped_step) & 7] * clipped_step;
                     full_err += diff_full * diff_full;
                     clipped_err += diff_clipped * diff_clipped;
+                    if (match_group_mean) {
+                        full_bias += if ((byte & 0x80) == 0) diff_full else -diff_full;
+                        clipped_bias += if ((byte & 0x80) == 0) diff_clipped else -diff_clipped;
+                    }
                 }
-                if (clipped_err < full_err) sc_code = clipped;
+                // The down projection consumes gated activations with a possible common component.
+                if (clipped_err + 0.25 * clipped_bias * clipped_bias < full_err + 0.25 * full_bias * full_bias) sc_code = clipped;
             }
             scales[r * kg16 + g] = sc_code;
             const denom = lut[sc_code] * global;
@@ -9843,8 +9851,8 @@ const BatchJob = struct {
         const alloc = std.heap.page_allocator;
         var i = tid;
         while (i < job.n_items) : (i += stride) {
-            const gg = quantizeFp8ToNvfp4(job.lut, job.raw_gate[i * mat ..][0..mat], job.sc_gate[i * job.blocks ..][0..job.blocks], job.width, job.dims, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16]);
-            const ug = quantizeFp8ToNvfp4(job.lut, job.raw_up[i * mat ..][0..mat], job.sc_up[i * job.blocks ..][0..job.blocks], job.width, job.dims, u_codes[0 .. mat / 2], u_scales[0 .. mat / 16]);
+            const gg = quantizeFp8ToNvfp4(job.lut, job.raw_gate[i * mat ..][0..mat], job.sc_gate[i * job.blocks ..][0..job.blocks], job.width, job.dims, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16], false);
+            const ug = quantizeFp8ToNvfp4(job.lut, job.raw_up[i * mat ..][0..mat], job.sc_up[i * job.blocks ..][0..job.blocks], job.width, job.dims, u_codes[0 .. mat / 2], u_scales[0 .. mat / 16], false);
             if (job.use_s5) {
                 const ubytes = std.mem.sliceAsBytes(job.packed_up[i * job.up_words ..][0..job.up_words]);
                 s5t.packGateUpS5(ubytes, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16], u_codes[0 .. mat / 2], u_scales[0 .. mat / 16], job.width, job.dims, &job.s5_recs[i].smin_g, &job.s5_recs[i].smin_u, &job.s5_recs[i].esc_g, &job.s5_recs[i].esc_u, alloc) catch unreachable;
@@ -9854,7 +9862,7 @@ const BatchJob = struct {
             job.up_globals[i * 2] = gg;
             job.up_globals[i * 2 + 1] = ug;
 
-            const dg = quantizeFp8ToNvfp4(job.lut, job.raw_down[i * mat ..][0..mat], job.sc_down[i * job.blocks ..][0..job.blocks], job.dims, job.width, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16]);
+            const dg = quantizeFp8ToNvfp4(job.lut, job.raw_down[i * mat ..][0..mat], job.sc_down[i * job.blocks ..][0..job.blocks], job.dims, job.width, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16], true);
             if (job.use_s5) {
                 const dbytes = std.mem.sliceAsBytes(job.packed_down[i * job.down_words ..][0..job.down_words]);
                 job.s5_recs[i].smin_d = s5t.packDownS5(dbytes, g_codes[0 .. mat / 2], g_scales[0 .. mat / 16], job.dims, job.width, &job.s5_recs[i].esc_d, alloc) catch unreachable;
