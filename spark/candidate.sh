@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t125"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t132"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9332,6 +9332,7 @@ const W1PackCtx = struct {
                 var weight_energy: f32 = 0.0;
                 var binary_energy: f32 = 0.0;
                 for (0..40) |g| {
+                    var group_energy: f32 = 0.0;
                     var sum_abs: f32 = 0.0;
                     var w0: u32 = 0;
                     var w1: u32 = 0;
@@ -9339,17 +9340,18 @@ const W1PackCtx = struct {
                         const bits = std.mem.readInt(u16, rb[(g * 64 + j) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
-                        weight_energy += f * f;
+                        group_energy += f * f;
                         if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
                     }
                     for (0..32) |j| {
                         const bits = std.mem.readInt(u16, rb[(g * 64 + 32 + j) * 2 ..][0..2], .little);
                         const f: f32 = @bitCast(@as(u32, bits) << 16);
                         sum_abs += @abs(f);
-                        weight_energy += f * f;
+                        group_energy += f * f;
                         if (f < 0.0) w1 |= @as(u32, 1) << @intCast(j);
                     }
-                    const s = sum_abs / 64.0;
+                    weight_energy += group_energy;
+                    const s = 0.5 * (sum_abs / 64.0 + 0.79788456 * @sqrt(group_energy / 64.0));
                     binary_energy += 64.0 * s * s;
                     g_scales[g] = s;
                     g_w0[g] = w0;
