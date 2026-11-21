@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t73"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t82"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5314,7 +5314,7 @@ static __device__ __noinline__ void s5_down_1w_wide(
   }
 }
 
-extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
+extern "C" __global__ void __launch_bounds__(128, 5) tf_nvfp4_s5_down_1w(
     const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
     const float* __restrict__ scale, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
     int KG, int NB, const int* items, const int* counts, const int* members,
@@ -5324,9 +5324,12 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
   constexpr int STRIP4 = 696;
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
   const int units = (*counts) * NB;
-  __shared__ uint4 sh_lo[40];
-  __shared__ uint4 sh_hi[10];
-  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+  constexpr int WARPS = 4;
+  const int warp = threadIdx.x >> 5;
+  __shared__ uint4 lo[WARPS][40], hi[WARPS][10];
+  uint4* sh_lo = lo[warp];
+  uint4* sh_hi = hi[warp];
+  for (int unit = blockIdx.x * WARPS + warp; unit < units; unit += gridDim.x * WARPS) {
     const int it = unit / NB, cb = unit - it * NB;
     const int e = items[3 * it], first = items[3 * it + 1], cnt = items[3 * it + 2];
     if (e == skip) continue;
@@ -13012,7 +13015,7 @@ patch_exact(
             a.add(@as(i32, @intCast(l.dims)));
             a.add(@as(f32, 0.0));
             a.add(skip);
-            return launch_.launch(e.s5_down_1w_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = true }, s, &a);
+            return launch_.launch(e.s5_down_1w_fn, .{ .grid = .{ .x = @intCast((grid + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = true }, s, &a);
         }""",
 )
 patch_exact(
