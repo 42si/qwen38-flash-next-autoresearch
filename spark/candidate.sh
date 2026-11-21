@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t168"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6978,7 +6978,7 @@ patch_k(
 static __device__ __forceinline__ void route_topk_plan_impl(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
-    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts) {
+    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts, int prune_draft) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     __shared__ int sh_cnt[512];
     __shared__ int sh_off[512];
@@ -7052,9 +7052,20 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         for (int k = 0; k < TOPK; ++k) {
             total = __fadd_rn(total, __shfl_sync(0xffffffffu, mine, k));
         }
+        bool drop_tail = false;
+        if (prune_draft && TOPK == 10 && E_PLAN == NE) {
+            // The draft may omit up to four trailing experts under one mass budget.
+            float suffix = lane >= 6 ? mine : 0.0f;
+            suffix += __shfl_down_sync(0xffffffffu, suffix, 1);
+            suffix += __shfl_down_sync(0xffffffffu, suffix, 2);
+            drop_tail = lane >= 6 && lane < TOPK && suffix <= 0.08f * total;
+            const unsigned drops = __ballot_sync(0xffffffffu, drop_tail);
+            const float removed = __shfl_sync(0xffffffffu, suffix, drops ? __ffs(drops) - 1 : 0);
+            if (drops) total -= removed;
+        }
         const int r_slots = shared ? (SLOTS - 1) : SLOTS;
         if (lane < r_slots) {
-            if (lane < TOPK) {
+            if (lane < TOPK && !drop_tail) {
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
                 sh_pick[warp * SLOTS + lane] = pick;
@@ -7171,15 +7182,15 @@ static __device__ __forceinline__ void route_topk_plan_impl(
 extern "C" __global__ void __launch_bounds__(1024) tf_route_topk_plan(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
-    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts) {
-    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
+    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts, int prune_draft) {
+    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts, prune_draft);
 }
 
 extern "C" __global__ void __launch_bounds__(512) tf_route_topk_plan_512(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
-    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts) {
-    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
+    int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts, int prune_draft) {
+    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts, prune_draft);
 }
 
 // Trial 65: Lossless BF11 NW=8 SK=1 Router (1.85MB vs 2.63MB BF16, 65 CTAs x 8 warps, weights-first PDL, STACK:0)
@@ -12407,12 +12418,13 @@ patch_exact(
     }
 
     /// Fused 1-CTA top-k + 4-bucket plan (with optional SK-slice router partial reduction) for rows<=32, experts<=512, e_plan<=512, slots<=12.
-    pub fn topkPlan(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, rows: usize, slots: usize, shared: bool, e_plan: usize, tile: usize, rsk: usize, picks: u64, wts: u64, members: u64, items: u64, counts: u64) !void {
+    pub fn topkPlan(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, rows: usize, slots: usize, shared: bool, e_plan: usize, tile: usize, rsk: usize, picks: u64, wts: u64, members: u64, items: u64, counts: u64, prune_draft: bool) !void {
         if (rows == 0 or rows > 32 or experts > 512 or e_plan > 512 or slots > 12 or top_k > 32) return error.RowShape;
         var a: launch_.Args = .{};
         a.add(l);
         for ([_]usize{ ld, experts, top_k, rows, slots, @intFromBool(shared), e_plan, tile, rsk }) |v| a.add(@as(i32, @intCast(v)));
         for ([_]u64{ picks, wts, members, items, counts }) |p| a.add(p);
+        a.add(@as(i32, @intFromBool(prune_draft)));
         const blk: u32 = if (rows <= 16) 512 else 1024;
         const f = if (rows <= 16) g.topk_plan_512_fn else g.topk_plan_fn;
         try launch_.launch(f, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = blk }, .pdl = true }, s, &a);
@@ -12435,11 +12447,11 @@ patch_exact(
     }
 
     pub fn topkPlanMany(g: *const Glue, s: cuda.Stream, logits: u64, rsk: usize, pick: u64, wts: u64, rows: usize, e_plan: usize, tile: usize, plan: cuda.grouped.Plan) !void {
-        try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, wt.slots - 1, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts);
+        try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, wt.slots - 1, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts, false);
     }
 
-    pub fn topkPlanManyK(g: *const Glue, s: cuda.Stream, logits: u64, rsk: usize, pick: u64, wts: u64, rows: usize, e_plan: usize, tile: usize, plan: cuda.grouped.Plan, top_k: usize) !void {
-        try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, top_k, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts);
+    pub fn topkPlanManyK(g: *const Glue, s: cuda.Stream, logits: u64, rsk: usize, pick: u64, wts: u64, rows: usize, e_plan: usize, tile: usize, plan: cuda.grouped.Plan, top_k: usize, prune_draft: bool) !void {
+        try g.route.topkPlan(s, logits, wt.experts_n + 1, wt.experts_n, top_k, rows, wt.slots, true, e_plan, tile, rsk, pick, wts, plan.members, plan.items, plan.counts, prune_draft);
     }""",
 )
 patch_exact(
@@ -12552,7 +12564,7 @@ pub fn runFused(self: anytype, glue: anytype, lw: anytype, native: *const mixed.
         if (rq.native.?.mode == .bf11 and n <= 32) {
             try glue.routerBf11Many(self.stream, s.mixed, rq.native.?, s.router_l, dims, n);
             if (shared_early) side = try shared.fork(self, native, n);
-            try glue.topkPlanManyK(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan, active_k);
+            try glue.topkPlanManyK(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan, active_k, lw.is_mtp);
         } else {
             const rsk = try self.k.native_lane.matmulRawPart(self.stream, s.mixed, dims, n, rq.native.?, s.router_l, .f32, s.native_part, false);
             const r_src = if (rsk > 1) s.native_part else s.router_l;
@@ -12561,12 +12573,12 @@ pub fn runFused(self: anytype, glue: anytype, lw: anytype, native: *const mixed.
             if (shared_early and s.native_part != 0 and r_off + 4 * n * 2048 * 4 <= part_cap) {
                 side = try shared.forkWithPart(self, native, n, s.native_part + r_off);
             }
-            try glue.topkPlanManyK(self.stream, r_src, rsk, s.picks, s.wts, n, e, pt, plan, active_k);
+            try glue.topkPlanManyK(self.stream, r_src, rsk, s.picks, s.wts, n, e, pt, plan, active_k, lw.is_mtp);
         }
     } else {
         try glue.routerMany(self.stream, s.mixed, lw.router.ptr, s.router_l, dims, n);
         if (shared_early) side = try shared.fork(self, native, n);
-        try glue.topkPlanManyK(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan, active_k);
+        try glue.topkPlanManyK(self.stream, s.router_l, 1, s.picks, s.wts, n, e, pt, plan, active_k, lw.is_mtp);
     }
     if (side == null) side = try shared.fork(self, native, n);
     if (active_k > 0) {
