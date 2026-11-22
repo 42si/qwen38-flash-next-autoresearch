@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t351"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -386,7 +386,10 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                 s4 = ns4;
             }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const uint2 meta = __ldg(reinterpret_cast<const uint2*>(G) + row);
+        const float residual = __uint_as_float(meta.y & 0xffff0000u);
+        const float acc = fmaf(residual, __uint_as_float(sxu[meta.y & 65535u]),
+                               (acc0 + acc1) * __uint_as_float(meta.x));
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -856,7 +859,10 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
             }
             if (g4 + 1 < 10) { wa = nwa; wb = nwb; s4 = ns4; }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const uint2 meta = __ldg(reinterpret_cast<const uint2*>(G) + row);
+        const float residual = __uint_as_float(meta.y & 0xffff0000u);
+        const float acc = fmaf(residual, __uint_as_float(sxu[meta.y & 65535u]),
+                               (acc0 + acc1) * __uint_as_float(meta.x));
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -9364,7 +9370,27 @@ const W1PackCtx = struct {
                 const inv_gsc: f32 = 1.0 / gsc;
                 // Match the row-specific RMS loss, relative to the Gaussian sign-quantizer ratio.
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
-                ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
+                const gain = gsc * ctx.cal * adjust;
+                var delta: f32 = 0;
+                var column: u32 = 0;
+                for (g_scales, 0..) |group_scale, group| {
+                    const encoded = core.exlr8.codec.e4m3FromF32(std.math.clamp(group_scale * inv_gsc, 0.0, 448.0));
+                    const magnitude = gain * core.exlr8.codec.e4m3Value(encoded);
+                    for (0..64) |j| {
+                        const i = group * 64 + j;
+                        const bits = std.mem.readInt(u16, rb[i * 2 ..][0..2], .little);
+                        const w: f32 = @bitCast(@as(u32, bits) << 16);
+                        const err = w - (if (w < 0.0) -magnitude else magnitude);
+                        if (@abs(err) > @abs(delta)) {
+                            delta = err;
+                            column = @intCast(i);
+                        }
+                    }
+                }
+                const raw: u32 = @bitCast(delta);
+                const rounded = (raw +% 0x7fff +% ((raw >> 16) & 1)) & 0xffff0000;
+                ctx.globals[2 * r] = gain;
+                ctx.globals[2 * r + 1] = @bitCast(rounded | column);
                 for (0..10) |g4| {
                     const base_u4 = blk * 720 + g4 * 72;
                     const idx_a = (base_u4 + lane) * 4;
@@ -9478,7 +9504,7 @@ pub const W2 = struct {
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
-            const globals_host = try gpa.alloc(f32, nb * 32);
+            const globals_host = try gpa.alloc(f32, nb * @as(usize, if (is_w1g64) 64 else 32));
             defer gpa.free(globals_host);
             @memset(globals_host, 0.0);
 
