@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t327"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -300,17 +300,23 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
     __shared__ uint32_t sxu[2560];
-    const int tid = threadIdx.x;
-    for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+    __shared__ float group_sum[40];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int g = warp; g < 40; g += 4) {
+        const int i = 64 * g + lane;
+        const float x0 = __bfloat162float(X[i]), x1 = __bfloat162float(X[i + 32]);
+        sxu[i] = __float_as_uint(x0);
+        sxu[i + 32] = __float_as_uint(x1);
+        float sum = x0 + x1;
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        if (lane == 0) group_sum[g] = sum;
     }
     __syncthreads();
-    const int warp = tid >> 5, lane = tid & 31;
     const int blk = blockIdx.x * 4 + warp;
     const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
-        const uint4* bp = WS + static_cast<size_t>(blk) * 720;
+        const uint4* bp = WS + static_cast<size_t>(blk) * 800;
         auto ld4_256 = [](const uint4* p) -> uint4 {
             uint4 v;
 #if __CUDA_ARCH__ >= 900
@@ -339,11 +345,12 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             uint4 nwa, nwb;
             uint32_t ns4;
             if (g4 + 1 < 10) {
-                const uint4* np = bp + (g4 + 1) * 72;
+                const uint4* np = bp + (g4 + 1) * 80;
                 nwa = ld4_256(np + lane);
                 nwb = ld4_256(np + 32 + lane);
                 ns4 = ld1_256(reinterpret_cast<const uint32_t*>(np + 64) + lane);
             }
+            const uint32_t biases = ld1_256(reinterpret_cast<const uint32_t*>(bp + g4 * 80 + 72) + lane);
             const uint32_t s01 = s4 & 0xFFFFu, s23 = s4 >> 16;
             const uint32_t sx01 = (s01 & 0xFFu) | ((s01 & 0xFF00u) << 8);
             const uint32_t sx23 = (s23 & 0xFFu) | ((s23 & 0xFF00u) << 8);
@@ -377,6 +384,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                     d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
                     d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
                 }
+                const int8_t bias = static_cast<int8_t>(biases >> (8 * q));
+                acc0 = fmaf(static_cast<float>(bias) * (448.0f / 127.0f), group_sum[g4 * 4 + q], acc0);
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
             }
@@ -773,18 +782,24 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
         return;
     }
     __shared__ uint32_t sxu[2560];
-    const int tid = threadIdx.x;
-    for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+    __shared__ float group_sum[40];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int g = warp; g < 40; g += 4) {
+        const int i = 64 * g + lane;
+        const float x0 = __bfloat162float(X[i]), x1 = __bfloat162float(X[i + 32]);
+        sxu[i] = __float_as_uint(x0);
+        sxu[i + 32] = __float_as_uint(x1);
+        float sum = x0 + x1;
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        if (lane == 0) group_sum[g] = sum;
     }
     __syncthreads();
-    const int warp = tid >> 5, lane = tid & 31;
     const int bidx = blk_offset + blockIdx.x;
     const int blk = bidx * 4 + warp;
     const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
-        const uint4* bp = WS + static_cast<size_t>(blk) * 720;
+        const uint4* bp = WS + static_cast<size_t>(blk) * 800;
         auto ld4_256 = [](const uint4* p) -> uint4 {
             uint4 v;
 #if __CUDA_ARCH__ >= 900
@@ -813,11 +828,12 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
             uint4 nwa, nwb;
             uint32_t ns4;
             if (g4 + 1 < 10) {
-                const uint4* np = bp + (g4 + 1) * 72;
+                const uint4* np = bp + (g4 + 1) * 80;
                 nwa = ld4_256(np + lane);
                 nwb = ld4_256(np + 32 + lane);
                 ns4 = ld1_256(reinterpret_cast<const uint32_t*>(np + 64) + lane);
             }
+            const uint32_t biases = ld1_256(reinterpret_cast<const uint32_t*>(bp + g4 * 80 + 72) + lane);
             const uint32_t s01 = s4 & 0xFFFFu, s23 = s4 >> 16;
             const uint32_t sx01 = (s01 & 0xFFu) | ((s01 & 0xFF00u) << 8);
             const uint32_t sx23 = (s23 & 0xFFu) | ((s23 & 0xFF00u) << 8);
@@ -851,6 +867,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
                     d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
                     d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
                 }
+                const int8_t bias = static_cast<int8_t>(biases >> (8 * q));
+                acc0 = fmaf(static_cast<float>(bias) * (448.0f / 127.0f), group_sum[g4 * 4 + q], acc0);
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
             }
@@ -9335,26 +9353,52 @@ const W1PackCtx = struct {
                 var rmax: f32 = 0.0;
                 var weight_energy: f32 = 0.0;
                 var binary_energy: f32 = 0.0;
+                var offsets: [40]f32 = undefined;
                 for (0..40) |g| {
-                    var sum_abs: f32 = 0.0;
+                    var values: [64]f32 = undefined;
+                    var center: f32 = 0.0;
+                    var radius: f32 = 0.0;
                     var w0: u32 = 0;
                     var w1: u32 = 0;
-                    for (0..32) |j| {
+                    for (&values, 0..) |*value, j| {
                         const bits = std.mem.readInt(u16, rb[(g * 64 + j) * 2 ..][0..2], .little);
-                        const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
-                        weight_energy += f * f;
-                        if (f < 0.0) w0 |= @as(u32, 1) << @intCast(j);
+                        value.* = @bitCast(@as(u32, bits) << 16);
+                        weight_energy += value.* * value.*;
                     }
-                    for (0..32) |j| {
-                        const bits = std.mem.readInt(u16, rb[(g * 64 + 32 + j) * 2 ..][0..2], .little);
-                        const f: f32 = @bitCast(@as(u32, bits) << 16);
-                        sum_abs += @abs(f);
-                        weight_energy += f * f;
-                        if (f < 0.0) w1 |= @as(u32, 1) << @intCast(j);
+                    // Fit both reconstruction levels around the current decision boundary.
+                    for (0..3) |_| {
+                        var low: f32 = 0.0;
+                        var high: f32 = 0.0;
+                        var n_low: usize = 0;
+                        w0 = 0;
+                        w1 = 0;
+                        for (values, 0..) |value, j| {
+                            if (value < center) {
+                                low += value;
+                                n_low += 1;
+                                if (j < 32) {
+                                    w0 |= @as(u32, 1) << @intCast(j);
+                                } else {
+                                    w1 |= @as(u32, 1) << @intCast(j - 32);
+                                }
+                            } else high += value;
+                        }
+                        if (n_low == 0 or n_low == 64) {
+                            // A one-level group uses the magnitude and its common sign.
+                            center = 0.0;
+                            radius = @abs(low + high) / 64.0;
+                            break;
+                        }
+                        low /= @as(f32, @floatFromInt(n_low));
+                        high /= @as(f32, @floatFromInt(64 - n_low));
+                        center = 0.5 * (high + low);
+                        radius = 0.5 * (high - low);
                     }
-                    const s = sum_abs / 64.0;
-                    binary_energy += 64.0 * s * s;
+                    const s = radius;
+                    offsets[g] = center;
+                    const n_low_f: f32 = @floatFromInt(@as(u32, @popCount(w0)) + @popCount(w1));
+                    binary_energy += n_low_f * (center - radius) * (center - radius) +
+                        (64.0 - n_low_f) * (center + radius) * (center + radius);
                     g_scales[g] = s;
                     g_w0[g] = w0;
                     g_w1[g] = w1;
@@ -9366,7 +9410,13 @@ const W1PackCtx = struct {
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
                 ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
                 for (0..10) |g4| {
-                    const base_u4 = blk * 720 + g4 * 72;
+                    const base_u4 = blk * 800 + g4 * 80;
+                    var packed_bias: u32 = 0;
+                    for (0..4) |j| {
+                        const bias: i8 = @intFromFloat(@round(std.math.clamp(offsets[g4 * 4 + j] * inv_gsc * (127.0 / 448.0), -127.0, 127.0)));
+                        packed_bias |= @as(u32, @as(u8, @bitCast(bias))) << @intCast(8 * j);
+                    }
+                    ctx.ws[(base_u4 + 72) * 4 + lane] = packed_bias;
                     const idx_a = (base_u4 + lane) * 4;
                     ctx.ws[idx_a + 0] = g_w0[g4 * 4 + 0];
                     ctx.ws[idx_a + 1] = g_w1[g4 * 4 + 0];
@@ -9474,7 +9524,7 @@ pub const W2 = struct {
         if (is_w1g64 or is_w1g32) {
             const cal: f32 = if (std.c.getenv("TF_FLASHNEXT_W1_CAL")) |cv| (std.fmt.parseFloat(f32, std.mem.span(cv)) catch 1.15) else 1.15;
             const k_top_v: c_int = if (std.c.getenv("TF_FLASHNEXT_W1_KTOP")) |kv| (std.fmt.parseInt(c_int, std.mem.span(kv), 10) catch 64) else 64;
-            const u4_per_blk: usize = if (is_w1g64) 720 else 800;
+            const u4_per_blk: usize = 800;
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
