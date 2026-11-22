@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t257"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1667,7 +1667,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
         }
         for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
         __shared__ float sw[4];
-        __shared__ int s_is_last;
+        bool last = false;
         if (lane == 0) sw[warp] = sum;
         __syncthreads();
         if (tid == 0) {
@@ -1677,11 +1677,10 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
             po->cand_new[j] = __bfloat162float(nb);
             __threadfence();
             const unsigned int done = atomicAdd(&po->done_cnt, 1u);
-            s_is_last = (done == static_cast<unsigned int>(K - 1)) ? 1 : 0;
-            if (s_is_last) po->done_cnt = 0u;
+            last = done == static_cast<unsigned int>(K - 1);
+            if (last) po->done_cnt = 0u;
         }
-        __syncthreads();
-        if (s_is_last && warp == 0) {
+        if (warp == 0 && __shfl_sync(0xffffffffu, int(last), 0)) {
             const float gmax = po->gmax;
             const float sgsum = po->gsum;
             float best_v = (lane == 0) ? po->rmax : -CUDART_INF_F;
