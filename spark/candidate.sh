@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t285"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6994,6 +6994,8 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         const long long slice_stride = static_cast<long long>(M) * NL;
         const float* row0 = L + static_cast<long long>(warp) * NL;
         float wv[16];
+        float quartet_v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        int quartet_i[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
         float cur_v = -INFINITY;
         int cur_i = 0x7fffffff;
         if (RSK == 4) {
@@ -7005,6 +7007,10 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                 const int i = lane + j * 32;
                 float v = (i < NE) ? __fadd_rn(__fadd_rn(__fadd_rn(row0[i], row1[i]), row2[i]), row3[i]) : -INFINITY;
                 wv[j] = v;
+                if (v > quartet_v[j >> 2] || (v == quartet_v[j >> 2] && i < quartet_i[j >> 2])) {
+                    quartet_v[j >> 2] = v;
+                    quartet_i[j >> 2] = i;
+                }
                 if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
             }
         } else {
@@ -7017,6 +7023,10 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                     for (int s = 1; s < RSK; ++s) v = __fadd_rn(v, row0[static_cast<long long>(s) * slice_stride + i]);
                 }
                 wv[j] = v;
+                if (v > quartet_v[j >> 2] || (v == quartet_v[j >> 2] && i < quartet_i[j >> 2])) {
+                    quartet_v[j >> 2] = v;
+                    quartet_i[j >> 2] = i;
+                }
                 if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
             }
         }
@@ -7034,17 +7044,28 @@ static __device__ __forceinline__ void route_topk_plan_impl(
             if (k == 0) top = bv;
             if (lane == k) { my_bv = bv; pick = bi; }
             if (cur_i == bi && k + 1 < TOPK) {
-                const int wj = bi >> 5;
-                wv[wj] = -INFINITY;
-                float nv = -INFINITY;
-                int ni = 0x7fffffff;
+                const int winning_group = bi >> 7;
+                cur_v = -INFINITY;
+                cur_i = 0x7fffffff;
 #pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    const int i = lane + j * 32;
-                    if (wv[j] > nv || (wv[j] == nv && i < ni)) { nv = wv[j]; ni = i; }
+                for (int group = 0; group < 4; ++group) {
+                    if (group == winning_group) {
+                        float v = -INFINITY;
+                        int id = 0x7fffffff;
+#pragma unroll
+                        for (int member = 0; member < 4; ++member) {
+                            const int j = group * 4 + member;
+                            const int i = lane + j * 32;
+                            if (i == bi) wv[j] = -INFINITY;
+                            if (wv[j] > v || (wv[j] == v && i < id)) { v = wv[j]; id = i; }
+                        }
+                        quartet_v[group] = v;
+                        quartet_i[group] = id;
+                    }
+                    const float v = quartet_v[group];
+                    const int id = quartet_i[group];
+                    if (v > cur_v || (v == cur_v && id < cur_i)) { cur_v = v; cur_i = id; }
                 }
-                cur_v = nv;
-                cur_i = ni;
             }
         }
         const float mine = (lane < TOPK) ? tf_exp(__fsub_rn(my_bv, top)) : 0.0f;
