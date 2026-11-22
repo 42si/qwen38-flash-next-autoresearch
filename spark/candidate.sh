@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t222"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1455,6 +1455,53 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         ws = ss[lane];
         for (int o = 16; o; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
         if (lane == 0) sgsum = ws;
+    }
+
+    // Give each equal-sized vocabulary partition one BF16 rescore slot.
+    const int width = k_top > 0 ? n_blocks / k_top : 0;
+    if (width >= 1 && width <= 32 && !(width & (width - 1)) && width * k_top == n_blocks) {
+        float v = my_st.x;
+        int col = __float_as_int(my_st.z);
+        for (int offset = width >> 1; offset; offset >>= 1) {
+            const float peer = __shfl_xor_sync(0xffffffffu, v, offset);
+            const int id = __shfl_xor_sync(0xffffffffu, col, offset);
+            fn_mtp::better(v, col, peer, id);
+        }
+        if (t < n_blocks && (t & (width - 1)) == 0) {
+            po->cand_col[t / width] = col;
+            po->cand_old[t / width] = v;
+        }
+        __syncthreads();
+        float runner = -CUDART_INF_F;
+        int runner_id = 0x7fffffff;
+        if (t < n_blocks && __float_as_int(my_st.z) != col)
+            fn_mtp::better(runner, runner_id, my_st.x, __float_as_int(my_st.z));
+        // Recover the best unselected token from each winning block.
+        for (int u = t; u < 128 * k_top; u += blockDim.x) {
+            const int winner = po->cand_col[u >> 7];
+            const int token = (winner & ~127) + (u & 127);
+            if (token < V && token != winner)
+                fn_mtp::better(runner, runner_id, __bfloat162float(dlogits[token]), token);
+        }
+        for (int offset = 16; offset; offset >>= 1) {
+            fn_mtp::better(runner, runner_id, __shfl_xor_sync(0xffffffffu, runner, offset),
+                           __shfl_xor_sync(0xffffffffu, runner_id, offset));
+        }
+        if (lane == 0) { sv[warp] = runner; si[warp] = runner_id; }
+        __syncthreads();
+        if (warp == 0) {
+            runner = sv[lane]; runner_id = si[lane];
+            for (int offset = 16; offset; offset >>= 1) {
+                fn_mtp::better(runner, runner_id, __shfl_xor_sync(0xffffffffu, runner, offset),
+                               __shfl_xor_sync(0xffffffffu, runner_id, offset));
+            }
+            if (lane == 0) {
+                po->gmax = gmax; po->gsum = sgsum;
+                po->rmax = runner; po->rcol = runner_id;
+                po->K = k_top; po->done_cnt = 0;
+            }
+        }
+        return;
     }
 
     uint32_t hi = s_hi, lo = s_lo;
