@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t316"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -11071,7 +11071,7 @@ patch_exact(
             return exec;
         }
 
-        fn draftWhile(o: Self, d: *Draft, max_steps: usize, confidence: f64, out: *Chain) !bool {
+        fn draftWhile(o: Self, d: *Draft, max_steps: usize, confidence: f64, out: *Chain, warm_token: ?u32) !bool {
             const wg = @import("cuda_window_graph.zig");
             const e = o.e;
             if (e.graphs.head_while.off) return false;
@@ -11112,6 +11112,8 @@ patch_exact(
                 try st.d.check(st.d.api.cuMemcpyHtoDAsync_v2(h.while_ctl_dev.ptr, h.while_ctl_host.bytes.ptr, @sizeOf(MtpChainCtl), st.handle), "cuMemcpyHtoDAsync");
                 try exec_ptr.launchOn(st);
                 try st.d.check(st.d.api.cuMemcpyDtoHAsync_v2(h.while_out_host.bytes.ptr, h.while_out_dev.ptr, @sizeOf(MtpChainOut), st.handle), "cuMemcpyDtoHAsync");
+                // The host can gather the confirmed embedding while the GPU drafts.
+                if (warm_token) |tok| e.ngram.warmToken(&d.draft_hist, tok);
                 try st.synchronize();
             }
 
@@ -11138,12 +11140,13 @@ patch_exact(
         pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
-            if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
+            const warm_token: ?u32 = if (next.len > 0) next[next.len - 1] else null;
             const max_steps = @min(count, max_chain);
             const wg = @import("cuda_window_graph.zig");
             if (whileEnabled() and !mtp.isSampled(sm) and o.h.w2.ready() and o.main == null and d.media == null and o.e.collective == null and max_steps > 1 and wg.enabled() and d.len + max_steps - 1 <= d.cap and std.meta.eql(wg.Geometry.at(d.len + 1, d.cap), wg.Geometry.at(d.len + max_steps - 1, d.cap))) {
-                if (try o.draftWhile(d, max_steps, confidence, out)) return;
+                if (try o.draftWhile(d, max_steps, confidence, out, warm_token)) return;
             }
+            if (warm_token) |tok| o.e.ngram.warmToken(&d.draft_hist, tok);
             var stop: mtp.Stop = mtp.Stop.init(confidence);
             var j: usize = 0;
             while (j < max_steps) : (j += 1) {
