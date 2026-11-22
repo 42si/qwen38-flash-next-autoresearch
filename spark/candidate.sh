@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t306"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1108,7 +1108,10 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_hot(
         for (int j = lane; j < K; j += 32) add_new += expf(cand_new[j] - new_max);
         for (int o = 16; o; o >>= 1) add_new += __shfl_xor_sync(0xffffffffu, add_new, o);
         if (lane == 0) {
-            const float tot_sum = fmaxf(rest_sum + add_new, 1.0f);
+            const float original_mass = sub_old * expf(gmax - new_max);
+            const float correction = original_mass > 0.0f
+                ? sqrtf(fminf(2.0f, fmaxf(0.5f, add_new / original_mass))) : 1.0f;
+            const float tot_sum = fmaxf(rest_sum * correction + add_new, 1.0f);
             const float p_hot = 1.0f / tot_sum;
             const int skip_cold = (any_bad == 0u && isfinite(new_max) && p_hot >= thr_p && new_max >= thr_l) ? 1 : 0;
             *hot_flag = skip_cold;
@@ -1350,7 +1353,10 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best_cond(
             if (any_bad != 0u || !isfinite(new_max)) {
                 best_out[0] = CUDART_NAN_F; best_out[1] = CUDART_NAN_F; best_out[2] = 0.0f; best_out[3] = 0.0f;
             } else {
-                const float tot_sum = fmaxf(rest_sum + add_new, 1.0f);
+                const float original_mass = sub_old * expf(gmax - new_max);
+            const float correction = original_mass > 0.0f
+                ? sqrtf(fminf(2.0f, fmaxf(0.5f, add_new / original_mass))) : 1.0f;
+            const float tot_sum = fmaxf(rest_sum * correction + add_new, 1.0f);
                 best_out[0] = new_max;
                 best_out[1] = new_max + logf(tot_sum);
                 best_out[2] = __int_as_float(best_c);
@@ -13755,7 +13761,7 @@ PY
     export TF_FLASHNEXT_SHARED_EARLY="${TF_FLASHNEXT_SHARED_EARLY:-0}"
     export TF_FLASHNEXT_GDN_DIRECT_KEEP="${TF_FLASHNEXT_GDN_DIRECT_KEEP:-1}"
     export TF_QMMF_M1_GEMV="${TF_QMMF_M1_GEMV:-2}"
-    export TF_FLASHNEXT_W1_HOT_BLOCKS="${TF_FLASHNEXT_W1_HOT_BLOCKS:-0}"
+    export TF_FLASHNEXT_W1_HOT_BLOCKS="${TF_FLASHNEXT_W1_HOT_BLOCKS:-256}"
     export TF_FLASHNEXT_W1_HOT_KTOP="${TF_FLASHNEXT_W1_HOT_KTOP:-32}"
     export TF_FLASHNEXT_W1_HOT_P="${TF_FLASHNEXT_W1_HOT_P:-0.90}"
     export TF_FLASHNEXT_W1_HOT_LOGIT="${TF_FLASHNEXT_W1_HOT_LOGIT:-0.0}"
