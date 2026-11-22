@@ -33,11 +33,11 @@ Full ledger: [`colab/results.tsv`](colab/results.tsv)
 <!-- FRONTIER_TABLE_START -->
 | Track | Hardware | Best Trial | Commit | `decode_c1_tps` | `total_c4_tps` | `total_c8_tps` | `total_c16_tps` | `ttft_c1_s` | `prefill_tps` | GPQA Guard | Engine & Quantization |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
-| `spark` | DGX Spark (GB10 x1) | `0` | `36ee7423` | **74.87** | 137.76 | 187.93 | 228.41 | 0.185 s | 1,743.19 | `G13` 13/13 | TensorFold v1.2.9 (`6b9de695`) + NVFP4 (`fc694b54`) |
+| `spark` | DGX Spark (GB10 x1) | `137` | `155b6558` | **139.10** | 187.10 | 252.52 | 296.73 | 0.144 s | 1,447.57 | `hash_match=1` (GPQA —) | TensorFold v1.2.9 (`6b9de695`, `spark/candidate.sh` patches) + NVFP4 (`fc694b54`) |
 | `colab` | RTX PRO 6000 (G4 x1) | — | — | — | — | — | — | — | — | — | — |
 <!-- FRONTIER_TABLE_END -->
 
-*(Cells remain blank until measured by the frozen harness and recorded in `<site>/results.tsv`.)*
+*(Baseline trial `0` on the current Spark stack: `77.93` tok/s `decode_c1_tps`, commit `99f86afa`. Trial `137` passed the accuracy guard via greedy 16-prompt exact output match `hash_match=1` with GPQA columns blank in `spark/results.tsv`; the full `engine` tag is recorded in `spark/results.tsv`. Cells remain `—` until measured by the frozen harness and recorded in `<site>/results.tsv`.)*
 
 ---
 
