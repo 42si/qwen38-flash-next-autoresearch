@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137-t237"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13681,6 +13681,65 @@ patch_exact(
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
         }""",
 )
+# Cache-only speculative prefill, adapted to the pinned attention and graph interfaces.
+patch_exact(
+    root, "cuda_batch.zig",
+    """        /// attnBlock, keeping its q|gate, k and v projections and o_proj's input.""",
+    """        /// Populate only the draft attention caches when no proposal output is consumed.
+        pub fn attnBlockCache(self: *Self, lw: *const Layer) !void {
+            const s = self.s;
+            _ = try self.lane(s.mixed, s.xsm, lw.proj, s.proj, s.dummy, self.rows, 1);
+            try self.attnRows(lw, 0, s.proj, self.rows, .{
+                .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao, .cache_only = true,
+            });
+        }
+
+        /// attnBlock, keeping its q|gate, k and v projections and o_proj's input.""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """const RowsAt = struct { pos: u64, q: u64, iq: u64, ao: u64, gated: u64 = 0, pn: usize = 0 };""",
+    """const RowsAt = struct { pos: u64, q: u64, iq: u64, ao: u64, gated: u64 = 0, pn: usize = 0, cache_only: bool = false };""",
+)
+patch_exact(
+    root, "cuda_batch.zig",
+    """n, pg);
+            const nb = scoreStride(self.seq.cap);""",
+    """n, pg);
+            if (at.cache_only) return;
+            const nb = scoreStride(self.seq.cap);""",
+)
+patch_exact(
+    root, "cuda_mtp_ops.zig",
+    """if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);""",
+    """if (head_to > at) try o.forwardHeadImpl(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false, d.media != null or o.e.collective != null);""",
+)
+patch_exact(
+    root, "cuda_mtp_ops.zig",
+    """        pub fn forwardHead(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool) !void {""",
+    """        pub fn forwardHead(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool) !void {
+            return o.forwardHeadImpl(d, next, rows, scores, true);
+        }
+
+        fn forwardHeadImpl(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool, keep_last: bool) !void {""",
+)
+patch_exact(
+    root, "cuda_mtp_ops.zig",
+    """.last = at + m == next.len, .score = at + m == next.len and scores""",
+    """.last = keep_last and at + m == next.len, .score = at + m == next.len and scores""",
+)
+patch_exact(
+    root, "cuda_mtp_pieces.zig",
+    """            try pp.attnBlock(&hh.layer, 0);
+            try t.hcWriteback(ps.h, ps.h, ps.pss, ps.part, "*fp32", ps.inj, ps.dummy, "*bf16", ps.dummy, "*bf16", m * dims""",
+    """            if (!r.last and r.d.media == null and ee.collective == null) {
+                try pp.attnBlockCache(&hh.layer);
+                return;
+            }
+            try pp.attnBlock(&hh.layer, 0);
+            try t.hcWriteback(ps.h, ps.h, ps.pss, ps.part, "*fp32", ps.inj, ps.dummy, "*bf16", ps.dummy, "*bf16", m * dims""",
+)
+
 PY
 }
 
