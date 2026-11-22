@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t217"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5008,7 +5008,7 @@ static __device__ __forceinline__ uint32_t s5_unpack4(
   const uint32_t q = __byte_perm(lo16, lo16 >> 4, 0x5140) & 0x0f0f0f0fu;
   const uint32_t h = ((hi4 * 0x00204081u) & 0x01010101u) << 4;
   const uint32_t qh = q | h;
-  uint32_t val = qh + smin4;
+  uint32_t val = __vadd4(qh, smin4) & ~__vcmpeq4(qh, 0x1e1e1e1eu);
   const uint32_t eq31 = (qh + 0x01010101u) & 0x20202020u;
   if (__builtin_expect(eq31 != 0u, 0)) val = s5_fix4(val, eq31, meta, esc, midx, key_base);
   return val;
@@ -5041,7 +5041,7 @@ static __device__ __forceinline__ uint4 s5_unpack16(
     const uint32_t h = ((h4 * 0x00204081u) & 0x01010101u) << 4;
     const uint32_t qh = q | h;
     eq = (qh + 0x01010101u) & 0x20202020u;
-    return qh + smin4;
+    return __vadd4(qh, smin4) & ~__vcmpeq4(qh, 0x1e1e1e1eu);
   };
   uint32_t e0, e1, e2, e3;
   uint4 sf;
@@ -13174,11 +13174,12 @@ fn bestSmin(scales: []const u8) u8 {
     var hist: [256]u32 = @splat(0);
     for (scales) |b| hist[b] += 1;
     var cur: u32 = 0;
-    for (0..31) |i| cur += hist[i];
+    // Reserve one direct code for a zero scale. The other thirty cover a positive interval.
+    for (1..31) |i| cur += hist[i];
     var best_sum: u32 = cur;
-    var best_s: u8 = 0;
-    for (1..226) |s| {
-        cur = cur + hist[s + 30] - hist[s - 1];
+    var best_s: u8 = 1;
+    for (2..227) |s| {
+        cur = cur + hist[s + 29] - hist[s - 1];
         if (cur > best_sum) {
             best_sum = cur;
             best_s = @intCast(s);
@@ -13244,7 +13245,7 @@ pub fn packGateUpS5(
                         const row = cb * ex.cols + j * 8 + t * 2 + c;
                         const raw = scales[row * (k / 16) + g * 2 + h];
                         const key: u32 = @intCast((cb * kg + g) * 64 + t * 16 + u);
-                        const q: u8 = if (raw >= smin and @as(usize, raw) <= @as(usize, smin) + 30)
+                        const q: u8 = if (raw == 0) 30 else if (raw >= smin and @as(usize, raw) <= @as(usize, smin) + 29)
                             raw - smin
                         else blk: {
                             try esc_out.append(alloc, (key << 8) | raw);
@@ -13300,7 +13301,7 @@ pub fn packDownS5(
                         const row = cb * ex.cols + j * 8 + t * 2 + c;
                         const raw = scales[row * (k / 16) + g * 2 + h];
                         const key: u32 = @intCast((cb * kg + g) * 64 + t * 16 + u);
-                        const q: u8 = if (raw >= smin and @as(usize, raw) <= @as(usize, smin) + 30)
+                        const q: u8 = if (raw == 0) 30 else if (raw >= smin and @as(usize, raw) <= @as(usize, smin) + 29)
                             raw - smin
                         else blk: {
                             try esc_out.append(alloc, (key << 8) | raw);
