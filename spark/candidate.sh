@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t320"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1815,6 +1815,7 @@ struct MtpChainCtl {
     double alpha;
     double decay;
     double gamma;
+    double late_gamma;
     int start_pos;
     int max_steps;
     int vocab_n;
@@ -1850,7 +1851,8 @@ __device__ __forceinline__ void mtp_stop_take(
         return;
     }
     if (c < 0.0) {
-        const double pq = (ctl->gamma == 1.0) ? p : pow(p, ctl->gamma);
+        const double exponent = (j < 2) ? ctl->gamma : ctl->late_gamma;
+        const double pq = (exponent == 1.0) ? p : pow(p, exponent);
         const double prod = (*product) * pq;
         *product = prod;
         if (j >= 15 && (ctl->ext_stay > 0.0 || ctl->ext_tok > 0.0)) {
@@ -10986,6 +10988,7 @@ patch_exact(
             alpha: f64,
             decay: f64,
             gamma: f64,
+            late_gamma: f64,
             start_pos: i32,
             max_steps: i32,
             vocab_n: i32,
@@ -11100,7 +11103,8 @@ patch_exact(
                 .p_cliff = stop_cfg.p_cliff,
                 .alpha = stop_cfg.alpha,
                 .decay = stop_cfg.decay,
-                .gamma = stop_cfg.gamma,
+                .gamma = stop_cfg.gamma * std.math.clamp(1.0 - 2.0 * d.calibration_error[0], 0.65, 1.5),
+                .late_gamma = stop_cfg.gamma * std.math.clamp(1.0 - 2.0 * d.calibration_error[1], 0.65, 1.5),
                 .start_pos = @intCast(d.len),
                 .max_steps = @intCast(max_steps),
                 .vocab_n = @intCast(h.ids.len),
@@ -11137,6 +11141,32 @@ patch_exact(
 
         pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
             out.n = 0;
+            const observe = !mtp.isSampled(sm) and confidence < 0.0;
+            if (observe and d.calibration_n > 0 and position >= next.len and position - next.len == d.calibration_pos) {
+                var error_sum: [2]f64 = .{ 0.0, 0.0 };
+                var observations: [2]usize = .{ 0, 0 };
+                for (0..@min(next.len, d.calibration_n)) |idx| {
+                    const hit = next[idx] == d.calibration_ids[idx];
+                    const band: usize = @intFromBool(idx >= 2);
+                    error_sum[band] += @as(f64, @floatFromInt(@intFromBool(hit))) - d.calibration_probs[idx];
+                    observations[band] += 1;
+                    if (!hit) break;
+                }
+                for (0..2) |band| {
+                    if (observations[band] == 0) continue;
+                    const mean = error_sum[band] / @as(f64, @floatFromInt(observations[band] + 1));
+                    d.calibration_error[band] = 0.75 * d.calibration_error[band] + 0.25 * mean;
+                }
+            } else d.calibration_error = .{ 0.0, 0.0 };
+            d.calibration_n = 0;
+            defer {
+                if (observe) {
+                    d.calibration_n = out.n;
+                    d.calibration_pos = position;
+                    @memcpy(d.calibration_ids[0..out.n], out.tokens[0..out.n]);
+                    @memcpy(d.calibration_probs[0..out.n], out.probs[0..out.n]);
+                }
+            }
             try o.absorb(d, next, rows, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
             const max_steps = @min(count, max_chain);
@@ -11145,6 +11175,9 @@ patch_exact(
                 if (try o.draftWhile(d, max_steps, confidence, out)) return;
             }
             var stop: mtp.Stop = mtp.Stop.init(confidence);
+            const early = std.math.clamp(1.0 - 2.0 * d.calibration_error[0], 0.65, 1.5);
+            stop.late_factor = std.math.clamp(1.0 - 2.0 * d.calibration_error[1], 0.65, 1.5) / early;
+            stop.gamma *= early;
             var j: usize = 0;
             while (j < max_steps) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
@@ -11336,6 +11369,7 @@ pub const Stop = struct {
     alpha: f64 = 0.0,
     decay: f64 = 1.0,
     gamma: f64 = 1.0,
+    late_factor: f64 = 1.0,
 
     pub fn init(c: f64) Stop {
         const a = envF64("TF_FLASHNEXT_STOP_ALPHA", 0.0);
@@ -11360,7 +11394,8 @@ pub const Stop = struct {
             return .{ .propose = true, .more = !low };
         }
         if (s.c < 0) {
-            const pq: f64 = if (s.gamma == 1.0) p else std.math.pow(f64, p, s.gamma);
+            const exponent = if (j < 2) s.gamma else s.gamma * s.late_factor;
+            const pq: f64 = if (exponent == 1.0) p else std.math.pow(f64, p, exponent);
             s.product *= pq;
             if (j >= 15 and (s.ext_stay > 0 or s.ext_tok > 0)) {
                 if (s.product < s.ext_stay or p < s.ext_tok) return .{ .propose = false, .more = false };
@@ -12338,7 +12373,7 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp_draft.zig",
     "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
-    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,\n    calibration_pos: u64 = 0,\n    calibration_n: usize = 0,\n    calibration_ids: [max_chain]u32 = undefined,\n    calibration_probs: [max_chain]f64 = undefined,\n    calibration_error: [2]f64 = .{ 0.0, 0.0 },",
 )
 patch_exact(
     root, "cuda_lanes_verify.zig",
