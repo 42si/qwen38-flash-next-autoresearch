@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t280"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1851,7 +1851,8 @@ __device__ __forceinline__ void mtp_stop_take(
     }
     if (c < 0.0) {
         const double pq = (ctl->gamma == 1.0) ? p : pow(p, ctl->gamma);
-        const double prod = (*product) * pq;
+        const double independent = (*product) * pq;
+        const double prod = independent + 0.125 * (fmin(*product, pq) - independent);
         *product = prod;
         if (j >= 15 && (ctl->ext_stay > 0.0 || ctl->ext_tok > 0.0)) {
             if (prod < ctl->ext_stay || p < ctl->ext_tok) {
@@ -11361,7 +11362,8 @@ pub const Stop = struct {
         }
         if (s.c < 0) {
             const pq: f64 = if (s.gamma == 1.0) p else std.math.pow(f64, p, s.gamma);
-            s.product *= pq;
+            const independent = s.product * pq;
+            s.product = independent + 0.125 * (@min(s.product, pq) - independent);
             if (j >= 15 and (s.ext_stay > 0 or s.ext_tok > 0)) {
                 if (s.product < s.ext_stay or p < s.ext_tok) return .{ .propose = false, .more = false };
                 s.exp_acc += s.product;
