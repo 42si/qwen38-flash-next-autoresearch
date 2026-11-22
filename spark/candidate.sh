@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t264"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -7617,6 +7617,32 @@ instrument_pdl("flashnext_gdn_lanes.cuh", expect_min=4)
 instrument_pdl("flashnext_gdn_fused.cuh", expect_min=2)
 instrument_pdl("flashnext_gdn_tpr.cuh", expect_min=2)
 instrument_pdl("flashnext_attn.cu", expect_min=12)
+patch_k(
+    "flashnext_attn.cu",
+    """    auto load = [&](int t0, int buf) {""",
+    """    auto tile_address = [&](int base, int key) -> long long {
+        const int stride = HK * HD;
+        // The 32 adjacent rows of an aligned dense tile fit in one physical page.
+        if (!sparse && pg.ptok >= 32 && (pg.ptok & 31) == 0 && (base & 31) == 0) {
+            long long page_base = 0;
+            if (lane == 0) page_base = page_row(pg, base, pg.ptok, stride) + hk * HD;
+            page_base = __shfl_sync(0xffffffffu, page_base, 0);
+            return page_base + (key >= 0 ? static_cast<long long>(lane) * stride : 0);
+        }
+        return page_row(pg, max(key, 0), pg.ptok, stride) + hk * HD;
+    };
+    auto load = [&](int t0, int buf) {""",
+)
+patch_k(
+    "flashnext_attn.cu",
+    """if constexpr (PAGED) key_at[buf][threadIdx.x] = page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;""",
+    """if constexpr (PAGED) key_at[buf][threadIdx.x] = tile_address(start + t0, key);""",
+)
+patch_k(
+    "flashnext_attn.cu",
+    """if constexpr (PAGED) key_at[0][threadIdx.x] = page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;""",
+    """if constexpr (PAGED) key_at[0][threadIdx.x] = tile_address(start + t0, key);""",
+)
 patch_k(
     "flashnext_attn.cu",
     """template <int NB, bool ONE = false, bool FUSE = false, bool PAGED = false>
