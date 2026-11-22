@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t284"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2448,40 +2448,36 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(1024) fn_head_rescore_best(
+extern "C" __global__ void __launch_bounds__(32) fn_head_rescore_best(
     const __nv_bfloat16* X,
     const __nv_bfloat16* __restrict__ W_bf16,
     const int* cols,
     float* __restrict__ best_out,
     int V,
-    int K) {
+    int K, int parts) {
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
     const int r = blockIdx.y;
-    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    best_out += (static_cast<size_t>(r) * parts + blockIdx.x) * 4;
+    const int t = threadIdx.x, lane = t;
     if (cols[static_cast<long long>(r) * K] < 0) {
         if (t == 0) {
-            best_out[r * 4 + 0] = __int_as_float(0x7fc00000);
-            best_out[r * 4 + 1] = __int_as_float(0x7fc00000);
-            best_out[r * 4 + 2] = __int_as_float(-1);
-            best_out[r * 4 + 3] = 0.0f;
+            best_out[0] = __int_as_float(0x7fc00000);
+            best_out[1] = __int_as_float(0x7fc00000);
+            best_out[2] = __int_as_float(-1);
+            best_out[3] = 0.0f;
         }
 #if __CUDA_ARCH__ >= 900
         asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
         return;
     }
-    __shared__ float sx[320 * 9];
-    const __nv_bfloat16* xr = X + static_cast<size_t>(r) * 2560;
-    for (int idx = t; idx < 2560; idx += 1024) {
-        sx[(idx >> 3) * 9 + (idx & 7)] = __bfloat162float(xr[idx]);
-    }
-    __syncthreads();
+    const uint4* xr = reinterpret_cast<const uint4*>(X + static_cast<size_t>(r) * 2560);
     float bv = __int_as_float(0xff800000);
     int bc = 0x7fffffff;
     int bad = 0;
-    for (int j = warp; j < K; j += 32) {
+    for (int j = blockIdx.x; j < K; j += parts) {
         const int c = cols[static_cast<long long>(r) * K + j];
         if (c < 0 || c >= V) continue;
         const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
@@ -2489,16 +2485,16 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_rescore_best(
         #pragma unroll
         for (int i = lane; i < 320; i += 32) {
             const uint4 wv = __ldg(wp4 + i);
-            const float* xp = sx + i * 9;
+            const uint4 xv = __ldg(xr + i);
             const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
-            sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+            sum = fmaf(__uint_as_float(xv.x << 16), __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+            sum = fmaf(__uint_as_float(xv.x & 0xffff0000u), __uint_as_float(u0 & 0xFFFF0000u), sum);
+            sum = fmaf(__uint_as_float(xv.y << 16), __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+            sum = fmaf(__uint_as_float(xv.y & 0xffff0000u), __uint_as_float(u1 & 0xFFFF0000u), sum);
+            sum = fmaf(__uint_as_float(xv.z << 16), __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+            sum = fmaf(__uint_as_float(xv.z & 0xffff0000u), __uint_as_float(u2 & 0xFFFF0000u), sum);
+            sum = fmaf(__uint_as_float(xv.w << 16), __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+            sum = fmaf(__uint_as_float(xv.w & 0xffff0000u), __uint_as_float(u3 & 0xFFFF0000u), sum);
         }
         for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
         if (lane == 0) {
@@ -2512,41 +2508,38 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_rescore_best(
             }
         }
     }
-    __shared__ float sv[32];
-    __shared__ int sc[32];
-    __shared__ int sb[32];
     if (lane == 0) {
-        sv[warp] = bv;
-        sc[warp] = bc;
-        sb[warp] = bad;
+        const bool invalid = bad || (parts == 1 && (bc < 0 || bc >= V));
+        const float score = invalid ? __int_as_float(0x7fc00000) : bv;
+        best_out[0] = score;
+        best_out[1] = score;
+        best_out[2] = __int_as_float(invalid ? -1 : bc);
+        best_out[3] = 0.0f;
     }
-    __syncthreads();
-    if (warp == 0) {
-        float v = sv[lane];
-        int c = sc[lane];
-        int b = sb[lane];
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
-            const int oc = __shfl_xor_sync(0xffffffffu, c, o);
-            b |= __shfl_xor_sync(0xffffffffu, b, o);
-            if (ov > v || (ov == v && oc < c)) {
-                v = ov;
-                c = oc;
-            }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+extern "C" __global__ void fn_head_merge_best(
+    const float4* partials, float4* best, int rows, int parts, int vocab) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) {
+        float score = __int_as_float(0xff800000);
+        int token = 0x7fffffff;
+        bool bad = false;
+        for (int i = 0; i < parts; ++i) {
+            const float4 p = partials[row * parts + i];
+            const int id = __float_as_int(p.z);
+            bad |= isnan(p.x);
+            if (p.x > score || (p.x == score && id < token)) { score = p.x; token = id; }
         }
-        if (lane == 0) {
-            if (b || c < 0 || c >= V) {
-                best_out[r * 4 + 0] = __int_as_float(0x7fc00000);
-                best_out[r * 4 + 1] = __int_as_float(0x7fc00000);
-                best_out[r * 4 + 2] = __int_as_float(-1);
-                best_out[r * 4 + 3] = 0.0f;
-            } else {
-                best_out[r * 4 + 0] = v;
-                best_out[r * 4 + 1] = v;
-                best_out[r * 4 + 2] = __int_as_float(c);
-                best_out[r * 4 + 3] = 0.0f;
-            }
-        }
+        best[row] = bad || token < 0 || token >= vocab
+            ? make_float4(__int_as_float(0x7fc00000), __int_as_float(0x7fc00000), __int_as_float(-1), 0.0f)
+            : make_float4(score, score, __int_as_float(token), 0.0f);
     }
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
@@ -11549,10 +11542,24 @@ patch_exact(
             a2.add(self.m.head.b.ptr);
             a2.add(s.router_l);
             if (direct) {
-                a2.add(self.hooks.best_out);
+                const wanted = @max(1, @min(32, k_top));
+                const used = std.mem.alignForward(usize, n * k_top * 4, 16);
+                const parts = if (used + n * wanted * 16 <= s.cap * (wt.experts_n + 1) * 4) wanted else 1;
+                const dest = if (parts == 1) self.hooks.best_out else s.router_l + used;
+                a2.add(dest);
                 a2.add(@as(c_int, vocab));
                 a2.add(@as(c_int, @intCast(k_top)));
-                try cuda.launch.launch(self.k.head_rescore_best, .{ .grid = .{ .x = 1, .y = @intCast(n) }, .block = .{ .x = 1024 }, .pdl = true }, self.stream, &a2);
+                a2.add(@as(c_int, @intCast(parts)));
+                try cuda.launch.launch(self.k.head_rescore_best, .{ .grid = .{ .x = @intCast(parts), .y = @intCast(n) }, .block = .{ .x = 32 }, .pdl = true }, self.stream, &a2);
+                if (parts > 1) {
+                    var merge: cuda.Args = .{};
+                    merge.add(dest);
+                    merge.add(self.hooks.best_out);
+                    merge.add(@as(c_int, @intCast(n)));
+                    merge.add(@as(c_int, @intCast(parts)));
+                    merge.add(@as(c_int, vocab));
+                    try cuda.launch.launch(self.k.head_merge_best, .{ .grid = .{ .x = @intCast((n + 31) / 32) }, .block = .{ .x = 32 }, .pdl = true }, self.stream, &merge);
+                }
             } else {
                 a2.add(out);
                 a2.add(@as(c_int, vocab));
@@ -13681,6 +13688,12 @@ patch_exact(
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
         }""",
 )
+patch_exact(root, "cuda_batch_kernels.zig",
+    "    head_rescore_best: cuda.Function,",
+    "    head_rescore_best: cuda.Function,\n    head_merge_best: cuda.Function,")
+patch_exact(root, "cuda_batch_kernels.zig",
+    '        k.head_rescore_best = try k.batch.function("fn_head_rescore_best");',
+    '        k.head_rescore_best = try k.batch.function("fn_head_rescore_best");\n        k.head_merge_best = try k.batch.function("fn_head_merge_best");')
 PY
 }
 
