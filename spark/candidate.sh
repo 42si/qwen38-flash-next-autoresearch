@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="flashnext-nvfp4-t300"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1458,18 +1458,35 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
     }
 
     uint32_t hi = s_hi, lo = s_lo;
-    for (int it = 0; it < 16 && lo < hi; ++it) {
-        const uint32_t mid = (lo + hi + 1u) >> 1;
-        const uint32_t m = __ballot_sync(0xffffffffu, (t < n_blocks) && (my_ord >= mid));
-        if (lane == 0) wcnt[warp] = __popc(m);
-        __syncthreads();
-        if (warp == 0) {
-            uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-            if (lane == 0) s_tot = c;
+    __shared__ uint32_t upper_counts[32];
+    __shared__ int selected_quarter;
+    while (lo < hi) {
+        const uint32_t width = hi - lo + 1u;
+        const uint32_t q1 = lo + width / 4u;
+        const uint32_t q2 = lo + width / 2u;
+        const uint32_t q3 = lo + 3u * width / 4u;
+        const bool valid = t < n_blocks;
+        const uint32_t n1 = __popc(__ballot_sync(0xffffffffu, valid && my_ord >= q1));
+        const uint32_t n2 = __popc(__ballot_sync(0xffffffffu, valid && my_ord >= q2));
+        const uint32_t n3 = __popc(__ballot_sync(0xffffffffu, valid && my_ord >= q3));
+        if (lane == 0) {
+            wcnt[warp] = n1 | (n2 << 11);
+            upper_counts[warp] = n3;
         }
         __syncthreads();
-        if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
+        if (warp == 0) {
+            const uint32_t counts = __reduce_add_sync(0xffffffffu, wcnt[lane]);
+            const uint32_t upper = __reduce_add_sync(0xffffffffu, upper_counts[lane]);
+            if (lane == 0) {
+                const uint32_t k = static_cast<uint32_t>(k_top);
+                selected_quarter = upper >= k ? 3 : (counts >> 11) >= k ? 2 : (counts & 2047u) >= k ? 1 : 0;
+            }
+        }
+        __syncthreads();
+        if (selected_quarter == 3) lo = q3;
+        else if (selected_quarter == 2) { lo = q2; hi = q3 - 1u; }
+        else if (selected_quarter == 1) { lo = q1; hi = q2 - 1u; }
+        else hi = q1 > lo ? q1 - 1u : lo;
     }
     const uint32_t blk_cut = lo;
     float rmax = -CUDART_INF_F;
