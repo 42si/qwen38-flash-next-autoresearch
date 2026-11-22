@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="flashnext-nvfp4-t302"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2481,34 +2481,47 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_rescore_best(
     float bv = __int_as_float(0xff800000);
     int bc = 0x7fffffff;
     int bad = 0;
-    for (int j = warp; j < K; j += 32) {
-        const int c = cols[static_cast<long long>(r) * K + j];
-        if (c < 0 || c >= V) continue;
-        const uint4* wp4 = reinterpret_cast<const uint4*>(W_bf16 + static_cast<size_t>(c) * 2560);
-        float sum = 0.0f;
+    auto accumulate = [](float sum, const float* xp, uint4 wv) {
+        const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
+        sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
+        sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
+        sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+        return sum;
+    };
+    const int* ids = cols + static_cast<long long>(r) * K;
+    for (int j = warp; j < K; j += 64) {
+        const int first = ids[j], second = j + 32 < K ? ids[j + 32] : -1;
+        const bool use_first = first >= 0 && first < V;
+        const bool use_second = second >= 0 && second < V;
+        if (!use_first && !use_second) continue;
+        const uint4* weights = reinterpret_cast<const uint4*>(W_bf16);
+        float sums[2] = {};
         #pragma unroll
         for (int i = lane; i < 320; i += 32) {
-            const uint4 wv = __ldg(wp4 + i);
             const float* xp = sx + i * 9;
-            const uint32_t u0 = wv.x, u1 = wv.y, u2 = wv.z, u3 = wv.w;
-            sum = fmaf(xp[0], __uint_as_float((u0 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[1], __uint_as_float(u0 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[2], __uint_as_float((u1 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[3], __uint_as_float(u1 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[4], __uint_as_float((u2 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[5], __uint_as_float(u2 & 0xFFFF0000u), sum);
-            sum = fmaf(xp[6], __uint_as_float((u3 & 0xFFFFu) << 16), sum);
-            sum = fmaf(xp[7], __uint_as_float(u3 & 0xFFFF0000u), sum);
+            if (use_first) sums[0] = accumulate(sums[0], xp, __ldg(weights + static_cast<size_t>(first) * 320 + i));
+            if (use_second) sums[1] = accumulate(sums[1], xp, __ldg(weights + static_cast<size_t>(second) * 320 + i));
         }
-        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        if (lane == 0) {
-            const __nv_bfloat16 bfv = __float2bfloat16_rn(sum);
-            const unsigned short u = *reinterpret_cast<const unsigned short*>(&bfv);
-            bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
-            const float fv = __uint_as_float(static_cast<uint32_t>(u) << 16);
-            if (fv > bv || (fv == bv && c < bc)) {
-                bv = fv;
-                bc = c;
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int c = k == 0 ? first : second;
+            if (c < 0 || c >= V) continue;
+            float sum = sums[k];
+            for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (lane == 0) {
+                const __nv_bfloat16 bfv = __float2bfloat16_rn(sum);
+                const unsigned short u = *reinterpret_cast<const unsigned short*>(&bfv);
+                bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
+                const float fv = __uint_as_float(static_cast<uint32_t>(u) << 16);
+                if (fv > bv || (fv == bv && c < bc)) {
+                    bv = fv;
+                    bc = c;
+                }
             }
         }
     }
