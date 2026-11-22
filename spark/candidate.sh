@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t288"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1474,12 +1474,26 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
     const uint32_t blk_cut = lo;
     float rmax = -CUDART_INF_F;
     int rcol = 0x7fffffff;
-    if (t < n_blocks) {
-        if (my_ord >= blk_cut) {
-            act_blk[atomicAdd(&n_act_blk, 1u)] = t;
-        } else {
-            fn_mtp::better(rmax, rcol, my_st.x, __float_as_int(my_st.z));
+    const bool active = t < n_blocks && my_ord >= blk_cut;
+    const unsigned mask = __ballot_sync(0xffffffffu, active);
+    if (lane == 0) wcnt[warp] = __popc(mask);
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned count = wcnt[lane];
+        unsigned prefix = count;
+        for (int step = 1; step < 32; step <<= 1) {
+            const unsigned other = __shfl_up_sync(0xffffffffu, prefix, step);
+            if (lane >= step) prefix += other;
         }
+        wcnt[lane] = prefix - count;
+        if (lane == 31) n_act_blk = prefix;
+    }
+    __syncthreads();
+    if (active) {
+        const unsigned lower = mask & ((1u << lane) - 1u);
+        act_blk[wcnt[warp] + __popc(lower)] = t;
+    } else if (t < n_blocks) {
+        fn_mtp::better(rmax, rcol, my_st.x, __float_as_int(my_st.z));
     }
     __syncthreads();
 
