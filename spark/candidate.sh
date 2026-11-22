@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t291"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -295,10 +295,16 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     const float* __restrict__ G,
     __nv_bfloat16* __restrict__ out,
     float4* __restrict__ stats,
-    int V) {
+    int V, const float* previous_best) {
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
+    if (previous_best != nullptr) {
+        const int winner = __float_as_int(previous_best[2]);
+        if (winner >= 0 && winner < 49152 && previous_best[0] - previous_best[1] > -0.22314355f)
+            V = min(V, 49152);
+        if (static_cast<int>(blockIdx.x) * 128 >= V) return;
+    }
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
@@ -422,7 +428,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     if (lane == 0) ssum[warp] = ex;
     __syncthreads();
     if (tid == 0) {
-        stats[blockIdx.x] = make_float4(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3], __int_as_float(sbcol), 0.0f);
+        stats[blockIdx.x] = make_float4(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3], __int_as_float(sbcol), static_cast<float>(V));
     }
 }
 
@@ -1396,6 +1402,11 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
     __shared__ float sgmax, sgsum;
     __shared__ uint32_t s_hi, s_lo, s_tot;
     __shared__ unsigned int n_act_blk, n_cand, n_eq_taken;
+    const int active_rows = static_cast<int>(stats[0].w);
+    if (active_rows > 0) {
+        V = min(V, active_rows);
+        n_blocks = (V + 127) / 128;
+    }
 
     float bm = -CUDART_INF_F;
     int bad = 0;
@@ -9598,8 +9609,9 @@ pub const W2 = struct {
         };
     }
 
-    pub fn projectFused(self: *const W2, stream: cuda.Stream, input: u64, dlogits: u64, best_out: u64, vocab_rows: usize) !void {
-        const v = @min(vocab_rows, 65536);
+    pub fn projectFused(self: *const W2, stream: cuda.Stream, input: u64, dlogits: u64, best_out: u64, vocab_rows: usize, greedy_body: bool) !void {
+        const adaptive = greedy_body and self.is_g64 and self.use_multi and self.hot_blocks == 0 and self.k_top > 0 and self.k_top <= 64 and self.pick_fn != null and self.multi_fn != null and vocab_rows <= 131072;
+        const v = if (adaptive) vocab_rows else @min(vocab_rows, 65536);
         const nb = (v + 31) / 32;
         const n_blocks = (nb + 3) / 4;
         const sc = self.scratch.?.ptr;
@@ -9667,6 +9679,7 @@ pub const W2 = struct {
         a1.add(dlogits);
         a1.add(sc);
         a1.add(@as(c_int, @intCast(v)));
+        if (self.is_g64) a1.add(if (adaptive) best_out else @as(u64, 0));
         try cuda.launch.launch(self.gemv_fn.?, .{ .grid = .{ .x = @intCast(n_blocks) }, .block = .{ .x = 128 }, .pdl = true }, stream, &a1);
 
         if (self.use_multi and n_blocks <= 1024 and self.k_top > 0 and self.k_top <= 64 and self.pick_fn != null and self.multi_fn != null) {
@@ -11043,7 +11056,7 @@ patch_exact(
                 .rows = 1,
                 .pos0 = d.len,
             };
-            const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = d.out.ptr, .m = 1, .last = true, .score = true };
+            const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = d.out.ptr, .m = 1, .last = true, .score = true, .greedy_body = true };
 
             try cuda.graph.beginCaptureToGraph(st, while_res.body, .thread_local);
             const cap_err: ?anyerror = blk: {
@@ -11445,10 +11458,11 @@ patch_exact(
     "    pub fn deinit(h: *Head) void {\n        h.draw_batch.deinit(h.gpa);",
     "    pub fn deinit(h: *Head) void {\n        h.while_out_host.free();\n        h.while_ctl_host.free();\n        h.while_out_dev.free();\n        h.while_ctl_dev.free();\n        h.w2.deinit();\n        h.draw_batch.deinit(h.gpa);",
 )
+patch_exact(root, "cuda_mtp_pieces.zig", "        input: u64,\n        m: usize,", "        input: u64,\n        greedy_body: bool = false,\n        m: usize,")
 patch_exact(
     root, "cuda_mtp_pieces.zig",
     "            try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
-    "            if (hh.w2.ready()) try hh.w2.projectFused(pp.stream, ps.mixed, r.d.dlogits.ptr, r.d.best.ptr, hh.ids.len) else try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
+    "            if (hh.w2.ready()) try hh.w2.projectFused(pp.stream, ps.mixed, r.d.dlogits.ptr, r.d.best.ptr, hh.ids.len, r.greedy_body) else try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);",
 )
 patch_exact(
     root, "cuda_mtp_pieces.zig",
