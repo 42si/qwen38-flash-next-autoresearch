@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t216"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1508,29 +1508,70 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         }
     }
     const int any_ovf = __syncthreads_or(ovf);
-    hi = s_hi;
-    lo = blk_cut;
-    for (int it = 0; it < 16 && lo < hi; ++it) {
-        const uint32_t mid = (lo + hi + 1u) >> 1;
-        uint32_t cnt = 0;
-        if (!any_ovf) {
-            for (int j = 0; j < n_loc; ++j) cnt += (loc_ord[j] >= mid);
+    __shared__ uint32_t bins[256], selected;
+    if (s_hi - blk_cut < 256u) {
+        if (t < 256) bins[t] = 0;
+        if (t == 0) selected = blk_cut;
+        __syncthreads();
+        if (!ovf) {
+            for (int j = 0; j < n_loc; ++j) atomicAdd(bins + (loc_ord[j] - blk_cut), 1u);
         } else {
             for (int idx = t; idx < total_act; idx += 1024) {
                 const int i = (act_blk[idx >> 7] << 7) + (idx & 127);
-                if (i < V) cnt += (fn_bf16_ord(drow[i]) >= mid);
+                if (i < V) {
+                    const uint32_t key = fn_bf16_ord(drow[i]);
+                    if (key >= blk_cut) atomicAdd(bins + (key - blk_cut), 1u);
+                }
             }
         }
-        for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
-        if (lane == 0) wcnt[warp] = cnt;
         __syncthreads();
         if (warp == 0) {
-            uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-            if (lane == 0) s_tot = c;
+            const int high = 255 - 8 * lane;
+            unsigned count = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) count += bins[high - j];
+            unsigned through = count;
+            for (int delta = 1; delta < 32; delta <<= 1) {
+                const unsigned left = __shfl_up_sync(0xffffffffu, through, delta);
+                if (lane >= delta) through += left;
+            }
+            const unsigned before = through - count;
+            if (before < (unsigned)k_top && through >= (unsigned)k_top) {
+                unsigned rank = k_top - before;
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned n = bins[high - j];
+                    if (rank <= n) { selected = blk_cut + high - j; break; }
+                    rank -= n;
+                }
+            }
         }
         __syncthreads();
-        if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
+        lo = selected;
+    } else {
+        hi = s_hi;
+        lo = blk_cut;
+        for (int it = 0; it < 16 && lo < hi; ++it) {
+            const uint32_t mid = (lo + hi + 1u) >> 1;
+            uint32_t cnt = 0;
+            if (!any_ovf) {
+                for (int j = 0; j < n_loc; ++j) cnt += (loc_ord[j] >= mid);
+            } else {
+                for (int idx = t; idx < total_act; idx += 1024) {
+                    const int i = (act_blk[idx >> 7] << 7) + (idx & 127);
+                    if (i < V) cnt += (fn_bf16_ord(drow[i]) >= mid);
+                }
+            }
+            for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
+            if (lane == 0) wcnt[warp] = cnt;
+            __syncthreads();
+            if (warp == 0) {
+                uint32_t c = wcnt[lane];
+                for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+                if (lane == 0) s_tot = c;
+            }
+            __syncthreads();
+            if (s_tot >= static_cast<uint32_t>(k_top)) lo = mid; else hi = mid - 1u;
+        }
     }
     const uint32_t tok_cut = lo;
     uint32_t gt_cnt = 0;
