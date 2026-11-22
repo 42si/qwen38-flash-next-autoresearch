@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137-t235"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -296,45 +296,49 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     __nv_bfloat16* __restrict__ out,
     float4* __restrict__ stats,
     int V) {
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int blk = blockIdx.x * 4 + warp;
+    const int row = blk * 32 + lane;
+    auto ld4_256 = [](const uint4* p) -> uint4 {
+        uint4 v;
+#if __CUDA_ARCH__ >= 900
+        asm volatile("ld.global.nc.L1::evict_first.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+#else
+        v = __ldg(p);
+#endif
+        return v;
+    };
+    auto ld1_256 = [](const uint32_t* p) -> uint32_t {
+        uint32_t v;
+#if __CUDA_ARCH__ >= 900
+        asm volatile("ld.global.nc.L1::evict_first.L2::256B.u32 %0, [%1];"
+                     : "=r"(v) : "l"(p));
+#else
+        v = __ldg(p);
+#endif
+        return v;
+    };
+    const uint4* bp = WS + static_cast<size_t>(blk < (V + 31) / 32 ? blk : 0) * 720;
+    uint4 wa, wb;
+    uint32_t s4;
+    if (blk * 32 < V) {
+        wa = ld4_256(bp + lane);
+        wb = ld4_256(bp + 32 + lane);
+        s4 = ld1_256(reinterpret_cast<const uint32_t*>(bp + 64) + lane);
+    }
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
     __shared__ uint32_t sxu[2560];
-    const int tid = threadIdx.x;
     for (int i = tid; i < 2560; i += 128) {
         sxu[i] = __float_as_uint(__bfloat162float(X[i]));
     }
     __syncthreads();
-    const int warp = tid >> 5, lane = tid & 31;
-    const int blk = blockIdx.x * 4 + warp;
-    const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
-        const uint4* bp = WS + static_cast<size_t>(blk) * 720;
-        auto ld4_256 = [](const uint4* p) -> uint4 {
-            uint4 v;
-#if __CUDA_ARCH__ >= 900
-            asm volatile("ld.global.nc.L1::evict_first.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-#else
-            v = __ldg(p);
-#endif
-            return v;
-        };
-        auto ld1_256 = [](const uint32_t* p) -> uint32_t {
-            uint32_t v;
-#if __CUDA_ARCH__ >= 900
-            asm volatile("ld.global.nc.L1::evict_first.L2::256B.u32 %0, [%1];"
-                         : "=r"(v) : "l"(p));
-#else
-            v = __ldg(p);
-#endif
-            return v;
-        };
         float acc0 = 0.0f, acc1 = 0.0f;
-        uint4 wa = ld4_256(bp + lane);
-        uint4 wb = ld4_256(bp + 32 + lane);
-        uint32_t s4 = ld1_256(reinterpret_cast<const uint32_t*>(bp + 64) + lane);
         for (int g4 = 0; g4 < 10; ++g4) {
             uint4 nwa, nwb;
             uint32_t ns4;
