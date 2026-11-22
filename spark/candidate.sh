@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t294"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10762,6 +10762,39 @@ patch_exact(
                 try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);
             }""",
 )
+
+patch_exact(root, "cuda_ple.zig", """pub fn sumGroups(row: []const u16, out: []f32) void {
+    const groups = row.len / 32;
+    for (0..groups) |g| {
+        var buf: [32]f32 = undefined;
+        for (0..32) |i| buf[i] = @bitCast(@as(u32, row[g * 32 + i]) << 16);
+        var n: usize = 32;
+        while (n > 1) {
+            n /= 2;
+            for (0..n) |i| buf[i] = buf[2 * i] + buf[2 * i + 1];
+        }
+        out[g] = buf[0];
+    }
+}""", """pub fn sumGroups(row: []const u16, out: []f32) void {
+    const F4 = @Vector(4, f32);
+    const Pair = struct {
+        inline fn add(a: F4, b: F4) F4 {
+            return @shuffle(f32, a, b, @Vector(4, i32){ 0, 2, -1, -3 }) +
+                @shuffle(f32, a, b, @Vector(4, i32){ 1, 3, -2, -4 });
+        }
+    };
+    for (0..row.len / 32) |g| {
+        var sums: [8]F4 = undefined;
+        inline for (0..8) |i| {
+            const bits: @Vector(4, u16) = row[g * 32 + 4 * i ..][0..4].*;
+            sums[i] = @bitCast(@as(@Vector(4, u32), bits) << @splat(16));
+        }
+        inline for (0..4) |i| sums[i] = Pair.add(sums[2 * i], sums[2 * i + 1]);
+        inline for (0..2) |i| sums[i] = Pair.add(sums[2 * i], sums[2 * i + 1]);
+        const four = Pair.add(sums[0], sums[1]);
+        out[g] = (four[0] + four[1]) + (four[2] + four[3]);
+    }
+}""")
 
 # 5e. cuda_ple.zig + cuda_mtp_draft.zig + cuda_lanes.zig + cuda_lanes_draft.zig + cuda_mtp_ops.zig: 32K PLE cache + pre-gather
 patch_exact(
