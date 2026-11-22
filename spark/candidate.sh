@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t286"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10764,6 +10764,9 @@ patch_exact(
 )
 
 # 5e. cuda_ple.zig + cuda_mtp_draft.zig + cuda_lanes.zig + cuda_lanes_draft.zig + cuda_mtp_ops.zig: 32K PLE cache + pre-gather
+patch_exact(root, "cuda_ple.zig", "    sizes: [max_heads]i64 = undefined,", "    sizes: [max_heads]i64 = undefined,\n    reciprocals: [max_heads]u64 = @splat(0),")
+patch_exact(root, "cuda_ple.zig", "            h.sizes[head] = size;", "            h.sizes[head] = size;\n            h.reciprocals[head] = @intCast((@as(u128, 1) << 64) / @as(u128, @intCast(size)));")
+patch_exact(root, "cuda_ple.zig", "            out[at] = @mod(mixed, h.sizes[at]) + h.offsets[at];", "            const denom: u64 = @intCast(h.sizes[at]);\n            const recip = h.reciprocals[at];\n            const residue: i64 = if (recip == 0) @mod(mixed, h.sizes[at]) else rem: {\n                const abs_mixed: u64 = @abs(mixed);\n                const quot: u64 = @intCast((@as(u128, abs_mixed) * recip) >> 64);\n                var r = abs_mixed - quot * denom;\n                if (r >= denom) r -= denom;\n                break :rem @intCast(if (mixed < 0 and r != 0) denom - r else r);\n            };\n            out[at] = residue + h.offsets[at];")
 patch_exact(
     root, "cuda_ple.zig",
     "const ple_fp8 = @import(\"cuda_ple_fp8.zig\");",
