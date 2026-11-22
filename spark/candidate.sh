@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t350"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4080,6 +4080,34 @@ patch_k(
                 if (MODE == FP4 || ((MODE == MXFP8 || MODE == INT6 || MODE == W2) && (kt & 1)) || ((MODE == FP8G || MODE == W1) && kt == GS / 16 - 1)) {""",
 )
 
+# Widen the two original E2M1 codes exactly; keep scale application after the MMA.
+patch_k("common/fp_pairs.cuh", "#include <cuda_fp8.h>",
+        "#include <cuda_fp8.h>\n#include <cuda_fp4.h>\n#include <cuda_bf16.h>")
+patch_k(
+    "common/fp_pairs.cuh",
+    """    const uint32_t v = w >> s;
+    const uint32_t t = ((v & 0x00070007u) << 6) | ((v & 0x00080008u) << 12);
+    uint32_t r;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\\n" : "=r"(r) : "r"(t), "r"(0x7E807E80u), "r"(0x80008000u));
+    return r;""",
+    """#if defined(TF_SPARK_FP4_PAIR) && __CUDA_ARCH__ >= 1200
+    const uint32_t v = w >> s;
+    const unsigned char codes = static_cast<unsigned char>((v & 15u) | ((v >> 12) & 0xf0u));
+    uint32_t halves;
+    asm("{ .reg .b8 a; mov.b32 {a, _, _, _}, %1; cvt.rn.f16x2.e2m1x2 %0, a; }"
+        : "=r"(halves) : "r"(static_cast<uint32_t>(codes)));
+    const __half2 decoded = __halves2half2(__ushort_as_half(halves & 65535u), __ushort_as_half(halves >> 16));
+    const float2 f = __half22float2(decoded);
+    const __nv_bfloat162 pair = __floats2bfloat162_rn(f.x, f.y);
+    return __bfloat16_as_ushort(pair.x) | (static_cast<uint32_t>(__bfloat16_as_ushort(pair.y)) << 16);
+#else
+    const uint32_t v = w >> s;
+    const uint32_t t = ((v & 0x00070007u) << 6) | ((v & 0x00080008u) << 12);
+    uint32_t r;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\\n" : "=r"(r) : "r"(t), "r"(0x7E807E80u), "r"(0x80008000u));
+    return r;
+#endif""",
+)
 # Fast bit-exact bf16x2 E4M3 scale decode in qmmf_body.cuh (FP4 + INT6 + W2 + W1) and nvfp4_experts.cu (+ mma0)
 patch_k(
     "qmmf_body.cuh",
@@ -10081,6 +10109,12 @@ def patch_exact(base: Path, rel: str, old: str, new: str) -> None:
         raise RuntimeError(f"Expected exactly 1 match in {rel}, got {txt.count(old)}")
     p.write_text(txt.replace(old, new, 1), encoding="utf-8")
 
+# Only the routed NVFP4 kernel needs architecture-specific pair conversion.
+patch_exact(
+    cdir.parents[1] / "build", "cuda_kernels.zig",
+    '.{ .name = "nvfp4_experts", .flags = &.{"-O3"} }',
+    '.{ .name = "nvfp4_experts", .flags = &.{ "-O3", "-DTF_SPARK_FP4_PAIR=1" }, .arch_specific = true }',
+)
 # 5a. zig/src/cuda/qmmf.zig + qmmf_shared.zig: Mode::bf12 + Mode::bf11 + Mode::int6 + Mode::w2 + Mode::w1 + PR #3475 fused split-K
 patch_exact(
     cdir, "qmmf.zig",
