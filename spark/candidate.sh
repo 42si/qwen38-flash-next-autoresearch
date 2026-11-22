@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t317"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -311,21 +311,26 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     float fv = -CUDART_INF_F;
     if (blk * 32 < V) {
         const uint4* bp = WS + static_cast<size_t>(blk) * 720;
-        auto ld4_256 = [](const uint4* p) -> uint4 {
+        unsigned long long policy = 0;
+#if __CUDA_ARCH__ >= 900
+        // Reserve some draft weight lines across successive MTP steps.
+        asm("createpolicy.fractional.L2::evict_last.b64 %0, 0.5;" : "=l"(policy));
+#endif
+        auto ld4_256 = [=](const uint4* p) -> uint4 {
             uint4 v;
 #if __CUDA_ARCH__ >= 900
-            asm volatile("ld.global.nc.L1::evict_first.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+            asm volatile("ld.global.nc.L1::evict_first.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p), "l"(policy));
 #else
             v = __ldg(p);
 #endif
             return v;
         };
-        auto ld1_256 = [](const uint32_t* p) -> uint32_t {
+        auto ld1_256 = [=](const uint32_t* p) -> uint32_t {
             uint32_t v;
 #if __CUDA_ARCH__ >= 900
-            asm volatile("ld.global.nc.L1::evict_first.L2::256B.u32 %0, [%1];"
-                         : "=r"(v) : "l"(p));
+            asm volatile("ld.global.nc.L1::evict_first.L2::cache_hint.L2::256B.u32 %0, [%1], %2;"
+                         : "=r"(v) : "l"(p), "l"(policy));
 #else
             v = __ldg(p);
 #endif
