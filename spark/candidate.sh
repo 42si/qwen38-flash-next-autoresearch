@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t292"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5353,7 +5353,7 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
     sh_lo[lane] = s5_ld4_256(blk + 640 + lane);
     if (lane < 8)  sh_lo[32 + lane] = s5_ld4_256(blk + 672 + lane);
     if (lane < 10) sh_hi[lane]      = s5_ld4_256(blk + 680 + lane);
-    const uint32_t smin4 = (__ldg(meta + e).x & 0xFFu) * 0x01010101u;
+    const uint32_t smin4 = __ldg(reinterpret_cast<const uint32_t*>(blk + 690));
     const float gscale = __ldg(scale + e);
     if (cnt <= 8) {
       const bool v0 = gq < cnt;
@@ -5657,7 +5657,7 @@ static __device__ __forceinline__ void s5_fact_down_tiles(
   };
   constexpr int TA = NT > 0 ? NT : 1;
   const bool active = NT > 0 && cb < NB;
-  const uint32_t smin4 = active ? ((__ldg(meta + e).x & 0xFFu) * 0x01010101u) : 0u;
+  const uint32_t smin4 = active ? __ldg(reinterpret_cast<const uint32_t*>(e_dn_base + (size_t)cb * STRIP4 + 690)) : 0u;
   float acc[1][TA][4][4];
 #pragma unroll
   for (int r = 0; r < NT; ++r)
@@ -13272,10 +13272,13 @@ pub fn packDownS5(
 ) !u8 {
     const nb = n / ex.cols;
     const kg = k / 32;
-    const smin = bestSmin(scales);
+    const scales_per_strip = ex.cols * (k / 16);
     for (0..nb) |cb| {
         const cb_off = cb * 11136;
+        const strip_scales = scales[cb * scales_per_strip ..][0..scales_per_strip];
+        const smin = @min(bestSmin(strip_scales), 224);
         @memset(out_bytes[cb_off + 11040 ..][0..96], 0);
+        @memset(out_bytes[cb_off + 11040 ..][0..4], smin);
         for (0..kg) |g| {
             const block_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_bytes[cb_off + g * 512 ..][0..512]));
             for (0..8) |gq| for (0..4) |t| for (0..4) |j| {
@@ -13315,7 +13318,7 @@ pub fn packDownS5(
             }
         }
     }
-    return smin;
+    return 0;
 }
 
 pub const S5Rec = struct {
