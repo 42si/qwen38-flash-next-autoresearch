@@ -31,6 +31,8 @@ SRC_DIR="$WORKDIR/engines/tf-src-${ENGINE_COMMIT:0:8}"
 BUILD_DIR="$WORKDIR/engines/tf-${ENGINE_COMMIT:0:8}-${BUILD_FLAVOR}"
 ENGINE_BIN="$BUILD_DIR/native/bin/tensorfold-native"
 MODEL_DIR="$WORKDIR/models/Qwen3.8-Flash-Next-NVFP4-${WEIGHTS_REV:0:8}"
+DRAFT_REV="38b78560cc7d4b91287c9d5bb49da728e16f46eb"
+SERVE_MODEL_DIR="$WORKDIR/models/flashnext-${WEIGHTS_REV:0:8}-draft-${DRAFT_REV:0:8}-inputs-hidden"
 
 apply_patches() {
   local fn_dir="$SRC_DIR/zig/src/families/flashnext"
@@ -13684,10 +13686,101 @@ patch_exact(
 PY
 }
 
+prepare_draft_overlay() {
+  if [[ -f "$SERVE_MODEL_DIR/model.safetensors.index.json" ]]; then return; fi
+  python3 - "$MODEL_DIR" "$SERVE_MODEL_DIR" "$DRAFT_REV" <<'PY'
+import hashlib
+import json
+import os
+import shutil
+import struct
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+base, destination = map(Path, sys.argv[1:3])
+revision = sys.argv[3]
+index_name = "model.safetensors.index.json"
+index = json.loads((base / index_name).read_text())
+weight_map = index["weight_map"]
+names = ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight",
+         "mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight"]
+
+# The pinned donor stores each pair of BF16 input tensors contiguously.
+# Their shapes and order were checked against both published shard headers.
+ranges = [(2769137912, 2795352312), (2950249208, 2950274808)]
+byte_count = sum(hi - lo for lo, hi in ranges)
+expected = "97f644aac2c9b90914e76c761f1c8326dc8157ee3f9684515efc50f08a189f2b"
+url = (f"https://huggingface.co/diffbot/Qwen3.8-Flash-Next-FP4-Local-DGX-Spark/resolve/{revision}"
+       "/tensors/model-00015-of-00021.safetensors")
+source_info = {}
+for shard in sorted({weight_map[k] for k in names}):
+    with (base / shard).open("rb") as f:
+        header_size, = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_size))
+    source_info.update({k: header[k] for k in names if weight_map[k] == shard})
+header = {}
+offset = 0
+for k in names:
+    desc = source_info[k]
+    lo, hi = desc["data_offsets"]
+    if desc["dtype"] != "BF16":
+        raise ValueError("unexpected MTP tensor type")
+    header[k] = dict(desc, data_offsets=[offset, offset + hi - lo])
+    offset += hi - lo
+if offset != byte_count:
+    raise ValueError("unexpected total dense MTP weight size")
+
+with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".mtp-stage-") as temp:
+    staged = Path(temp) / "model"
+    # Share immutable base shards and replace only the hidden input branch.
+    shutil.copytree(base, staged, copy_function=lambda src, dst: os.link(os.path.realpath(src), dst),
+                    ignore=shutil.ignore_patterns(".*", index_name))
+    draft_name = "draft-inputs.safetensors"
+    cached = destination.with_name(destination.name.removesuffix("-hidden")) / draft_name
+    if cached.is_file():
+        with cached.open("rb") as donor:
+            header_size, = struct.unpack("<Q", donor.read(8))
+            if json.loads(donor.read(header_size)) != header:
+                raise ValueError("unexpected cached donor layout")
+            donor_bytes = donor.read(byte_count + 1)
+    else:
+        donor_bytes = bytearray()
+        for first_byte, limit in ranges:
+            for start in range(first_byte, limit, 8 << 20):
+                end = min(start + (8 << 20), limit) - 1
+                request = urllib.request.Request(f"{url}?bytes={start}-{end}", headers={"Range": f"bytes={start}-{end}"})
+                with urllib.request.urlopen(request, timeout=90) as response:
+                    if response.status != 206 or response.headers.get("Content-Range") != f"bytes {start}-{end}/4860574920":
+                        raise ValueError("unexpected donor range")
+                    donor_bytes.extend(response.read(end - start + 2))
+    if len(donor_bytes) != byte_count or hashlib.sha256(donor_bytes).hexdigest() != expected:
+        raise ValueError("dense MTP payload checksum mismatch")
+    selected = ("mtp.fc_hidden.weight", "mtp.pre_fc_norm_hidden.weight")
+    selected_header = {}
+    data = bytearray()
+    for name in selected:
+        lo, hi = header[name]["data_offsets"]
+        offset = len(data)
+        data.extend(donor_bytes[lo:hi])
+        selected_header[name] = dict(header[name], data_offsets=[offset, len(data)])
+        weight_map[name] = draft_name
+    encoded = json.dumps(selected_header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    with (staged / draft_name).open("xb") as out:
+        out.write(struct.pack("<Q", len(encoded)))
+        out.write(encoded)
+        out.write(data)
+    (staged / index_name).write_text(json.dumps(index, separators=(",", ":")))
+    staged.rename(destination)
+PY
+}
+
 case "$ACTION" in
   meta)
     cat <<EOF
-{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}","context":${SPEED_CONTEXT}}
+{"engine":"${ENGINE_NAME} v${ENGINE_VERSION}+${BUILD_FLAVOR}+greedy23","engine_rev":"${ENGINE_COMMIT:0:8}","quant":"${QUANT_NAME}","weights_rev":"${WEIGHTS_REV:0:8}+mtp.hidden.${DRAFT_REV:0:8}","context":${SPEED_CONTEXT}}
 EOF
     ;;
 
@@ -13742,6 +13835,7 @@ repo_id, rev, local_dir = sys.argv[1:4]
 snapshot_download(repo_id=repo_id, revision=rev, local_dir=local_dir)
 PY
     fi
+    prepare_draft_overlay
     ;;
 
   start)
@@ -13783,16 +13877,15 @@ PY
     export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     export TF_FLASHNEXT_MTP_WHILE="1"
+    export TF_FLASHNEXT_DRAFTS_GREEDY="${TF_FLASHNEXT_DRAFTS_GREEDY:-23}"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       export TF_FLASHNEXT_DRAFTS="6"
-      export TF_FLASHNEXT_DRAFTS_GREEDY="14"
       export TF_FLASHNEXT_CONFIDENCE="-0.35"
       CTX="$GUARD_CONTEXT"
       PAR="$GUARD_PARALLEL"
       THINK="--thinking"
     else
-      export TF_FLASHNEXT_DRAFTS_GREEDY="${TF_FLASHNEXT_DRAFTS_GREEDY:-15}"
       export TF_FLASHNEXT_CONFIDENCE="${TF_FLASHNEXT_CONFIDENCE:--0.28}"
       export TF_FLASHNEXT_STOP_ALPHA="${TF_FLASHNEXT_STOP_ALPHA:-3.2}"
       export TF_FLASHNEXT_STOP_DECAY="${TF_FLASHNEXT_STOP_DECAY:-1.0}"
@@ -13819,7 +13912,7 @@ PY
       PAR="$SPEED_PARALLEL"
       THINK="--no-thinking"
     fi
-    exec "$ENGINE_BIN" serve "$MODEL_DIR" \
+    exec "$ENGINE_BIN" serve "$SERVE_MODEL_DIR" \
       --host 127.0.0.1 \
       --port "$PORT" \
       --name Qwen3.8-Flash-Next \
