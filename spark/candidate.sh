@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t256"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6996,6 +6996,8 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         float wv[16];
         float cur_v = -INFINITY;
         int cur_i = 0x7fffffff;
+        float second_v = -INFINITY;
+        int second_i = 0x7fffffff;
         if (RSK == 4) {
             const float* row1 = row0 + slice_stride;
             const float* row2 = row1 + slice_stride;
@@ -7005,7 +7007,17 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                 const int i = lane + j * 32;
                 float v = (i < NE) ? __fadd_rn(__fadd_rn(__fadd_rn(row0[i], row1[i]), row2[i]), row3[i]) : -INFINITY;
                 wv[j] = v;
-                if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
+                if (i < NE) {
+                    if (v > cur_v || (v == cur_v && i < cur_i)) {
+                        second_v = cur_v;
+                        second_i = cur_i;
+                        cur_v = v;
+                        cur_i = i;
+                    } else if (v > second_v || (v == second_v && i < second_i)) {
+                        second_v = v;
+                        second_i = i;
+                    }
+                }
             }
         } else {
 #pragma unroll
@@ -7017,7 +7029,17 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                     for (int s = 1; s < RSK; ++s) v = __fadd_rn(v, row0[static_cast<long long>(s) * slice_stride + i]);
                 }
                 wv[j] = v;
-                if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
+                if (i < NE) {
+                    if (v > cur_v || (v == cur_v && i < cur_i)) {
+                        second_v = cur_v;
+                        second_i = cur_i;
+                        cur_v = v;
+                        cur_i = i;
+                    } else if (v > second_v || (v == second_v && i < second_i)) {
+                        second_v = v;
+                        second_i = i;
+                    }
+                }
             }
         }
         float top = 0.0f, my_bv = -INFINITY;
@@ -7036,15 +7058,21 @@ static __device__ __forceinline__ void route_topk_plan_impl(
             if (cur_i == bi && k + 1 < TOPK) {
                 const int wj = bi >> 5;
                 wv[wj] = -INFINITY;
-                float nv = -INFINITY;
-                int ni = 0x7fffffff;
+                if (second_i != 0x7fffffff) {
+                    cur_v = second_v;
+                    cur_i = second_i;
+                    second_i = 0x7fffffff;
+                } else {
+                    float nv = -INFINITY;
+                    int ni = 0x7fffffff;
 #pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    const int i = lane + j * 32;
-                    if (wv[j] > nv || (wv[j] == nv && i < ni)) { nv = wv[j]; ni = i; }
+                    for (int j = 0; j < 16; ++j) {
+                        const int i = lane + j * 32;
+                        if (wv[j] > nv || (wv[j] == nv && i < ni)) { nv = wv[j]; ni = i; }
+                    }
+                    cur_v = nv;
+                    cur_i = ni;
                 }
-                cur_v = nv;
-                cur_i = ni;
             }
         }
         const float mine = (lane < TOPK) ? tf_exp(__fsub_rn(my_bv, top)) : 0.0f;
