@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t263"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5342,11 +5342,17 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
   qmm_frag::grid_wait();
   constexpr int STRIP4 = 696;
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
-  const int units = (*counts) * NB;
+  const int item_count = *counts;
+  const int units = item_count * NB;
   __shared__ uint4 sh_lo[40];
   __shared__ uint4 sh_hi[10];
   for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
-    const int it = unit / NB, cb = unit - it * NB;
+    // Interleave four planned items at a time to mix heavy and light expert tiles.
+    const int base = (unit / (4 * NB)) * 4;
+    const int local = unit - base * NB;
+    const int width = min(4, item_count - base);
+    const int cb = width == 4 ? local >> 2 : local / width;
+    const int it = base + local - cb * width;
     const int e = items[3 * it], first = items[3 * it + 1], cnt = items[3 * it + 2];
     if (e == skip) continue;
     const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)STRIP4;
