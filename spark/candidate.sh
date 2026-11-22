@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t224"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4374,6 +4374,9 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
     };
 
     constexpr unsigned tile = 4;
+    const unsigned ring_size = static_cast<unsigned>(log_rows);
+    unsigned ring_row = first + static_cast<unsigned>(tid >> 5);
+    if (ring_row >= ring_size) ring_row %= ring_size;
     __shared__ float4 keys[tile][32], queries[tile][32];
     __shared__ float values[tile][32];
     __shared__ float2 gate_beta[tile];
@@ -4381,7 +4384,7 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
     for (unsigned base = 0; base < total; base += tile) {
         const unsigned load_p = base + (unsigned)(tid >> 5);
         if (load_p < total) {
-            const unsigned lr = (first + load_p) % (unsigned)log_rows;
+            const unsigned lr = ring_row;
             const int vec = tid & 31;
             values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
             if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
@@ -4431,6 +4434,11 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
             }
         }
         __syncthreads();
+        ring_row += tile;
+        if (ring_row >= ring_size) {
+            ring_row -= ring_size;
+            if (ring_row >= ring_size) ring_row %= ring_size;
+        }
     }
     if (state_out != nullptr) store_tile(state_out);
 }
