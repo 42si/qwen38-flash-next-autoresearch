@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t274"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5248,13 +5248,16 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
               }
             __syncthreads();
           };
-          L st[3];
-          load(st[0], 0); load(st[1], 1); load(st[2], 2);
+          L stages[4];
+#pragma unroll
+          for (int slot = 0; slot < 4; ++slot) load(stages[slot], slot);
           __syncthreads();
-          for (int rg = 0; rg < 16; rg += 3) {
-            if (rg < 16)     { comp_s(st[0], rg);     if (rg + 3 < 16) load(st[0], rg + 3); }
-            if (rg + 1 < 16) { comp_s(st[1], rg + 1); if (rg + 4 < 16) load(st[1], rg + 4); }
-            if (rg + 2 < 16) { comp_s(st[2], rg + 2); if (rg + 5 < 16) load(st[2], rg + 5); }
+          for (int rg = 0; rg < 16; rg += 4) {
+#pragma unroll
+            for (int slot = 0; slot < 4; ++slot) {
+              comp_s(stages[slot], rg + slot);
+              if (rg + 4 < 16) load(stages[slot], rg + 4 + slot);
+            }
           }
         }
         if (v0) {
