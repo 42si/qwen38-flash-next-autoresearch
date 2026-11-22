@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t241"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6983,6 +6983,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     __shared__ int sh_cnt[512];
     __shared__ int sh_off[512];
     __shared__ int sh_pick[32 * 12];
+    __shared__ int sh_rank[32 * 12];
     __shared__ uint32_t wsum[2][16];
     if (tid < E_PLAN) sh_cnt[tid] = 0;
 #if __CUDA_ARCH__ >= 900
@@ -7058,7 +7059,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
                 sh_pick[warp * SLOTS + lane] = pick;
-                if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
+                if (pick >= 0 && pick < E_PLAN) sh_rank[warp * SLOTS + lane] = atomicAdd(&sh_cnt[pick], 1);
             } else {
                 PICK[static_cast<long long>(warp) * SLOTS + lane] = NE;
                 WTS[static_cast<long long>(warp) * SLOTS + lane] = 0.0f;
@@ -7072,7 +7073,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
             PICK[static_cast<long long>(warp) * SLOTS + s_slot] = NE;
             WTS[static_cast<long long>(warp) * SLOTS + s_slot] = rbf(tf_sigmoid(rbf(sg)));
             sh_pick[warp * SLOTS + s_slot] = NE;
-            if (NE < E_PLAN) atomicAdd(&sh_cnt[NE], 1);
+            if (NE < E_PLAN) sh_rank[warp * SLOTS + s_slot] = atomicAdd(&sh_cnt[NE], 1);
         }
     }
     __syncthreads();
@@ -7158,7 +7159,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     for (int p = tid; p < P; p += blockDim.x) {
         const int e = sh_pick[p];
         if (e >= 0 && e < E_PLAN) {
-            const int pos = atomicAdd(&sh_off[e], 1);
+            const int pos = sh_off[e] + sh_rank[p];
             members[pos] = p;
         }
     }
