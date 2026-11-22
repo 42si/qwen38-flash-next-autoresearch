@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t214"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -306,6 +306,29 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     }
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31;
+    // Rank ten input tiles once per block. All vocabulary rows use the same retained coordinates.
+    __shared__ float energy[10];
+    for (int tile = warp; tile < 10; tile += 4) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = lane; i < 256; i += 32) {
+            const float x = __uint_as_float(sxu[tile * 256 + i]);
+            sum = fmaf(x, x, sum);
+        }
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        if (lane == 0) energy[tile] = sum;
+    }
+    __syncthreads();
+    const float mine = lane < 10 ? energy[lane] : CUDART_INF_F;
+    unsigned rank = 0;
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+        const float other = __shfl_sync(0xffffffffu, mine, i);
+        rank += (other < mine || (other == mine && i < lane));
+    }
+    const unsigned valid = __ballot_sync(0xffffffffu, lane < 10 && isfinite(mine));
+    unsigned live = __ballot_sync(0xffffffffu, lane < 10 && rank >= 2);
+    if (valid != 1023u) live = 1023u;
     const int blk = blockIdx.x * 4 + warp;
     const int row = blk * 32 + lane;
     float fv = -CUDART_INF_F;
@@ -332,14 +355,17 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             return v;
         };
         float acc0 = 0.0f, acc1 = 0.0f;
-        uint4 wa = ld4_256(bp + lane);
-        uint4 wb = ld4_256(bp + 32 + lane);
-        uint32_t s4 = ld1_256(reinterpret_cast<const uint32_t*>(bp + 64) + lane);
-        for (int g4 = 0; g4 < 10; ++g4) {
+        const uint4* first = bp + (__ffs(live) - 1) * 72;
+        uint4 wa = ld4_256(first + lane);
+        uint4 wb = ld4_256(first + 32 + lane);
+        uint32_t s4 = ld1_256(reinterpret_cast<const uint32_t*>(first + 64) + lane);
+        while (live) {
+            const int g4 = __ffs(live) - 1;
+            live &= live - 1u;
             uint4 nwa, nwb;
             uint32_t ns4;
-            if (g4 + 1 < 10) {
-                const uint4* np = bp + (g4 + 1) * 72;
+            if (live) {
+                const uint4* np = bp + (__ffs(live) - 1) * 72;
                 nwa = ld4_256(np + lane);
                 nwb = ld4_256(np + 32 + lane);
                 ns4 = ld1_256(reinterpret_cast<const uint32_t*>(np + 64) + lane);
@@ -380,7 +406,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
             }
-            if (g4 + 1 < 10) {
+            if (live) {
                 wa = nwa;
                 wb = nwb;
                 s4 = ns4;
