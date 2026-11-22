@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t212"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -401,28 +401,24 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     for (int o = 16; o; o >>= 1) {
         fn_mtp::better(wm, wc, __shfl_xor_sync(0xffffffffu, wm, o), __shfl_xor_sync(0xffffffffu, wc, o));
     }
-    __shared__ float smax[4], ssum[4], sbmax;
-    __shared__ int scol[4], sbcol;
+    __shared__ float smax[4], ssum[4];
+    __shared__ int scol[4];
     if (lane == 0) {
         smax[warp] = wm;
         scol[warp] = wc;
     }
     __syncthreads();
-    if (tid == 0) {
-        float bm = smax[0];
-        int bc = scol[0];
-        for (int w = 1; w < 4; ++w) fn_mtp::better(bm, bc, smax[w], scol[w]);
-        sbmax = bm;
-        sbcol = bc;
-    }
-    __syncthreads();
-    const float bmax = sbmax;
+    // Each warp reads the same four entries, so the block does not need a broadcast barrier.
+    float bmax = smax[0];
+    int best_col = scol[0];
+    #pragma unroll
+    for (int w = 1; w < 4; ++w) fn_mtp::better(bmax, best_col, smax[w], scol[w]);
     float ex = (row < V) ? expf(fv - bmax) : 0.0f;
     for (int o = 16; o; o >>= 1) ex += __shfl_xor_sync(0xffffffffu, ex, o);
     if (lane == 0) ssum[warp] = ex;
     __syncthreads();
     if (tid == 0) {
-        stats[blockIdx.x] = make_float4(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3], __int_as_float(sbcol), 0.0f);
+        stats[blockIdx.x] = make_float4(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3], __int_as_float(best_col), 0.0f);
     }
 }
 
