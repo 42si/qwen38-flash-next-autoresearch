@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t282"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5393,8 +5393,15 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
             const uint32_t sv = (2 * h + (j >> 1)) == 0 ? sx : ((2 * h + (j >> 1)) == 1 ? sy : ((2 * h + (j >> 1)) == 2 ? sz : sw));
             const uint32_t sp = tf_common::fp8pair_unit((sv >> ((j & 1) * 16)) & 0xFFFFu, 0x7B807B80u);
             const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+#if __CUDA_ARCH__ >= 1000
+            const float2 updated = __ffma2_rn(make_float2(p[0], p[1]), make_float2(s0, s1),
+                                              make_float2(acc[j][0], acc[j][1]));
+            acc[j][0] = updated.x;
+            acc[j][1] = updated.y;
+#else
             acc[j][0] = fmaf(p[0], s0, acc[j][0]);
             acc[j][1] = fmaf(p[1], s1, acc[j][1]);
+#endif
           }
         }
       };
