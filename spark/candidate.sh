@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t254"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6558,11 +6558,10 @@ patch_k(
     """    constexpr int D = NC * 256;
     __shared__ float sw[S][NC];
     __shared__ float rinv[S];
-    __shared__ float swts[16];
     const int r = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    float route_weight = 0.0f;
     if constexpr (MODE == 2) {
-        if (tid <= TOPK) swts[tid] = WTS[static_cast<long long>(r) * SLOTS + tid];
-        __syncthreads();
+        if (lane <= TOPK) route_weight = WTS[static_cast<long long>(r) * SLOTS + lane];
     }
     float branch[8];
     if constexpr (MODE == 4) {
@@ -6585,7 +6584,7 @@ patch_k(
         float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         const float4* yp0 = reinterpret_cast<const float4*>(Y + static_cast<long long>(r) * SLOTS * D);
         for (int k = 0; k <= TOPK; ++k) {
-            const float wk = swts[k];
+            const float wk = k < 32 ? __shfl_sync(0xffffffffu, route_weight, k) : WTS[static_cast<long long>(r) * SLOTS + k];
             if (wk == 0.0f) continue;
             const float4* yk = yp0 + static_cast<long long>(k) * (D / 4);
             const float4 v0 = yk[tid * 2];
