@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t226"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10904,8 +10904,15 @@ patch_exact(
                 const miss_items = n_miss * heads;
                 const miss_ids = try g.gpa.alloc(i64, miss_items);
                 defer g.gpa.free(miss_ids);
-                const miss_emb = try g.gpa.alloc(u16, n_miss * ple_cache.row_w);
-                defer g.gpa.free(miss_emb);
+                // Miss indices are emitted in token order. A contiguous run can use the
+                // caller's final rows as gather storage without overwriting any cache hit.
+                const contiguous = miss_idx[n_miss - 1] - miss_idx[0] + 1 == n_miss;
+                const miss_len = n_miss * ple_cache.row_w;
+                const miss_emb = if (contiguous)
+                    out[miss_idx[0] * ple_cache.row_w ..][0..miss_len]
+                else
+                    try g.gpa.alloc(u16, miss_len);
+                defer if (!contiguous) g.gpa.free(miss_emb);
                 for (0..n_miss) |m| {
                     const t = miss_idx[m];
                     const mh: [2]i64 = .{ miss_h0[m], miss_h1[m] };
@@ -10931,7 +10938,7 @@ patch_exact(
                     }
                     const dst_row: *[ple_cache.row_w]u16 = out[t * ple_cache.row_w ..][0..ple_cache.row_w];
                     const dst_xs: *[ple_cache.xs_w]f32 = xs[t * ple_cache.xs_w ..][0..ple_cache.xs_w];
-                    @memcpy(dst_row, src_row);
+                    if (!contiguous) @memcpy(dst_row, src_row);
                     sumGroups(dst_row, dst_xs);
                     cache.put(miss_h0[m], miss_h1[m], tokens[t], dst_row, dst_xs);
                 }
