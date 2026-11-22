@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t244"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2173,6 +2173,33 @@ extern "C" __global__ void __launch_bounds__(64) fn_bf16_to_w1(
     }
 }
 
+// Lane zero owns the highest eight bins. The winning lane resolves its local rank.
+static __device__ __forceinline__ uint2 fn_head_hist_rank(
+        const unsigned int* hist, unsigned int k, unsigned int prior) {
+    const int lane = threadIdx.x & 31;
+    const int hi = 255 - 8 * lane;
+    unsigned int subtotal = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) subtotal += hist[hi - i];
+    unsigned int inclusive = subtotal;
+#pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+        const unsigned int left = __shfl_up_sync(0xffffffffu, inclusive, step);
+        if (lane >= step) inclusive += left;
+    }
+    unsigned int above = prior + inclusive - subtotal;
+    const unsigned int ballot = __ballot_sync(0xffffffffu, prior + inclusive >= k);
+    const int owner = ballot ? __ffs(ballot) - 1 : 31;
+    int bin = hi;
+    if (lane == owner) {
+        while (bin > 0 && bin > hi - 7 && above + hist[bin] < k) {
+            above += hist[bin--];
+        }
+    }
+    return make_uint2(__shfl_sync(0xffffffffu, bin, owner),
+                      __shfl_sync(0xffffffffu, above, owner));
+}
+
 extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     __nv_bfloat16* L,
     int V,
@@ -2237,15 +2264,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     __syncthreads();
     atomicAdd(&hist[tmax >> 8], 1u);
     __syncthreads();
-    if (t == 0) {
-        unsigned int cum = 0;
-        int b = 255;
-        for (; b > 0; --b) {
-            if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-            cum += hist[b];
+    if (t < 32) {
+        const uint2 cutoff = fn_head_hist_rank(hist, K, 0);
+        if (t == 0) {
+            pick_hi = cutoff.x;
+            above = cutoff.y;
         }
-        pick_hi = b;
-        above = cum;
     }
     __syncthreads();
     const unsigned int lb_hi = pick_hi;
@@ -2253,16 +2277,13 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     __syncthreads();
     if ((tmax >> 8) == lb_hi) atomicAdd(&hist[tmax & 255u], 1u);
     __syncthreads();
-    if (t == 0) {
-        unsigned int cum = above;
-        int b = 255;
-        for (; b > 0; --b) {
-            if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-            cum += hist[b];
+    if (t < 32) {
+        const uint2 cutoff = fn_head_hist_rank(hist, K, above);
+        if (t == 0) {
+            pick_lo = cutoff.x;
+            n_gt = 0;
+            n_eq = 0;
         }
-        pick_lo = b;
-        n_gt = 0;
-        n_eq = 0;
     }
     __syncthreads();
     const unsigned int lb = (lb_hi << 8) | pick_lo;
@@ -2320,15 +2341,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
             __syncthreads();
             for (int i = t; i < static_cast<int>(nc); i += nt) atomicAdd(&hist[cand_k[i] >> 8], 1u);
             __syncthreads();
-            if (t == 0) {
-                unsigned int cum = 0;
-                int b = 255;
-                for (; b > 0; --b) {
-                    if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-                    cum += hist[b];
+            if (t < 32) {
+                const uint2 cutoff = fn_head_hist_rank(hist, K, 0);
+                if (t == 0) {
+                    pick_hi = cutoff.x;
+                    above = cutoff.y;
                 }
-                pick_hi = b;
-                above = cum;
             }
             __syncthreads();
             const unsigned int hi = pick_hi;
@@ -2338,16 +2356,13 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
                 if ((cand_k[i] >> 8) == hi) atomicAdd(&hist[cand_k[i] & 255u], 1u);
             }
             __syncthreads();
-            if (t == 0) {
-                unsigned int cum = above;
-                int b = 255;
-                for (; b > 0; --b) {
-                    if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-                    cum += hist[b];
+            if (t < 32) {
+                const uint2 cutoff = fn_head_hist_rank(hist, K, above);
+                if (t == 0) {
+                    pick_lo = cutoff.x;
+                    above = cutoff.y;
+                    n_eq = 0;
                 }
-                pick_lo = b;
-                above = cum;
-                n_eq = 0;
             }
             __syncthreads();
             const unsigned int kth = (hi << 8) | pick_lo;
@@ -2373,15 +2388,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
         __syncthreads();
         for (int i = t; i < V; i += nt) atomicAdd(&hist[okey(row[i]) >> 8], 1u);
         __syncthreads();
-        if (t == 0) {
-            unsigned int cum = 0;
-            int b = 255;
-            for (; b > 0; --b) {
-                if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-                cum += hist[b];
+        if (t < 32) {
+            const uint2 cutoff = fn_head_hist_rank(hist, K, 0);
+            if (t == 0) {
+                pick_hi = cutoff.x;
+                above = cutoff.y;
             }
-            pick_hi = b;
-            above = cum;
         }
         __syncthreads();
         const unsigned int hi = pick_hi;
@@ -2392,15 +2404,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
             if ((ok >> 8) == hi) atomicAdd(&hist[ok & 255u], 1u);
         }
         __syncthreads();
-        if (t == 0) {
-            unsigned int cum = above;
-            int b = 255;
-            for (; b > 0; --b) {
-                if (cum + hist[b] >= static_cast<unsigned int>(K)) break;
-                cum += hist[b];
+        if (t < 32) {
+            const uint2 cutoff = fn_head_hist_rank(hist, K, above);
+            if (t == 0) {
+                pick_lo = cutoff.x;
+                above = cutoff.y;
             }
-            pick_lo = b;
-            above = cum;
         }
         __syncthreads();
         const unsigned int kth = (hi << 8) | pick_lo;
