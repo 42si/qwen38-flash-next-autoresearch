@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t334"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -11139,7 +11139,50 @@ patch_exact(
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
             if (next.len > 0) o.e.ngram.warmToken(&d.draft_hist, next[next.len - 1]);
-            const max_steps = @min(count, max_chain);
+            const cap: usize = @min(count, max_chain);
+            var max_steps: usize = cap;
+            const adaptive = !mtp.isSampled(sm) and confidence < 0.0;
+            const continuous = adaptive and d.history_n > 0 and position >= next.len and position - next.len == d.history_position;
+            if (continuous) {
+                // Decay all positions together. Positions beyond the first mismatch are unobserved.
+                for (0..max_chain) |i| {
+                    d.depth_hits[i] *= 0.94;
+                    d.depth_trials[i] *= 0.94;
+                }
+                for (0..@min(next.len, d.history_n)) |i| {
+                    d.depth_trials[i] += 1.0;
+                    if (next[i] != d.history_ids[i]) break;
+                    d.depth_hits[i] += 1.0;
+                }
+                d.probe_turn +%= 1;
+                if (d.probe_turn % 8 != 0) {
+                    var survival: f64 = 1.0;
+                    var emitted: f64 = 1.0;
+                    for (0..cap) |i| {
+                        const seen = d.depth_trials[i];
+                        // A sparse position stays open. The optimistic estimate prevents early lock-in.
+                        const q = if (seen < 4.0) 1.0 else @min(1.0, (d.depth_hits[i] + 2.0) / (seen + 2.0) + 0.5 / @sqrt(seen + 2.0));
+                        survival *= q;
+                        if (i >= 4 and survival < emitted / (7.0 + @as(f64, @floatFromInt(i)))) {
+                            max_steps = i;
+                            break;
+                        }
+                        emitted += survival;
+                    }
+                }
+            } else {
+                d.depth_hits = @splat(0.0);
+                d.depth_trials = @splat(0.0);
+                d.probe_turn = 0;
+            }
+            d.history_n = 0;
+            defer {
+                if (adaptive) {
+                    d.history_position = position;
+                    d.history_n = out.n;
+                    @memcpy(d.history_ids[0..out.n], out.tokens[0..out.n]);
+                }
+            }
             const wg = @import("cuda_window_graph.zig");
             if (whileEnabled() and !mtp.isSampled(sm) and o.h.w2.ready() and o.main == null and d.media == null and o.e.collective == null and max_steps > 1 and wg.enabled() and d.len + max_steps - 1 <= d.cap and std.meta.eql(wg.Geometry.at(d.len + 1, d.cap), wg.Geometry.at(d.len + max_steps - 1, d.cap))) {
                 if (try o.draftWhile(d, max_steps, confidence, out)) return;
@@ -11154,7 +11197,7 @@ patch_exact(
                 out.probs[out.n] = got.prob;
                 out.n += 1;
                 if (!t.more) break;
-                if (j + 1 < count) {
+                if (j + 1 < max_steps) {
                     try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
                     d.drafted += 1;
                     o.e.ngram.warmToken(&d.draft_hist, got.token);
@@ -12338,7 +12381,7 @@ patch_exact(
 patch_exact(
     root, "cuda_mtp_draft.zig",
     "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },",
-    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,",
+    "    history: [2]i64 = .{ 0, 0 },\n    draft_hist: [2]i64 = .{ 0, 0 },\n    unused_history: [2]i64 = .{ 0, 0 },\n    best_direct: bool = false,\n    best_ready: bool = false,\n    history_position: u64 = 0,\n    history_n: usize = 0,\n    history_ids: [max_chain]u32 = undefined,\n    depth_hits: [max_chain]f64 = @splat(0.0),\n    depth_trials: [max_chain]f64 = @splat(0.0),\n    probe_turn: u8 = 0,",
 )
 patch_exact(
     root, "cuda_lanes_verify.zig",
