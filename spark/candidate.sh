@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t352"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -11065,6 +11065,13 @@ patch_exact(
             }
             try cuda.graph.endCaptureToGraph(st);
 
+            // The WHILE node completes before its final chain state is read by the host.
+            try cuda.graph.beginCaptureAfter(st, root_g, &.{while_res.node}, .thread_local);
+            st.d.check(st.d.api.cuMemcpyDtoHAsync_v2(h.while_out_host.bytes.ptr, h.while_out_dev.ptr, @sizeOf(MtpChainOut), st.handle), "cuMemcpyDtoHAsync") catch |err| {
+                cuda.graph.endCaptureToGraph(st) catch {};
+                return err;
+            };
+            try cuda.graph.endCaptureToGraph(st);
             var exec = try root_g.instantiate();
             errdefer exec.deinit();
             try exec.upload(st);
@@ -11081,7 +11088,7 @@ patch_exact(
             const piece = @max(@as(usize, 1), @min(piece_rows, s.cap / 2));
             const score_rows = try e.reserveScores(d.cap, piece);
             const vocab_ids_ptr = h.w2.vocab_ids.?.ptr;
-            const key = wg.HeadWhileKey.init(d, s, score_rows, vocab_ids_ptr, h.while_ctl_dev.ptr, h.while_out_dev.ptr);
+            const key = wg.HeadWhileKey.init(d, s, score_rows, vocab_ids_ptr, h.while_ctl_dev.ptr, h.while_out_dev.ptr, @intFromPtr(h.while_out_host.bytes.ptr));
             const exec_ptr = e.graphs.head_while.find(key) orelse blk: {
                 const exec = o.buildWhileGraph(d, s, score_rows, vocab_ids_ptr) catch |err| {
                     std.log.warn("head_while graphs off: capture failed ({s}), falling back to CPU loop", .{@errorName(err)});
@@ -11111,7 +11118,6 @@ patch_exact(
                 errdefer st.synchronize() catch {};
                 try st.d.check(st.d.api.cuMemcpyHtoDAsync_v2(h.while_ctl_dev.ptr, h.while_ctl_host.bytes.ptr, @sizeOf(MtpChainCtl), st.handle), "cuMemcpyHtoDAsync");
                 try exec_ptr.launchOn(st);
-                try st.d.check(st.d.api.cuMemcpyDtoHAsync_v2(h.while_out_host.bytes.ptr, h.while_out_dev.ptr, @sizeOf(MtpChainOut), st.handle), "cuMemcpyDtoHAsync");
                 try st.synchronize();
             }
 
@@ -11979,10 +11985,14 @@ patch_exact(
     return s;
 }""",
     """pub fn beginCaptureToGraph(stream: Stream, g: Graph, mode: abi.CaptureMode) Error!void {
+    return beginCaptureAfter(stream, g, &.{}, mode);
+}
+
+pub fn beginCaptureAfter(stream: Stream, g: Graph, deps: []const Node, mode: abi.CaptureMode) Error!void {
     const source = @import("copy_source.zig");
     try source.captureBegin(stream, mode);
     errdefer source.captureEnd(stream);
-    try stream.d.check(stream.d.api.cuStreamBeginCaptureToGraph(stream.handle, g.handle, null, null, 0, mode), "cuStreamBeginCaptureToGraph");
+    try stream.d.check(stream.d.api.cuStreamBeginCaptureToGraph(stream.handle, g.handle, if (deps.len == 0) null else deps.ptr, null, deps.len, mode), "cuStreamBeginCaptureToGraph");
 }
 
 pub fn endCaptureToGraph(stream: Stream) Error!void {
@@ -12051,7 +12061,7 @@ pub const HeadWhileKey = struct {
     shape: u64,
     moving: u64,
 
-    pub fn init(d: anytype, s: *const parts.Scratch, score_rows: u64, vocab_ids_ptr: u64, ctl_ptr: u64, out_ptr: u64) HeadWhileKey {
+    pub fn init(d: anytype, s: *const parts.Scratch, score_rows: u64, vocab_ids_ptr: u64, ctl_ptr: u64, out_ptr: u64, host_out_ptr: usize) HeadWhileKey {
         var h: Hash = .{};
         h.geometry(.at(d.len + 1, d.cap));
         h.values(&[_]u64{
@@ -12059,7 +12069,7 @@ pub const HeadWhileKey = struct {
             d.pg.pt, @as(u64, @bitCast(d.pg.ps)), @as(u64, @as(u32, @bitCast(d.pg.ptok))),
             d.out.ptr, d.dlogits.ptr, d.best.ptr,
             s.h, s.cap, s.ids, s.pos, score_rows,
-            vocab_ids_ptr, ctl_ptr, out_ptr,
+            vocab_ids_ptr, ctl_ptr, out_ptr, host_out_ptr,
         });
         return .{ .shape = h.shape.final(), .moving = h.moving.final() };
     }
