@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t328"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5333,6 +5333,23 @@ static __device__ __noinline__ void s5_down_1w_wide(
   }
 }
 
+// Each 64-scale group stores its first two exceptions in the strip padding.
+static __device__ __noinline__ uint32_t s5_restore_inline(
+    uint32_t val, uint32_t mask, uint32_t key, const uint2* meta, const uint32_t* esc,
+    int expert, uint32_t pair) {
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    const unsigned shift = byte * 8;
+    if (!(mask & (0x20u << shift))) continue;
+    const unsigned tag = 0x40u | ((key + byte) & 63u);
+    const unsigned a = pair & 0xffffu, b = pair >> 16;
+    const unsigned raw = (a >> 8) == tag ? (a & 255u) :
+                         (b >> 8) == tag ? (b & 255u) :
+                         s5_lookup_esc_meta(meta, esc, expert, key + byte);
+    val = (val & ~(255u << shift)) | (raw << shift);
+  }
+  return val;
+}
+
 extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
     const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
     const float* __restrict__ scale, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
@@ -5376,7 +5393,15 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
           const uint2 lo = reinterpret_cast<const uint2*>(sh_lo)[g * 4 + t];
           const uint32_t hi = reinterpret_cast<const uint16_t*>(sh_hi)[g * 4 + t];
           const uint32_t kb = ((uint32_t)(cb * KG + g) * 64u) + (uint32_t)t * 16u;
-          piece = s5_unpack_piece(lo, hi, gq, smin4, meta, esc, e, kb);
+          const uint32_t low = ((gq < 2 ? lo.x : lo.y) >> ((gq & 1) * 16)) & 0xffffu;
+          const uint32_t high = (hi >> (4 * gq)) & 15u;
+          const uint32_t codes = (__byte_perm(low, low >> 4, 0x5140) & 0x0f0f0f0fu) |
+              (((high * 0x00204081u) & 0x01010101u) << 4);
+          piece = codes + smin4;
+          const uint32_t mask = (codes + 0x01010101u) & 0x20202020u;
+          if (__builtin_expect(mask != 0, 0))
+              piece = s5_restore_inline(piece, mask, kb + 4u * gq, meta, esc, e,
+                  __ldg(reinterpret_cast<const uint32_t*>(blk + 690) + g));
         }
         const uint32_t sx = __shfl_sync(0xffffffffu, piece, t);
         const uint32_t sy = __shfl_sync(0xffffffffu, piece, 4 + t);
@@ -13277,6 +13302,7 @@ pub fn packDownS5(
         const cb_off = cb * 11136;
         @memset(out_bytes[cb_off + 11040 ..][0..96], 0);
         for (0..kg) |g| {
+            var inline_count: usize = 0;
             const block_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_bytes[cb_off + g * 512 ..][0..512]));
             for (0..8) |gq| for (0..4) |t| for (0..4) |j| {
                 const row = cb * ex.cols + j * 8 + gq;
@@ -13304,6 +13330,12 @@ pub fn packDownS5(
                             raw - smin
                         else blk: {
                             try esc_out.append(alloc, (key << 8) | raw);
+                            if (inline_count < 2) {
+                                const slot = cb_off + 11040 + g * 4 + inline_count * 2;
+                                const entry: u16 = @intCast(((0x40 | (key & 63)) << 8) | raw);
+                                std.mem.writeInt(u16, out_bytes[slot..][0..2], entry, .little);
+                                inline_count += 1;
+                            }
                             break :blk 31;
                         };
                         lo_byte |= (q & 0xF) << @intCast(c * 4);
