@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t339"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -7925,6 +7925,69 @@ extern "C" __global__ void __launch_bounds__(256) fn_attn_merge_gate(
 """,
     encoding="utf-8",
 )
+# Use one compact NVFP4 layout for both attention caches.
+kv_helpers = r"""
+#include <cuda_fp8.h>
+
+// A group of 16 coefficients occupies eight bytes plus a positive E4M3 scale.
+static __device__ __forceinline__ void kv_store_fp4(
+    __nv_bfloat16* head, int width, int d, __nv_bfloat16 value) {
+    unsigned char* bytes = reinterpret_cast<unsigned char*>(head);
+    const float x = __bfloat162float(value);
+    float peak = fabsf(x);
+#pragma unroll
+    for (int offset = 8; offset; offset >>= 1)
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, offset, 16));
+    const unsigned char sc = __nv_cvt_float_to_fp8(peak / 6.0f, __NV_SATFINITE, __NV_E4M3);
+    const float scale = __half2float(__half(__nv_cvt_fp8_to_halfraw(sc, __NV_E4M3)));
+    if ((d & 15) == 0) bytes[width / 2 + d / 16] = sc;
+    const float a = scale > 0.0f ? fabsf(x) * (1.0f / scale) : 0.0f;
+    const unsigned mag = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f)
+                       + (a > 2.5f) + (a >= 3.5f) + (a > 5.0f);
+    const unsigned code = mag | ((__float_as_uint(x) >> 28) & 8u);
+    const unsigned other = __shfl_xor_sync(0xffffffffu, code, 1);
+    if ((d & 1) == 0) bytes[d / 2] = static_cast<unsigned char>(code | (other << 4));
+}
+
+static __device__ __forceinline__ void kv_load_fp4(
+    __nv_bfloat16* dst, const __nv_bfloat16* head, int width, int v, bool valid) {
+    uint4 result = make_uint4(0, 0, 0, 0);
+    if (valid) {
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(head);
+        const unsigned char sc = bytes[width / 2 + v / 2];
+        const float scale = __half2float(__half(__nv_cvt_fp8_to_halfraw(sc, __NV_E4M3)));
+        const unsigned codes = reinterpret_cast<const unsigned*>(head)[v];
+        unsigned pairs[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned byte = codes >> (8 * j);
+            const auto decode = [](unsigned code) {
+                constexpr float magnitudes[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+                const float x = magnitudes[code & 7u];
+                return (code & 8u) ? -x : x;
+            };
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(decode(byte) * scale, decode(byte >> 4) * scale);
+            pairs[j] = __bfloat16_as_ushort(pair.x) | (static_cast<unsigned>(__bfloat16_as_ushort(pair.y)) << 16);
+        }
+        result = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+    }
+    *reinterpret_cast<uint4*>(dst) = result;
+}
+"""
+patch_k("flashnext_attn.cu", '#include <cuda_bf16.h>', '#include <cuda_bf16.h>\n' + kv_helpers)
+patch_k("flashnext_attn.cu", "KC[at + d] = out;",
+        "kv_store_fp4(KC + at, HD, d, out);")
+patch_k("flashnext_attn.cu", "VC[at + d] = P[row + NQ * 2 * HD + NKV * HD + (head - NQ) * HD + d];",
+        "kv_store_fp4(VC + at, HD, d, P[row + NQ * 2 * HD + NKV * HD + (head - NQ) * HD + d]);")
+for dst, base in (
+    ("dst[k]", "(PAGED ? key_at[buf][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD)"),
+    ("tiles_kv[k]", "(PAGED ? key_at[0][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD)"),
+    ("dst[k]", "key_at[buf][k]"),
+):
+    patch_k("flashnext_attn.cu",
+            f"qmm_frag::cp16z(&{dst}[8 * v], src + {base} + 8 * v, key >= 0);",
+            f"kv_load_fp4(&{dst}[8 * v], src + {base}, HD, v, key >= 0);")
+
 instrument_pdl("flashnext_attn_lanes.cuh", expect_min=5)
 instrument_pdl("flashnext_qsa_tile.cuh", expect_min=1)
 instrument_pdl("flashnext_mtp.cu", expect_min=2, stop_marker="extern \"C\" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(")
