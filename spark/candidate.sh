@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t311"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -7005,7 +7005,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                 const int i = lane + j * 32;
                 float v = (i < NE) ? __fadd_rn(__fadd_rn(__fadd_rn(row0[i], row1[i]), row2[i]), row3[i]) : -INFINITY;
                 wv[j] = v;
-                if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
+
             }
         } else {
 #pragma unroll
@@ -7017,9 +7017,34 @@ static __device__ __forceinline__ void route_topk_plan_impl(
                     for (int s = 1; s < RSK; ++s) v = __fadd_rn(v, row0[static_cast<long long>(s) * slice_stride + i]);
                 }
                 wv[j] = v;
-                if (v > cur_v || (v == cur_v && i < cur_i)) { cur_v = v; cur_i = i; }
+
             }
         }
+        // Sort each lane once. The warp then merges its 32 sorted streams.
+        int order[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            order[j] = lane + 32 * j;
+            if (isnan(wv[j])) wv[j] = -INFINITY;
+        }
+#pragma unroll
+        for (int width = 2; width <= 16; width *= 2) {
+#pragma unroll
+            for (int stride = width >> 1; stride; stride >>= 1) {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int peer = j ^ stride;
+                    if (peer <= j) continue;
+                    const bool j_first = wv[j] > wv[peer] ||
+                        (wv[j] == wv[peer] && order[j] < order[peer]);
+                    if (j_first != ((j & width) == 0)) {
+                        const float v = wv[j]; wv[j] = wv[peer]; wv[peer] = v;
+                        const int id = order[j]; order[j] = order[peer]; order[peer] = id;
+                    }
+                }
+            }
+        }
+        cur_v = wv[0]; cur_i = order[0];
         float top = 0.0f, my_bv = -INFINITY;
         int pick = 0;
         for (int k = 0; k < TOPK; ++k) {
@@ -7034,17 +7059,13 @@ static __device__ __forceinline__ void route_topk_plan_impl(
             if (k == 0) top = bv;
             if (lane == k) { my_bv = bv; pick = bi; }
             if (cur_i == bi && k + 1 < TOPK) {
-                const int wj = bi >> 5;
-                wv[wj] = -INFINITY;
-                float nv = -INFINITY;
-                int ni = 0x7fffffff;
+                // At most TOPK entries are consumed; unused slots stay at the end.
 #pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    const int i = lane + j * 32;
-                    if (wv[j] > nv || (wv[j] == nv && i < ni)) { nv = wv[j]; ni = i; }
+                for (int j = 0; j < 15; ++j) {
+                    wv[j] = wv[j + 1]; order[j] = order[j + 1];
                 }
-                cur_v = nv;
-                cur_i = ni;
+                wv[15] = -INFINITY; order[15] = 0x7fffffff;
+                cur_v = wv[0]; cur_i = order[0];
             }
         }
         const float mine = (lane < TOPK) ? tf_exp(__fsub_rn(my_bv, top)) : 0.0f;
