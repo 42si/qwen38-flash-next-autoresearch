@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137-t234"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4968,6 +4968,17 @@ extern "C" __global__ void __launch_bounds__(64) tf_nvfp4_coop2_u4(
 }
 
 // ===== Trial 65: Contiguous 256B-aligned Chunk-16 S5 gate+up (-3.72%) & 128B-aligned Strip-696 S5 down (-2.46%) =====
+static __device__ __forceinline__ float2 s5_gate_scale_pair(uint16_t bytes) {
+  // The software path assigns finite values to reserved E4M3 encodings.
+  if ((bytes & 0x7fu) == 0x7fu || ((bytes >> 8) & 0x7fu) == 0x7fu) {
+    const uint32_t pair = tf_common::fp8pair_unit(bytes, 0x7B807B80u);
+    return make_float2(__uint_as_float((pair & 0xffffu) << 16),
+                       __uint_as_float(pair & 0xffff0000u));
+  }
+  const __half2 scales(__nv_cvt_fp8x2_to_halfraw2(bytes, __NV_E4M3));
+  return __half22float2(scales);
+}
+
 static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 #if __CUDA_ARCH__ >= 900
   uint4 v;
@@ -5142,8 +5153,8 @@ static __device__ __noinline__ void s5_coop2_u4_wide(S5CoopSm* sm) {
               const uint32_t word = jj ? wm[m].y : wm[m].x;
               float p[4];
               qmm_frag::mma0(p, a0, a1, a2, a3, tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
-              const uint32_t sp = tf_common::fp8pair_unit((sw >> (jj * 16)) & 0xFFFFu, 0x7B807B80u);
-              const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+              const float2 scales = s5_gate_scale_pair(static_cast<uint16_t>(sw >> (jj * 16)));
+              const float s0 = scales.x, s1 = scales.y;
               acc[m][jj][0] = fmaf(p[0], s0, acc[m][jj][0]);
               acc[m][jj][1] = fmaf(p[1], s1, acc[m][jj][1]);
               if (v1) {
@@ -5240,8 +5251,8 @@ extern "C" __global__ void __launch_bounds__(64, 10) tf_nvfp4_s5_coop2_u4(
                   const uint32_t word = jj ? wm[m].y : wm[m].x;
                   float p[4];
                   qmm_frag::mma0(p, a0, 0u, a2, 0u, tf_common::fp4pair(word, 8 * h), tf_common::fp4pair(word, 8 * h + 4));
-                  const uint32_t sp = tf_common::fp8pair_unit((sw >> (jj * 16)) & 0xFFFFu, 0x7B807B80u);
-                  const float s0 = __uint_as_float((sp & 0xFFFFu) << 16), s1 = __uint_as_float(sp & 0xFFFF0000u);
+                  const float2 scales = s5_gate_scale_pair(static_cast<uint16_t>(sw >> (jj * 16)));
+                  const float s0 = scales.x, s1 = scales.y;
                   acc[m][jj][0] = fmaf(p[0], s0, acc[m][jj][0]);
                   acc[m][jj][1] = fmaf(p[1], s1, acc[m][jj][1]);
                 }
