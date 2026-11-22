@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t227"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13515,7 +13515,7 @@ patch_exact(
     return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };""",
 )
 
-# 5r. Trial 68: 2-piece pipelined verify graphs (Part A embed+L0..2 ~35us CPU / ~2.4ms GPU hides Part B L2..48+head ~700us cuGraphLaunch!)
+# 5r. Capture the first six layers separately so the second graph can be queued during execution.
 patch_exact(
     root, "cuda_window_graph.zig",
     """/// A pass over a window whose uploads stageWindow queued: Pass.chunk launches its kernels alone.
@@ -13662,7 +13662,7 @@ patch_exact(
 patch_exact(
     root, "cuda_prompt_windows.zig",
     """    try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });""",
-    """    const split: usize = 2;
+    """    const split: usize = 6;
     if (p.m.layers.len > split) {
         try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed, .from = 0, .to = split, .do_embed = true, .do_head = false });
         try e.graphs.window_b.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed, .from = split, .to = p.m.layers.len, .do_embed = false, .do_head = true });
@@ -13673,7 +13673,7 @@ patch_exact(
 patch_exact(
     root, "cuda_prompt_windows.zig",
     """        try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });""",
-    """        const split: usize = 2;
+    """        const split: usize = 6;
         if (p.m.layers.len > split) {
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0, .from = 0, .to = split, .do_embed = true, .do_head = false });
             try e.graphs.shared_b.run(e.gpa, e.stream.*, key, window_graph.ChunkPart(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0, .from = split, .to = p.m.layers.len, .do_embed = false, .do_head = true });
