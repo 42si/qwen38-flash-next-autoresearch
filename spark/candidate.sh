@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t312"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -12597,6 +12597,23 @@ patch_exact(
     "    if (!e.cfg.root_copies) return requests;",
     "    if (!e.cfg.root_copies or !e.alone) return requests;",
 )
+# Only forgo neural drafting when a verified-history proposal can cover
+# a substantial fraction of the requested lookahead.
+patch_exact(
+    root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "        const copies = if (r.rows == null and s.pending == null) blk: {",
+    "        const min_copy: usize = @min(8, @max(2, (r.depth + 1) / 2));\n        const copies = if (r.rows == null and s.pending == null) blk: {",
+)
+patch_exact(
+    root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "break :blk got.len >= least and p.lastMatch() >= e.cfg.enter_match;",
+    "break :blk got.len >= @max(least, min_copy) and p.lastMatch() >= e.cfg.enter_match;",
+)
+patch_exact(
+    root.parent.parent / "core" / "lanes", "root_copy.zig",
+    "} else (try win.copyProposal(e, s)).tokens.len > 0;",
+    "} else (try win.copyProposal(e, s)).tokens.len >= min_copy;",
+)
 patch_exact(
     root, "cuda_lanes_draft.zig",
     "const max_hist = 17;",
@@ -13783,6 +13800,7 @@ PY
     export TF_FLASHNEXT_WARM_AHEAD="1"
     export TF_FLASHNEXT_GREEDY_WIDE="1"
     export TF_FLASHNEXT_MTP_WHILE="1"
+    export TF_FLASHNEXT_ROOT_COPIES="1"
     if [[ "$PROFILE" == "guard" || "$PROFILE" == "nvidia" ]]; then
       export TENSORFOLD_MEMORY_RESERVE_GIB=6
       export TF_FLASHNEXT_DRAFTS="6"
@@ -13802,7 +13820,6 @@ PY
       export TF_FLASHNEXT_EXT_TOK="${TF_FLASHNEXT_EXT_TOK:-0.0}"
       export TF_FLASHNEXT_EXT_MIN="${TF_FLASHNEXT_EXT_MIN:-0}"
       export TF_FLASHNEXT_FACT_ROWS="${TF_FLASHNEXT_FACT_ROWS:-256}"
-      export TF_FLASHNEXT_ROOT_COPIES="0"
       export TF_FLASHNEXT_P_CLIFF="0.0"
       export TF_FLASHNEXT_W2_MULTI="1"
       export TF_FLASHNEXT_ROUTER_BF12="0"
