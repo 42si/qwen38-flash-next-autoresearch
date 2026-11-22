@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t246"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13170,21 +13170,45 @@ pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix:
     return std.mem.eql(u8, std.mem.span(raw), "1");
 }
 
-fn bestSmin(scales: []const u8) u8 {
+fn bestSmin(scales: []const u8, n: usize, k: usize) u8 {
     var hist: [256]u32 = @splat(0);
-    for (scales) |b| hist[b] += 1;
-    var cur: u32 = 0;
-    for (0..31) |i| cur += hist[i];
-    var best_sum: u32 = cur;
-    var best_s: u8 = 0;
-    for (1..226) |s| {
-        cur = cur + hist[s + 30] - hist[s - 1];
-        if (cur > best_sum) {
-            best_sum = cur;
-            best_s = @intCast(s);
+    var packets: [227]i32 = @splat(0);
+    for (0..n / ex.cols) |cb| for (0..k / 32) |g| {
+        for (0..4) |t| {
+            var lowest: usize = 255;
+            var highest: usize = 0;
+            for (0..4) |j| for (0..2) |c| {
+                const row = cb * ex.cols + j * 8 + t * 2 + c;
+                const offset = row * (k / 16) + g * 2;
+                for (scales[offset..][0..2]) |raw| {
+                    hist[raw] += 1;
+                    lowest = @min(lowest, raw);
+                    highest = @max(highest, raw);
+                }
+            };
+            const first = highest -| 30;
+            const last = @min(lowest, 225);
+            if (first <= last) {
+                packets[first] += 1;
+                packets[last + 1] -= 1;
+            }
+        }
+    };
+    var covered: u32 = 0;
+    for (hist[0..31]) |count| covered += count;
+    var clean: i32 = 0;
+    var best_score: u32 = 0;
+    var best: u8 = 0;
+    for (0..226) |base| {
+        if (base != 0) covered = covered + hist[base + 30] - hist[base - 1];
+        clean += packets[base];
+        const score = covered + 8 * @as(u32, @intCast(clean));
+        if (score > best_score) {
+            best_score = score;
+            best = @intCast(base);
         }
     }
-    return best_s;
+    return best;
 }
 
 pub fn packGateUpS5(
@@ -13204,8 +13228,8 @@ pub fn packGateUpS5(
     const nb = n / ex.cols;
     const kg = k / 32;
     const nchunks = kg / 16;
-    const smin_g = bestSmin(g_scales);
-    const smin_u = bestSmin(u_scales);
+    const smin_g = bestSmin(g_scales, n, k);
+    const smin_u = bestSmin(u_scales, n, k);
     smin_g_out.* = smin_g;
     smin_u_out.* = smin_u;
     const c_arr = [2][]const u8{ g_codes, u_codes };
@@ -13272,7 +13296,7 @@ pub fn packDownS5(
 ) !u8 {
     const nb = n / ex.cols;
     const kg = k / 32;
-    const smin = bestSmin(scales);
+    const smin = bestSmin(scales, n, k);
     for (0..nb) |cb| {
         const cb_off = cb * 11136;
         @memset(out_bytes[cb_off + 11040 ..][0..96], 0);
