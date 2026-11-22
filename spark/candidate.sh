@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t273"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -401,28 +401,30 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
     for (int o = 16; o; o >>= 1) {
         fn_mtp::better(wm, wc, __shfl_xor_sync(0xffffffffu, wm, o), __shfl_xor_sync(0xffffffffu, wc, o));
     }
-    __shared__ float smax[4], ssum[4], sbmax;
-    __shared__ int scol[4], sbcol;
+    __shared__ float warp_max[4], warp_sum[4];
+    __shared__ int warp_col[4];
+    float ex = row < V ? expf(fv - wm) : 0.0f;
+    for (int offset = 16; offset; offset >>= 1)
+        ex += __shfl_down_sync(0xffffffffu, ex, offset);
     if (lane == 0) {
-        smax[warp] = wm;
-        scol[warp] = wc;
+        warp_max[warp] = wm;
+        warp_col[warp] = wc;
+        warp_sum[warp] = ex;
     }
     __syncthreads();
-    if (tid == 0) {
-        float bm = smax[0];
-        int bc = scol[0];
-        for (int w = 1; w < 4; ++w) fn_mtp::better(bm, bc, smax[w], scol[w]);
-        sbmax = bm;
-        sbcol = bc;
-    }
-    __syncthreads();
-    const float bmax = sbmax;
-    float ex = (row < V) ? expf(fv - bmax) : 0.0f;
-    for (int o = 16; o; o >>= 1) ex += __shfl_xor_sync(0xffffffffu, ex, o);
-    if (lane == 0) ssum[warp] = ex;
-    __syncthreads();
-    if (tid == 0) {
-        stats[blockIdx.x] = make_float4(bmax, ssum[0] + ssum[1] + ssum[2] + ssum[3], __int_as_float(sbcol), 0.0f);
+    if (warp == 0) {
+        float block_max = warp_max[lane & 3];
+        int block_col = warp_col[lane & 3];
+        for (int offset = 2; offset; offset >>= 1) {
+            fn_mtp::better(block_max, block_col,
+                __shfl_xor_sync(0xffffffffu, block_max, offset),
+                __shfl_xor_sync(0xffffffffu, block_col, offset));
+        }
+        float mass = warp_sum[lane & 3] * expf(warp_max[lane & 3] - block_max);
+        for (int offset = 2; offset; offset >>= 1)
+            mass += __shfl_xor_sync(0xffffffffu, mass, offset);
+        if (lane == 0)
+            stats[blockIdx.x] = make_float4(block_max, mass, __int_as_float(block_col), 0.0f);
     }
 }
 
