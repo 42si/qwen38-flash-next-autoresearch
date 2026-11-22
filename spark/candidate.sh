@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="flashnext-nvfp4-t299"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4354,7 +4354,7 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
     const int tid = threadIdx.x;
     const int vr_local = tid >> 2;
     const int t4 = tid & 3;
-    const int vrow = blk * 32 + vr_local;
+    const int vrow = blk * 16 + vr_local;
     const size_t sbase = (size_t)hv * DV * DK + (size_t)vrow * DK;
     const float* vl = fn_late::vs(log, log_rows);
     const float* gl = fn_late::gbs(log, log_rows);
@@ -4373,9 +4373,9 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         for (int j = 0; j < 8; ++j) out4[t4 + 4 * j] = h[j];
     };
 
-    constexpr unsigned tile = 4;
+    constexpr unsigned tile = 2;
     __shared__ float4 keys[tile][32], queries[tile][32];
-    __shared__ float values[tile][32];
+    __shared__ float values[tile][16];
     __shared__ float2 gate_beta[tile];
     const unsigned total = np + (unsigned)rows;
     for (unsigned base = 0; base < total; base += tile) {
@@ -4383,7 +4383,7 @@ static __device__ __forceinline__ void gdn_rows_late_4t(
         if (load_p < total) {
             const unsigned lr = (first + load_p) % (unsigned)log_rows;
             const int vec = tid & 31;
-            values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 32 + vec];
+            if (vec < 16) values[tid >> 5][vec] = vl[((size_t)lr * NV + hv) * DV + blk * 16 + vec];
             if (vec == 0) gate_beta[tid >> 5] = reinterpret_cast<const float2*>(gl)[(size_t)lr * NV + hv];
             keys[tid >> 5][vec] = reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK)[vec];
             if (load_p >= np) {
@@ -12711,12 +12711,12 @@ pub fn frontHist(k: anytype, stream: cuda.Stream, lw: *const Layer, proj: u64, c
 patch_exact(
     root, "cuda_batch_late.zig",
     "    try cuda.launch.launch(k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, stream, &a);",
-    "    try cuda.launch.launch(k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 32 }, .block = .{ .x = 128 } }, stream, &a);",
+    "    try cuda.launch.launch(k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 64 } }, stream, &a);",
 )
 patch_exact(
     root, "cuda_mtp_ops.zig",
     "                try cuda.launch.launch(o.e.batch_k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, st, &a);",
-    "                try cuda.launch.launch(o.e.batch_k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 32 }, .block = .{ .x = 128 } }, st, &a);",
+    "                try cuda.launch.launch(o.e.batch_k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 64 } }, st, &a);",
 )
 patch_exact(
     root, "cuda_lanes.zig",
