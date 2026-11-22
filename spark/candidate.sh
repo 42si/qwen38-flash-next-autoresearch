@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t319"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -301,10 +301,18 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
 #endif
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float partial = 0.0f;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float x = __bfloat162float(X[i]);
+        sxu[i] = __float_as_uint(x);
+        partial = fmaf(x, __ldg(G + i), partial);
     }
+    for (int offset = 16; offset; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
     __syncthreads();
+    const float basis_projection = (warp_sums[0] + warp_sums[1]) + (warp_sums[2] + warp_sums[3]);
     const int warp = tid >> 5, lane = tid & 31;
     const int blk = blockIdx.x * 4 + warp;
     const int row = blk * 32 + lane;
@@ -386,7 +394,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
                 s4 = ns4;
             }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const float2 correction = __ldg(reinterpret_cast<const float2*>(G + 2560) + row);
+        const float acc = fmaf(correction.y, basis_projection, (acc0 + acc1) * correction.x);
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -774,10 +783,18 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
     }
     __shared__ uint32_t sxu[2560];
     const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float partial = 0.0f;
     for (int i = tid; i < 2560; i += 128) {
-        sxu[i] = __float_as_uint(__bfloat162float(X[i]));
+        const float x = __bfloat162float(X[i]);
+        sxu[i] = __float_as_uint(x);
+        partial = fmaf(x, __ldg(G + i), partial);
     }
+    for (int offset = 16; offset; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
     __syncthreads();
+    const float basis_projection = (warp_sums[0] + warp_sums[1]) + (warp_sums[2] + warp_sums[3]);
     const int warp = tid >> 5, lane = tid & 31;
     const int bidx = blk_offset + blockIdx.x;
     const int blk = bidx * 4 + warp;
@@ -856,7 +873,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_tier(
             }
             if (g4 + 1 < 10) { wa = nwa; wb = nwb; s4 = ns4; }
         }
-        const float acc = (acc0 + acc1) * __ldg(G + row);
+        const float2 correction = __ldg(reinterpret_cast<const float2*>(G + 2560) + row);
+        const float acc = fmaf(correction.y, basis_projection, (acc0 + acc1) * correction.x);
         if (row < V) {
             const __nv_bfloat16 bv = __float2bfloat16_rn(acc);
             out[row] = bv;
@@ -9320,6 +9338,54 @@ const W1PackCtx = struct {
     cal: f32,
     g64: bool,
 
+    // Reconstruct the row the binary GPU scan actually uses, including E4M3 scale rounding.
+    fn residual(ctx: *const W1PackCtx, row: usize, values: *[wt.dims]f32) void {
+        const rb = ctx.full_rows[@as(usize, ctx.ids[row]) * wt.dims * 2 ..][0 .. wt.dims * 2];
+        const gain = ctx.globals[wt.dims + 2 * row];
+        const block = row / 32;
+        const lane = row % 32;
+        for (0..wt.dims / 64) |group| {
+            const base = block * 720 + (group / 4) * 72;
+            const packed_scales = ctx.ws[(base + 64) * 4 + lane];
+            const code: u8 = @truncate(packed_scales >> @intCast((group % 4) * 8));
+            const scale = core.exlr8.codec.e4m3Value(code) * gain;
+            for (0..64) |j| {
+                const i = group * 64 + j;
+                const bits = std.mem.readInt(u16, rb[i * 2 ..][0..2], .little);
+                const original: f32 = @bitCast(@as(u32, bits) << 16);
+                values[i] = original - (if (original < 0.0) -scale else scale);
+            }
+        }
+    }
+
+    fn fitResidualDirection(ctx: *const W1PackCtx) void {
+        if (ctx.v == 0) return;
+        const direction = ctx.globals[0..wt.dims];
+        @memset(direction, 1.0 / @sqrt(@as(f32, @floatFromInt(wt.dims))));
+        const samples = @min(ctx.v, 512);
+        var residual_row: [wt.dims]f32 = undefined;
+        for (0..3) |_| {
+            var next: [wt.dims]f32 = @splat(0);
+            for (0..samples) |sample| {
+                ctx.residual(sample * ctx.v / samples, &residual_row);
+                var dot: f32 = 0;
+                for (residual_row, direction) |x, y| dot += x * y;
+                for (&next, residual_row) |*y, x| y.* += dot * x;
+            }
+            var norm2: f32 = 0;
+            for (next) |x| norm2 += x * x;
+            if (norm2 <= 1e-20) break;
+            const inv = 1.0 / @sqrt(norm2);
+            for (direction, next) |*x, y| x.* = y * inv;
+        }
+        for (0..ctx.v) |row| {
+            ctx.residual(row, &residual_row);
+            var dot: f32 = 0;
+            for (residual_row, direction) |x, y| dot += x * y;
+            ctx.globals[wt.dims + 2 * row + 1] = dot;
+        }
+    }
+
     fn worker(ctx: *const W1PackCtx, tid: usize) void {
         const lo = @min(ctx.v, tid * ctx.per);
         const hi = @min(ctx.v, lo + ctx.per);
@@ -9364,7 +9430,8 @@ const W1PackCtx = struct {
                 const inv_gsc: f32 = 1.0 / gsc;
                 // Match the row-specific RMS loss, relative to the Gaussian sign-quantizer ratio.
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
-                ctx.globals[blk * 32 + lane] = gsc * ctx.cal * adjust;
+                const gain = gsc * ctx.cal * adjust;
+                ctx.globals[wt.dims + 2 * r] = gain;
                 for (0..10) |g4| {
                     const base_u4 = blk * 720 + g4 * 72;
                     const idx_a = (base_u4 + lane) * 4;
@@ -9478,7 +9545,7 @@ pub const W2 = struct {
             const ws_host = try gpa.alloc(u32, nb * u4_per_blk * 4);
             defer gpa.free(ws_host);
             @memset(ws_host, 0);
-            const globals_host = try gpa.alloc(f32, nb * 32);
+            const globals_host = try gpa.alloc(f32, if (is_w1g64) wt.dims + nb * 64 else nb * 32);
             defer gpa.free(globals_host);
             @memset(globals_host, 0.0);
 
@@ -9496,6 +9563,7 @@ pub const W2 = struct {
             var ths: [n_threads]?std.Thread = @splat(null);
             for (0..n_threads) |ti| ths[ti] = try std.Thread.spawn(.{}, W1PackCtx.worker, .{ &ctx, ti });
             for (&ths) |*th| if (th.*) |t| t.join();
+            if (is_w1g64) ctx.fitResidualDirection();
             store.release();
 
             var ids_buf = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(ids));
