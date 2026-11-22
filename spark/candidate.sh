@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t270"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2315,6 +2315,24 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
         const unsigned int nc = n_gt;
         if (nc <= static_cast<unsigned int>(K)) {
             for (int i = t; i < static_cast<int>(nc); i += nt) oc[i] = cand_c[i];
+        } else if (nc <= 256u) {
+            // Each warp compares one candidate against a warp-width group at a time.
+            const unsigned int lane = t & 31u;
+            for (unsigned int i = t >> 5; i < nc; i += nt >> 5) {
+                const unsigned int key = cand_k[i];
+                const int col = cand_c[i];
+                unsigned int rank = 0;
+                for (unsigned int base = 0; base < nc && rank < static_cast<unsigned int>(K); base += 32) {
+                    const unsigned int j = base + lane;
+                    bool precedes = false;
+                    if (j < nc) {
+                        const unsigned int other = cand_k[j];
+                        precedes = other > key || (other == key && cand_c[j] < col);
+                    }
+                    rank += __popc(__ballot_sync(0xffffffffu, precedes));
+                }
+                if (lane == 0 && rank < static_cast<unsigned int>(K)) oc[rank] = col;
+            }
         } else {
             for (int i = t; i < 256; i += nt) hist[i] = 0;
             __syncthreads();
