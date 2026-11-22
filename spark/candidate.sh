@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t295"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -3403,25 +3403,27 @@ __device__ __forceinline__ void qmmf_m1_int6_coop_body(
     const int col = n8 * 8 + row_in_jj;
     const int n64 = n8 >> 3, jj = n8 & 7, KG = K >> 6;
     __shared__ float sh_acc[NW_N][NW_K][8];
-    const bool active = (n8 * 8 < N) && (wk < KG);
+    const int first_group = (KG * wk) / NW_K;
+    const int end_group = (KG * (wk + 1)) / NW_K;
+    const bool active = (n8 * 8 < N) && (first_group < end_group);
     const size_t t_base = static_cast<size_t>(n64) * KG;
     uint32_t w0 = 0u, w1 = 0u, w2 = 0u;
     uint16_t s_cur = 0u;
     if (active) {
-        const uint32_t* wp0 = w + (t_base + wk) * 768 + jj * 96 + lane;
+        const uint32_t* wp0 = w + (t_base + first_group) * 768 + jj * 96 + lane;
         w0 = m1_ld1_256(wp0); w1 = m1_ld1_256(wp0 + 32); w2 = m1_ld1_256(wp0 + 64);
-        s_cur = *reinterpret_cast<const uint16_t*>(bs + (t_base + wk) * 128 + (jj * 8 + row_in_jj) * 2);
+        s_cur = *reinterpret_cast<const uint16_t*>(bs + (t_base + first_group) * 128 + (jj * 8 + row_in_jj) * 2);
     }
     qmm_frag::grid_wait();
     float acc = 0.0f;
     if (active) {
-        for (int g = wk; g < KG; g += NW_K) {
+        for (int g = first_group; g < end_group; ++g) {
             uint32_t nw0, nw1, nw2;
             uint16_t ns_cur;
-            if (g + NW_K < KG) {
-                const uint32_t* np = w + (t_base + g + NW_K) * 768 + jj * 96 + lane;
+            if (g + 1 < end_group) {
+                const uint32_t* np = w + (t_base + g + 1) * 768 + jj * 96 + lane;
                 nw0 = m1_ld1_256(np); nw1 = m1_ld1_256(np + 32); nw2 = m1_ld1_256(np + 64);
-                ns_cur = *reinterpret_cast<const uint16_t*>(bs + (t_base + g + NW_K) * 128 + (jj * 8 + row_in_jj) * 2);
+                ns_cur = *reinterpret_cast<const uint16_t*>(bs + (t_base + g + 1) * 128 + (jj * 8 + row_in_jj) * 2);
             }
             const uint32_t sp = tf_common::fp8pair_unit(s_cur, 0x7B807B80u);
             const float sc0 = __uint_as_float((sp & 0xFFFFu) << 16);
@@ -3449,7 +3451,7 @@ __device__ __forceinline__ void qmmf_m1_int6_coop_body(
                 }
                 acc = fmaf(d, blk == 0 ? sc0 : sc1, acc);
             }
-            if (g + NW_K < KG) { w0 = nw0; w1 = nw1; w2 = nw2; s_cur = ns_cur; }
+            if (g + 1 < end_group) { w0 = nw0; w1 = nw1; w2 = nw2; s_cur = ns_cur; }
         }
     }
     acc += __shfl_xor_sync(0xffffffffu, acc, 1);
