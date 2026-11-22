@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t340"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13681,6 +13681,55 @@ patch_exact(
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
         }""",
 )
+# Set the next greedy depth budget from actual verification of the previous window.
+patch_exact(
+    root, "cuda_lanes.zig",
+    "            prepared: [prompt.batch.max_marks]?*snap.Snap = .{ null, null },",
+    """            prepared: [prompt.batch.max_marks]?*snap.Snap = .{ null, null },
+            previous_drafts: usize = 0,
+            previous_kept: ?usize = null,""",
+)
+patch_exact(
+    root, "cuda_lanes.zig",
+    "                    drafted[held] = wi;",
+    """                    l.previous_drafts = w.rows() - 1;
+                    l.previous_kept = null;
+                    drafted[held] = wi;""",
+)
+patch_exact(
+    root, "cuda_lanes.zig",
+    "                if (l.draft) |*d| try self.ops().rollback(&l.seq, d, path.len) else if (path.len != w.rows()) return error.CannotRewind;",
+    """                if (l.draft) |*d| try self.ops().rollback(&l.seq, d, path.len) else if (path.len != w.rows()) return error.CannotRewind;
+                l.previous_kept = path.len;""",
+)
+patch_exact(
+    root, "cuda_lanes_draft.zig",
+    "pub const Rule = struct { greedy: usize, greedy_stop: f64 };",
+    """pub const Rule = struct { greedy: usize, greedy_stop: f64 };
+
+/// Use verifier outcomes, including the pending root row, to price the next greedy window.
+pub fn lookahead(cap: usize, previous: usize, kept: ?usize, sampled: bool) usize {
+    if (sampled) return cap;
+    const rows = kept orelse return @min(cap, 15);
+    if (previous == 0 or rows == 0) return @min(cap, 15);
+    const accepted = @min(previous, rows - 1);
+    // A censored window can grow; a rejected tail leaves room to explore twice the accepted depth.
+    const budget = if (accepted == previous) @max(8, previous + 2) else @max(4, 2 * accepted + 2);
+    return @min(cap, budget);
+}""",
+)
+patch_exact(
+    root, "cuda_lanes.zig",
+    "                const count = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rule.greedy)), l.seq.cap - l.seq.fed - 1);",
+    """                const cap = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rule.greedy)), l.seq.cap - l.seq.fed - 1);
+                const count = lanes_draft.lookahead(cap, l.previous_drafts, if (r.rows) |path| path.len else l.previous_kept, mtp.isSampled(r.stream.sampling));""",
+)
+patch_exact(
+    root, "cuda_lanes_draft.zig",
+    "        counts[n] = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rl.greedy)), room);",
+    """        const cap = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rl.greedy)), room);
+        counts[n] = lookahead(cap, l.previous_drafts, if (r.rows) |path| path.len else l.previous_kept, mtp.isSampled(r.stream.sampling));""",
+)
 PY
 }
 
@@ -13792,7 +13841,7 @@ PY
       PAR="$GUARD_PARALLEL"
       THINK="--thinking"
     else
-      export TF_FLASHNEXT_DRAFTS_GREEDY="${TF_FLASHNEXT_DRAFTS_GREEDY:-15}"
+      export TF_FLASHNEXT_DRAFTS_GREEDY="${TF_FLASHNEXT_DRAFTS_GREEDY:-23}"
       export TF_FLASHNEXT_CONFIDENCE="${TF_FLASHNEXT_CONFIDENCE:--0.28}"
       export TF_FLASHNEXT_STOP_ALPHA="${TF_FLASHNEXT_STOP_ALPHA:-3.2}"
       export TF_FLASHNEXT_STOP_DECAY="${TF_FLASHNEXT_STOP_DECAY:-1.0}"
