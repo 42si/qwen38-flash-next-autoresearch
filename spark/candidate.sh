@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t305"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -361,21 +361,25 @@ extern "C" __global__ void __launch_bounds__(128) fn_w1g64_gemv_fused(
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 const uint32_t* xg = sxu + (g4 * 4 + q) * 64;
-                const uint32_t w0 = wlo[q], w1 = whi[q];
                 float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+                // Each half warp holds all signed sums for its four activations.
+                // Two shuffles select the pair of sums for each output row.
                 #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[j + 0] ^ ((w0 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[j + 1] ^ ((w0 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[j + 2] ^ ((w0 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[j + 3] ^ ((w0 << (31 - (j + 3))) & 0x80000000u));
-                }
-                #pragma unroll
-                for (int j = 0; j < 32; j += 4) {
-                    d0 += __uint_as_float(xg[32 + j + 0] ^ ((w1 << (31 - (j + 0))) & 0x80000000u));
-                    d1 += __uint_as_float(xg[32 + j + 1] ^ ((w1 << (31 - (j + 1))) & 0x80000000u));
-                    d2 += __uint_as_float(xg[32 + j + 2] ^ ((w1 << (31 - (j + 2))) & 0x80000000u));
-                    d3 += __uint_as_float(xg[32 + j + 3] ^ ((w1 << (31 - (j + 3))) & 0x80000000u));
+                for (int h = 0; h < 2; ++h) {
+                    const uint32_t word = h ? whi[q] : wlo[q];
+                    #pragma unroll
+                    for (int j = 0; j < 32; j += 8) {
+                        const uint32_t* x = xg + h * 32 + j + (lane >> 4) * 4;
+                        const float a = __uint_as_float(x[0] ^ ((lane & 1u) << 31));
+                        const float b = __uint_as_float(x[1] ^ ((lane & 2u) << 30));
+                        const float c = __uint_as_float(x[2] ^ ((lane & 4u) << 29));
+                        const float d = __uint_as_float(x[3] ^ ((lane & 8u) << 28));
+                        const float value = (a + b) + (c + d);
+                        const float lo = __shfl_sync(0xffffffffu, value, (word >> j) & 15u);
+                        const float hi = __shfl_sync(0xffffffffu, value, 16u + ((word >> (j + 4)) & 15u));
+                        if (h == 0) { d0 += lo; d1 += hi; }
+                        else { d2 += lo; d3 += hi; }
+                    }
                 }
                 if (q & 1) acc1 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc1);
                 else acc0 = fmaf(sc[q], (d0 + d1) + (d2 + d3), acc0);
