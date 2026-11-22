@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t255"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -7563,6 +7563,17 @@ for _gdn_call in (
     asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");
 #endif""",
     )
+patch_k(
+    "flashnext_pages.cuh",
+    "    return static_cast<long long>(pg.pt[p / per]) * pg.ps + static_cast<long long>(p % per) * row;",
+    """    if (p >= 0 && (per == 256 || per == 64)) {
+        const unsigned pos = static_cast<unsigned>(p);
+        const unsigned page = per == 256 ? pos >> 8 : pos >> 6;
+        const unsigned in_page = pos & static_cast<unsigned>(per - 1);
+        return static_cast<long long>(pg.pt[page]) * pg.ps + static_cast<long long>(in_page) * row;
+    }
+    return static_cast<long long>(pg.pt[p / per]) * pg.ps + static_cast<long long>(p % per) * row;""",
+)
 # State-first PDL on fn_gdn_rows_late: griddepcontrol.wait is now INSIDE gdn_rows_late_4t AFTER 3.15MB state_in prefetch!
 patch_k(
     "flashnext_batch.cu",
