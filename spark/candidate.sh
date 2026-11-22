@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t220"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -9360,7 +9360,24 @@ const W1PackCtx = struct {
                     g_w1[g] = w1;
                     if (s > rmax) rmax = s;
                 }
-                const gsc: f32 = if (rmax > 0.0) rmax / 448.0 else 1.0;
+                var gsc: f32 = if (rmax > 0.0) rmax / 448.0 else 1.0;
+                if (rmax > 0.0) {
+                    var best_error: f32 = std.math.inf(f32);
+                    // One E4M3 mantissa interval covers the relevant grid phases.
+                    for (0..9) |phase| {
+                        const step = rmax / (448.0 - 4.0 * @as(f32, @floatFromInt(phase)));
+                        var err: f32 = 0;
+                        for (g_scales) |scale| {
+                            const code = core.exlr8.codec.e4m3FromF32(@min(scale / step, 448.0));
+                            const delta = scale - core.exlr8.codec.e4m3Value(code) * step;
+                            err += delta * delta;
+                        }
+                        if (err < best_error) {
+                            best_error = err;
+                            gsc = step;
+                        }
+                    }
+                }
                 const inv_gsc: f32 = 1.0 / gsc;
                 // Match the row-specific RMS loss, relative to the Gaussian sign-quantizer ratio.
                 const adjust: f32 = if (binary_energy > 0.0) std.math.clamp(0.79788456 * @sqrt(weight_energy / binary_energy), 0.8, 1.25) else 1.0;
