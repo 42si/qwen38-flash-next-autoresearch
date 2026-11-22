@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t223"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -5333,6 +5333,26 @@ static __device__ __noinline__ void s5_down_1w_wide(
   }
 }
 
+// The final 96 bytes of each down-projection strip hold offsets for its 20 groups.
+static __device__ __noinline__ uint32_t s5_fix_down_group(
+    uint32_t val, uint32_t mask, uint32_t first_key, const uint32_t* offsets,
+    const uint32_t* entries, int group) {
+  const uint32_t start = __ldg(offsets + group);
+  const uint32_t end = __ldg(offsets + group + 1);
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    const unsigned shift = byte * 8;
+    if (!(mask & (0x20u << shift))) continue;
+    uint32_t lo = start, hi = end;
+    while (lo < hi) {
+      const uint32_t mid = (lo + hi) >> 1;
+      if ((__ldg(entries + mid) >> 8) < first_key + byte) lo = mid + 1; else hi = mid;
+    }
+    const uint32_t raw = __ldg(entries + lo) & 0xffu;
+    val = (val & ~(0xffu << shift)) | (raw << shift);
+  }
+  return val;
+}
+
 extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
     const __nv_bfloat16* X, int x_stride, int slots, const uint4* __restrict__ W,
     const float* __restrict__ scale, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
@@ -5376,7 +5396,15 @@ extern "C" __global__ void __launch_bounds__(32, 20) tf_nvfp4_s5_down_1w(
           const uint2 lo = reinterpret_cast<const uint2*>(sh_lo)[g * 4 + t];
           const uint32_t hi = reinterpret_cast<const uint16_t*>(sh_hi)[g * 4 + t];
           const uint32_t kb = ((uint32_t)(cb * KG + g) * 64u) + (uint32_t)t * 16u;
-          piece = s5_unpack_piece(lo, hi, gq, smin4, meta, esc, e, kb);
+          const uint32_t low = ((gq < 2 ? lo.x : lo.y) >> ((gq & 1) * 16)) & 0xffffu;
+          const uint32_t high = (hi >> (4 * gq)) & 15u;
+          const uint32_t codes = (__byte_perm(low, low >> 4, 0x5140) & 0x0f0f0f0fu) |
+              (((high * 0x00204081u) & 0x01010101u) << 4);
+          piece = codes + smin4;
+          const uint32_t mask = (codes + 0x01010101u) & 0x20202020u;
+          if (__builtin_expect(mask != 0, 0))
+              piece = s5_fix_down_group(piece, mask, kb + 4u * gq,
+                  reinterpret_cast<const uint32_t*>(blk + 690), esc + __ldg(meta + e).y, g);
         }
         const uint32_t sx = __shfl_sync(0xffffffffu, piece, t);
         const uint32_t sy = __shfl_sync(0xffffffffu, piece, 4 + t);
@@ -13275,8 +13303,11 @@ pub fn packDownS5(
     const smin = bestSmin(scales);
     for (0..nb) |cb| {
         const cb_off = cb * 11136;
-        @memset(out_bytes[cb_off + 11040 ..][0..96], 0);
+        const offsets = out_bytes[cb_off + 11040 ..][0..96];
+        @memset(offsets, 0);
+        std.debug.assert((kg + 1) * 4 <= offsets.len);
         for (0..kg) |g| {
+            std.mem.writeInt(u32, offsets[g * 4 ..][0..4], @intCast(esc_out.items.len), .little);
             const block_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_bytes[cb_off + g * 512 ..][0..512]));
             for (0..8) |gq| for (0..4) |t| for (0..4) |j| {
                 const row = cb * ex.cols + j * 8 + gq;
@@ -13314,6 +13345,7 @@ pub fn packDownS5(
                 std.mem.writeInt(u16, hi_dst[t * 2 ..][0..2], hi16, .little);
             }
         }
+        std.mem.writeInt(u32, offsets[kg * 4 ..][0..4], @intCast(esc_out.items.len), .little);
     }
     return smin;
 }
