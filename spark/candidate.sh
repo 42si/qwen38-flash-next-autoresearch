@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t265"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1363,6 +1363,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_rescore_best_cond(
 
 struct W2PickOut {
     int cand_col[64];
+    uint32_t weight_row[64];
     float cand_old[64];
     float cand_new[64];
     float gmax;
@@ -1379,6 +1380,7 @@ __device__ __forceinline__ uint16_t fn_bf16_ord(uint16_t u) {
 
 extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
     const __nv_bfloat16* dlogits,
+    const uint32_t* __restrict__ vocab_ids,
     const float4* stats,
     int n_blocks,
     int V,
@@ -1567,6 +1569,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                 const unsigned int slot = atomicAdd(&n_cand, 1u);
                 if (slot < k_lim) {
                     po->cand_col[slot] = i;
+                    po->weight_row[slot] = vocab_ids[i];
                     po->cand_old[slot] = v;
                 } else {
                     fn_mtp::better(rmax, rcol, v, i);
@@ -1588,6 +1591,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                     const unsigned int slot = atomicAdd(&n_cand, 1u);
                     if (slot < k_lim) {
                         po->cand_col[slot] = i;
+                        po->weight_row[slot] = vocab_ids[i];
                         po->cand_old[slot] = v;
                     } else {
                         fn_mtp::better(rmax, rcol, v, i);
@@ -1636,7 +1640,6 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
 extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
     const __nv_bfloat16* X,
     const __nv_bfloat16* __restrict__ W_full_bf16,
-    const uint32_t* __restrict__ vocab_ids,
     __nv_bfloat16* dlogits,
     W2PickOut* __restrict__ po,
     float* __restrict__ best_out) {
@@ -1648,7 +1651,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
     if (j < K) {
         const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
         const int c = po->cand_col[j];
-        const uint32_t gid = vocab_ids[c];
+        const uint32_t gid = po->weight_row[j];
         const uint4* wp = reinterpret_cast<const uint4*>(W_full_bf16 + static_cast<size_t>(gid) * 2560);
         const uint4* xp = reinterpret_cast<const uint4*>(X);
         float sum = 0.0f;
@@ -9673,6 +9676,7 @@ pub const W2 = struct {
             const po = sc + 16384;
             var ap: cuda.Args = .{};
             ap.add(dlogits);
+            ap.add(self.vocab_ids.?.ptr);
             ap.add(sc);
             ap.add(@as(c_int, @intCast(n_blocks)));
             ap.add(@as(c_int, @intCast(v)));
@@ -9684,7 +9688,6 @@ pub const W2 = struct {
             var am: cuda.Args = .{};
             am.add(input);
             am.add(self.bf16_ptr);
-            am.add(self.vocab_ids.?.ptr);
             am.add(dlogits);
             am.add(po);
             am.add(best_out);
