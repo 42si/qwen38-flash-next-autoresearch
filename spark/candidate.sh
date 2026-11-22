@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t322"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1633,7 +1633,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
 #endif
 }
 
-extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
+extern "C" __global__ void __launch_bounds__(320) fn_w2_rescore_multi(
     const __nv_bfloat16* X,
     const __nv_bfloat16* __restrict__ W_full_bf16,
     const uint32_t* __restrict__ vocab_ids,
@@ -1653,7 +1653,8 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
         const uint4* xp = reinterpret_cast<const uint4*>(X);
         float sum = 0.0f;
         #pragma unroll
-        for (int i = tid; i < 320; i += 128) {
+        {
+            const int i = tid;
             const uint4 wv = __ldg(wp + i);
             const uint4 xv = __ldg(xp + i);
             sum = fmaf(__uint_as_float((xv.x & 0xFFFFu) << 16), __uint_as_float((wv.x & 0xFFFFu) << 16), sum);
@@ -1666,12 +1667,14 @@ extern "C" __global__ void __launch_bounds__(128) fn_w2_rescore_multi(
             sum = fmaf(__uint_as_float(xv.w & 0xFFFF0000u),     __uint_as_float(wv.w & 0xFFFF0000u), sum);
         }
         for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        __shared__ float sw[4];
+        __shared__ float sw[10];
         __shared__ int s_is_last;
         if (lane == 0) sw[warp] = sum;
         __syncthreads();
         if (tid == 0) {
-            const float tot = sw[0] + sw[1] + sw[2] + sw[3];
+            float tot = sw[0];
+            #pragma unroll
+            for (int w = 1; w < 10; ++w) tot += sw[w];
             const __nv_bfloat16 nb = __float2bfloat16_rn(tot);
             dlogits[c] = nb;
             po->cand_new[j] = __bfloat162float(nb);
@@ -9688,7 +9691,7 @@ pub const W2 = struct {
             am.add(dlogits);
             am.add(po);
             am.add(best_out);
-            try cuda.launch.launch(self.multi_fn.?, .{ .grid = .{ .x = @intCast(self.k_top) }, .block = .{ .x = 128 }, .pdl = true }, stream, &am);
+            try cuda.launch.launch(self.multi_fn.?, .{ .grid = .{ .x = @intCast(self.k_top) }, .block = .{ .x = 320 }, .pdl = true }, stream, &am);
             return;
         }
 
