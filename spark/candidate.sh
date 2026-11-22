@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t321"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1465,7 +1465,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         __syncthreads();
         if (warp == 0) {
             uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+            c = __reduce_add_sync(0xffffffffu, c);
             if (lane == 0) s_tot = c;
         }
         __syncthreads();
@@ -1521,12 +1521,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
                 if (i < V) cnt += (fn_bf16_ord(drow[i]) >= mid);
             }
         }
-        for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
+        cnt = __reduce_add_sync(0xffffffffu, cnt);
         if (lane == 0) wcnt[warp] = cnt;
         __syncthreads();
         if (warp == 0) {
             uint32_t c = wcnt[lane];
-            for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+            c = __reduce_add_sync(0xffffffffu, c);
             if (lane == 0) s_tot = c;
         }
         __syncthreads();
@@ -1542,12 +1542,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
             if (i < V) gt_cnt += (fn_bf16_ord(drow[i]) > tok_cut);
         }
     }
-    for (int o = 16; o; o >>= 1) gt_cnt += __shfl_xor_sync(0xffffffffu, gt_cnt, o);
+    gt_cnt = __reduce_add_sync(0xffffffffu, gt_cnt);
     if (lane == 0) wcnt[warp] = gt_cnt;
     __syncthreads();
     if (warp == 0) {
         uint32_t c = wcnt[lane];
-        for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        c = __reduce_add_sync(0xffffffffu, c);
         if (lane == 0) {
             s_tot = c;
             n_cand = 0;
