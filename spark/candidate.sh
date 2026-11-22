@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t293"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -8267,9 +8267,32 @@ const PackJob = struct {
                             const sc_val = core.exlr8.codec.e4m3Value(sc_code) * ctx.global_scale;
                             if (sc_val > 0.0) {
                                 const inv = 1.0 / sc_val;
+                                var residual: [32]f32 = undefined;
+                                var sum_error: f32 = 0;
+                                const codes = q[blk * 32 ..][0..32];
                                 for (0..32) |j| {
-                                    const raw = @round(w[j] * inv + 31.5);
-                                    q[blk * 32 + j] = if (raw <= 0.0) 0 else if (raw >= 63.0) 63 else @intFromFloat(raw);
+                                    const desired = std.math.clamp(w[j] * inv + 31.5, 0.0, 63.0);
+                                    codes[j] = @intFromFloat(@round(desired));
+                                    residual[j] = desired - @as(f32, @floatFromInt(codes[j]));
+                                    sum_error += residual[j];
+                                }
+                                // Respect the nearest representable group sum, changing the least costly codes first.
+                                const up = sum_error > 0;
+                                const steps: usize = @intFromFloat(@round(@abs(sum_error)));
+                                for (0..steps) |_| {
+                                    var best: ?usize = null;
+                                    for (0..32) |j| {
+                                        if ((up and codes[j] == 63) or (!up and codes[j] == 0)) continue;
+                                        if (best == null or (if (up) residual[j] > residual[best.?] else residual[j] < residual[best.?])) best = j;
+                                    }
+                                    const j = best orelse break;
+                                    if (up) {
+                                        codes[j] += 1;
+                                        residual[j] -= 1.0;
+                                    } else {
+                                        codes[j] -= 1;
+                                        residual[j] += 1.0;
+                                    }
                                 }
                             } else {
                                 for (0..32) |j| q[blk * 32 + j] = 32;
