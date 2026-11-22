@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t341"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -1455,6 +1455,29 @@ extern "C" __global__ void __launch_bounds__(1024) fn_w2_pick_cands(
         ws = ss[lane];
         for (int o = 16; o; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
         if (lane == 0) sgsum = ws;
+    }
+
+    __syncthreads();
+    // A highly concentrated draft distribution can propose directly. The target still verifies it.
+    if (sgsum >= 1.0f && sgsum <= 1.05f) {
+        const int winner = t < n_blocks && my_st.x == gmax ? __float_as_int(my_st.z) : 0x7fffffff;
+        const int warp_winner = __reduce_min_sync(0xffffffffu, winner);
+        if (lane == 0) si[warp] = warp_winner;
+        __syncthreads();
+        if (warp == 0) {
+            const int col = __reduce_min_sync(0xffffffffu, si[lane]);
+            if (lane == 0) {
+                po->K = 0;
+                best_out[0] = gmax;
+                best_out[1] = gmax + logf(sgsum);
+                best_out[2] = __int_as_float(col);
+                best_out[3] = 0.0f;
+            }
+        }
+#if __CUDA_ARCH__ >= 900
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+        return;
     }
 
     uint32_t hi = s_hi, lo = s_lo;
