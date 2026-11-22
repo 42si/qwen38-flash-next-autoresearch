@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t213"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10805,7 +10805,12 @@ patch_exact(
         lastIds(g.hash, &mh, @intCast(tok), ids_buf[0..heads]) catch return;
         var emb: [ple_cache.row_w]u16 = undefined;
         if (g.format != .mlx and heads > 1) {
-            @import("cuda_ple_gather.zig").run(g, ids_buf[0..heads], &emb) catch return;
+            // lastIds emits one row per disjoint head range, already in table order.
+            const parts = @max(1, @min(ple_pool.max_parts, heads / 4));
+            if (g.pool) |pool| {
+                const split: Split = .{ .g = g, .ids = ids_buf[0..heads], .out = &emb, .per = (heads + parts - 1) / parts };
+                pool.run(parts, .{ .ctx = &split, .run = Split.part }) catch return;
+            } else g.fill(ids_buf[0..heads], &emb, 0, heads) catch return;
         } else {
             g.fill(ids_buf[0..heads], &emb, 0, heads) catch return;
         }
