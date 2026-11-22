@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t277"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -8603,6 +8603,7 @@ const Entry = struct {
 
 const Set = struct {
     hand: u32,
+    recent: u32,
     items: [ways]Entry,
 };
 
@@ -8649,8 +8650,9 @@ pub const Cache = struct {
         lk.acquire();
         defer lk.release();
         const set = &self.sets[idx];
-        for (&set.items) |*e| {
+        for (&set.items, 0..) |*e, way| {
             if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) {
+                set.recent |= @as(u32, 1) << @intCast(way);
                 @memcpy(emb_out, &e.emb);
                 @memcpy(xs_out, &e.xs);
                 return true;
@@ -8667,6 +8669,12 @@ pub const Cache = struct {
         const set = &self.sets[idx];
         for (&set.items) |*e| {
             if (e.valid != 0 and e.tok == tok and e.h0 == h0 and e.h1 == h1) return;
+        }
+        for (0..ways) |_| {
+            const bit = @as(u32, 1) << @intCast(set.hand & (ways - 1));
+            if (set.recent & bit == 0) break;
+            set.recent &= ~bit;
+            set.hand +%= 1;
         }
         const way: usize = @intCast(set.hand & (ways - 1));
         set.hand +%= 1;
