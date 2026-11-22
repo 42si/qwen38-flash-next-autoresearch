@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t245"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -13680,6 +13680,30 @@ patch_exact(
         } else {
             try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
         }""",
+)
+patch_exact(root, "cuda_batch_state.zig",
+    """    best_out: u64 = 0,""",
+    """    best_out: u64 = 0,
+    verify_nrow_dst: u64 = 0,""",
+)
+patch_exact(root, "cuda_mtp_ops.zig",
+    """            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .best_out = if (use_best) d.best.ptr else 0, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = vhl });
+            if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);""",
+    """            const capture_nrow = keeps and use_best and o.e.collective == null;
+            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .best_out = if (use_best) d.best.ptr else 0, .verify_nrow_dst = if (capture_nrow) d.saved.ptr + d.layout.nrow_at else 0, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = vhl });
+            if (keeps and !capture_nrow) try copyAsync(o.stream(), d.saved.ptr + d.layout.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);""",
+)
+patch_exact(root, "cuda_batch.zig",
+    """            if (do_head) try self.head(logits_host);""",
+    """            if (do_head) {
+                try self.head(logits_host);
+                if (self.hooks.verify_nrow_dst != 0) try self.copy(self.hooks.verify_nrow_dst, s.ple_nrow, n * wide * 2);
+            }""",
+)
+patch_exact(root, "cuda_window_graph.zig",
+    """        h.keep(hooks.keep);""",
+    """        h.keep(hooks.keep);
+        if (hooks.verify_nrow_dst != 0) h.values(&[_]u64{ hooks.verify_nrow_dst, s.ple_nrow });""",
 )
 PY
 }
