@@ -13745,6 +13745,7 @@ PY
     ;;
 
   start)
+    export CUDA_DEVICE_MAX_CONNECTIONS=16
     export LD_LIBRARY_PATH="${RELEASE_LIB}:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export TF_FLASHNEXT_DRAFT_HEAD="affine4"
     export TF_FLASHNEXT_MTP_W2="w1g64"
