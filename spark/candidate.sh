@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t368"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -10515,7 +10515,9 @@ patch_exact(
         const bm: usize = if (prompt) 128 else p.bm;
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
-        const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null and hm.? < 4;
+        // A single 16-row decode tile can avoid the clustered reduction's scheduling cost.
+        const fs = !prompt and m <= 16 and l.fuse_split_n != 0 and p.cluster and
+            w.n >= l.fuse_split_n and hm != null and hm.? < 4;
         const h_thr: usize = if (w.mode == .bf12 or w.mode == .bf11) 64 else l.half_below;
         const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < h_thr;
         const half32 = (w.mode == .bf12 or w.mode == .bf11) and out == .f32 and p.bm == 32 and !prompt and !p.fused and !p.cluster and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < h_thr;
@@ -13774,7 +13776,7 @@ PY
     export TF_BF12_OUT_SK4="0"
     export TF_FLASHNEXT_TRUNK_BF12="1"
     export TF_FLASHNEXT_TRUNK_BF11="1"
-    export TF_FLASHNEXT_FUSED_SPLIT="0"
+    export TF_FLASHNEXT_FUSED_SPLIT="1"
     export TF_FLASHNEXT_L2PF_MB="0"
     export TF_FLASHNEXT_L2PF_PACE_GBPS="165"
     export TF_NVFP4_DECODE_WARPS="1"
