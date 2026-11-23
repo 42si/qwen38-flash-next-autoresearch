@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t367"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2698,7 +2698,7 @@ __device__ __forceinline__ uint32_t int6pair(uint32_t lo4, uint32_t hi2) {
     const uint32_t q1 = ((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4);
     const uint32_t t = 0x42804280u | (q0 << 1) | (q1 << 17);
     uint32_t r;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC2BFC2BFu));
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC2C0C2C0u));
     return r;
 }
 
@@ -3288,10 +3288,10 @@ __device__ __forceinline__ void qmmf_m1_int6_body(
                 const int kt = blk * 2 + kh;
                 const uint32_t lo4 = lo_w >> (kh * 16);
                 const uint32_t hi2 = w2 >> (kt * 8);
-                const float q0 = static_cast<float>((lo4 & 0xFu) | ((hi2 & 0x3u) << 4)) - 31.5f;
-                const float q1 = static_cast<float>(((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4)) - 31.5f;
-                const float q2 = static_cast<float>(((lo4 >> 8) & 0xFu) | (((hi2 >> 4) & 0x3u) << 4)) - 31.5f;
-                const float q3 = static_cast<float>(((lo4 >> 12) & 0xFu) | (((hi2 >> 6) & 0x3u) << 4)) - 31.5f;
+                const float q0 = static_cast<float>((lo4 & 0xFu) | ((hi2 & 0x3u) << 4)) - 32.0f;
+                const float q1 = static_cast<float>(((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4)) - 32.0f;
+                const float q2 = static_cast<float>(((lo4 >> 8) & 0xFu) | (((hi2 >> 4) & 0x3u) << 4)) - 32.0f;
+                const float q3 = static_cast<float>(((lo4 >> 12) & 0xFu) | (((hi2 >> 6) & 0x3u) << 4)) - 32.0f;
                 const int k0 = g * 64 + kt * 16 + sub * 2;
                 const uint32_t xv0 = *reinterpret_cast<const uint32_t*>(x + k0);
                 const uint32_t xv1 = *reinterpret_cast<const uint32_t*>(x + k0 + 8);
@@ -3435,10 +3435,10 @@ __device__ __forceinline__ void qmmf_m1_int6_coop_body(
                     const int kt = blk * 2 + kh;
                     const uint32_t lo4 = lo_w >> (kh * 16);
                     const uint32_t hi2 = w2 >> (kt * 8);
-                    const float q0 = __uint_as_float(0x43000000u | (((lo4 & 0xFu) | ((hi2 & 0x3u) << 4)) << 16)) - 159.5f;
-                    const float q1 = __uint_as_float(0x43000000u | ((((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4)) << 16)) - 159.5f;
-                    const float q2 = __uint_as_float(0x43000000u | ((((lo4 >> 8) & 0xFu) | (((hi2 >> 4) & 0x3u) << 4)) << 16)) - 159.5f;
-                    const float q3 = __uint_as_float(0x43000000u | ((((lo4 >> 12) & 0xFu) | (((hi2 >> 6) & 0x3u) << 4)) << 16)) - 159.5f;
+                    const float q0 = __uint_as_float(0x43000000u | (((lo4 & 0xFu) | ((hi2 & 0x3u) << 4)) << 16)) - 160.0f;
+                    const float q1 = __uint_as_float(0x43000000u | ((((lo4 >> 4) & 0xFu) | (((hi2 >> 2) & 0x3u) << 4)) << 16)) - 160.0f;
+                    const float q2 = __uint_as_float(0x43000000u | ((((lo4 >> 8) & 0xFu) | (((hi2 >> 4) & 0x3u) << 4)) << 16)) - 160.0f;
+                    const float q3 = __uint_as_float(0x43000000u | ((((lo4 >> 12) & 0xFu) | (((hi2 >> 6) & 0x3u) << 4)) << 16)) - 160.0f;
                     const int k0 = g * 64 + kt * 16 + sub * 2;
                     const uint32_t xv0 = __ldg(reinterpret_cast<const uint32_t*>(x + k0));
                     const uint32_t xv1 = __ldg(reinterpret_cast<const uint32_t*>(x + k0 + 8));
@@ -8148,7 +8148,7 @@ ZIG
 
   # 2a3. MTP BF16 -> 6.25-bit symmetric INT6+E4M3 encoder (30.4-32.3 dB SNR, -24.2% DRAM vs MXFP8)
   cat > "$fn_dir/cuda_mtp_int6.zig" <<'ZIG'
-//! Re-codes MTP dense BF16 linears and HC mixers to 6.25-bit symmetric INT6 ([-31.5..+31.5]) + g32 E4M3 scales at load.
+//! Re-codes MTP dense BF16 linears and HC mixers to 6.25-bit symmetric INT6 ([-32..+31], exact zero) + g32 E4M3 scales at load.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -8242,7 +8242,7 @@ const PackJob = struct {
     fn worker(ctx: *const PackJob, tid_th: usize) void {
         const lo = @min(ctx.n64_tot, tid_th * ctx.per);
         const hi = @min(ctx.n64_tot, lo + ctx.per);
-        const inv_g315: f32 = 1.0 / (ctx.global_scale * 31.5);
+        const inv_global: f32 = 1.0 / ctx.global_scale;
         for (lo..hi) |n64| {
             for (0..ctx.kg) |g| {
                 const tile = n64 * ctx.kg + g;
@@ -8256,19 +8256,21 @@ const PackJob = struct {
                         const row_base = row * ctx.k + g * 64;
                         for (0..2) |blk| {
                             var w: [32]f32 = undefined;
-                            var mmax: f32 = 0.0;
+                            var pos_peak: f32 = 0.0;
+                            var neg_peak: f32 = 0.0;
                             for (0..32) |j| {
                                 const f = bf16ToF32(ctx.bf16, row_base + blk * 32 + j);
                                 w[j] = f;
-                                mmax = @max(mmax, @abs(f));
+                                pos_peak = @max(pos_peak, f);
+                                neg_peak = @max(neg_peak, -f);
                             }
-                            const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(mmax * inv_g315, 0.0, 448.0));
+                            const sc_code = core.exlr8.codec.e4m3FromF32(std.math.clamp(@max(pos_peak / 31.0, neg_peak / 32.0) * inv_global, 0.0, 448.0));
                             sc[blk] = sc_code;
                             const sc_val = core.exlr8.codec.e4m3Value(sc_code) * ctx.global_scale;
                             if (sc_val > 0.0) {
                                 const inv = 1.0 / sc_val;
                                 for (0..32) |j| {
-                                    const raw = @round(w[j] * inv + 31.5);
+                                    const raw = (@round(w[j] * inv) + 32.0);
                                     q[blk * 32 + j] = if (raw <= 0.0) 0 else if (raw >= 63.0) 63 else @intFromFloat(raw);
                                 }
                             } else {
@@ -8319,7 +8321,7 @@ pub fn project(gpa: std.mem.Allocator, driver: *const cuda.Driver, bf16: []const
         if (u <= 0x7f80 and u > top_bits) top_bits = u;
     }
     const max_abs: f32 = @bitCast(@as(u32, top_bits) << 16);
-    const global_scale: f32 = if (max_abs > 0.0) max_abs / (31.5 * 448.0) else 1.0;
+    const global_scale: f32 = if (max_abs > 0.0) max_abs / (31.0 * 448.0) else 1.0;
 
     const npad = cuda.nvfp4.padded(n);
     const n64_tot = npad / 64;
