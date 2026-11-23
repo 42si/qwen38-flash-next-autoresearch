@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t364"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -12597,6 +12597,23 @@ patch_exact(
     "    if (!e.cfg.root_copies) return requests;",
     "    if (!e.cfg.root_copies or !e.alone) return requests;",
 )
+# Prefer useful continuations when the longest request-local suffix occurs repeatedly.
+patch_exact(
+    root.parent.parent / "core" / "lanes", "proposer.zig",
+    """            if (length > best_len) {
+                best_len = length;
+                best_end = end;
+                if (length >= s.params.max_extension) break;
+            }""",
+    """            const wanted: usize = @intCast(max_draft);
+            const available = @min(wanted, history.len - end);
+            const previous = @min(wanted, history.len - best_end);
+            if (length > best_len or (length == best_len and available > previous)) {
+                best_len = length;
+                best_end = end;
+                if (length >= s.params.max_extension and available == wanted) break;
+            }""",
+)
 patch_exact(
     root, "cuda_lanes_draft.zig",
     "const max_hist = 17;",
@@ -13802,7 +13819,7 @@ PY
       export TF_FLASHNEXT_EXT_TOK="${TF_FLASHNEXT_EXT_TOK:-0.0}"
       export TF_FLASHNEXT_EXT_MIN="${TF_FLASHNEXT_EXT_MIN:-0}"
       export TF_FLASHNEXT_FACT_ROWS="${TF_FLASHNEXT_FACT_ROWS:-256}"
-      export TF_FLASHNEXT_ROOT_COPIES="0"
+      export TF_FLASHNEXT_ROOT_COPIES="1"
       export TF_FLASHNEXT_P_CLIFF="0.0"
       export TF_FLASHNEXT_W2_MULTI="1"
       export TF_FLASHNEXT_ROUTER_BF12="0"
