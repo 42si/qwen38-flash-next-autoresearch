@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t366"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -6975,6 +6975,7 @@ patch_k(
 (kdir / "route_rows.cu").write_text(
     (kdir / "route_rows.cu").read_text(encoding="utf-8") + r"""
 
+template<int PASSES>
 static __device__ __forceinline__ void route_topk_plan_impl(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
@@ -6982,7 +6983,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     __shared__ int sh_cnt[512];
     __shared__ int sh_off[512];
-    __shared__ int sh_pick[32 * 12];
+    __shared__ int sh_pick[PASSES * 32 * 12];
     __shared__ uint32_t wsum[2][16];
     if (tid < E_PLAN) sh_cnt[tid] = 0;
 #if __CUDA_ARCH__ >= 900
@@ -6990,9 +6991,16 @@ static __device__ __forceinline__ void route_topk_plan_impl(
 #endif
     __syncthreads();
 
-    if (warp < M) {
+    int selected_rows[PASSES];
+    float weight_rows[PASSES];
+#pragma unroll
+    for (int pass = 0; pass < PASSES; ++pass) {
+        const int r = warp + 32 * pass;
+        selected_rows[pass] = -1;
+        weight_rows[pass] = 0.0f;
+        if (r >= M) continue;
         const long long slice_stride = static_cast<long long>(M) * NL;
-        const float* row0 = L + static_cast<long long>(warp) * NL;
+        const float* row0 = L + static_cast<long long>(r) * NL;
         float wv[16];
         float cur_v = -INFINITY;
         int cur_i = 0x7fffffff;
@@ -7055,27 +7063,64 @@ static __device__ __forceinline__ void route_topk_plan_impl(
         const int r_slots = shared ? (SLOTS - 1) : SLOTS;
         if (lane < r_slots) {
             if (lane < TOPK) {
-                PICK[static_cast<long long>(warp) * SLOTS + lane] = pick;
-                WTS[static_cast<long long>(warp) * SLOTS + lane] = rbf(__fdiv_rn(mine, total));
-                sh_pick[warp * SLOTS + lane] = pick;
+                selected_rows[pass] = pick;
+                const float weight = __fdiv_rn(mine, total);
+                weight_rows[pass] = weight;
+                PICK[static_cast<long long>(r) * SLOTS + lane] = pick;
+                WTS[static_cast<long long>(r) * SLOTS + lane] = rbf(weight);
+                sh_pick[r * SLOTS + lane] = pick;
                 if (pick >= 0 && pick < E_PLAN) atomicAdd(&sh_cnt[pick], 1);
             } else {
-                PICK[static_cast<long long>(warp) * SLOTS + lane] = NE;
-                WTS[static_cast<long long>(warp) * SLOTS + lane] = 0.0f;
-                sh_pick[warp * SLOTS + lane] = NE;
+                PICK[static_cast<long long>(r) * SLOTS + lane] = NE;
+                WTS[static_cast<long long>(r) * SLOTS + lane] = 0.0f;
+                sh_pick[r * SLOTS + lane] = NE;
             }
         }
         if (shared && lane == 0) {
             float sg = row0[NE];
             for (int s = 1; s < RSK; ++s) sg = __fadd_rn(sg, row0[static_cast<long long>(s) * slice_stride + NE]);
             const int s_slot = SLOTS - 1;
-            PICK[static_cast<long long>(warp) * SLOTS + s_slot] = NE;
-            WTS[static_cast<long long>(warp) * SLOTS + s_slot] = rbf(tf_sigmoid(rbf(sg)));
-            sh_pick[warp * SLOTS + s_slot] = NE;
+            PICK[static_cast<long long>(r) * SLOTS + s_slot] = NE;
+            WTS[static_cast<long long>(r) * SLOTS + s_slot] = rbf(tf_sigmoid(rbf(sg)));
+            sh_pick[r * SLOTS + s_slot] = NE;
             if (NE < E_PLAN) atomicAdd(&sh_cnt[NE], 1);
         }
     }
     __syncthreads();
+
+    if (M > 1 && shared && E_PLAN == NE && TOPK == 10) {
+#pragma unroll
+        for (int pass = 0; pass < PASSES; ++pass) {
+            const int r = warp + 32 * pass;
+            if (r >= M) continue;
+            const int selected = selected_rows[pass];
+            const float weight = weight_rows[pass];
+            const bool singleton = lane >= 6 && lane < TOPK &&
+                                   selected >= 0 && selected < NE && sh_cnt[selected] == 1;
+            float tail = singleton ? weight : 0.0f;
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const float more = __shfl_down_sync(0xffffffffu, tail, offset);
+                if (lane + offset < 32) tail += more;
+            }
+            const bool drop = singleton && tail <= 0.08f;
+            float removed = drop ? weight : 0.0f;
+            for (int offset = 16; offset; offset >>= 1)
+                removed += __shfl_xor_sync(0xffffffffu, removed, offset);
+            const unsigned survivors = __ballot_sync(0xffffffffu, lane < TOPK && !drop);
+            const float bonus = removed / static_cast<float>(max(1, __popc(survivors)));
+            const int slot = r * SLOTS + lane;
+            if (drop) {
+                // This expert has exactly one reader. NE is the plan's existing unused-slot sentinel.
+                sh_cnt[selected] = 0;
+                sh_pick[slot] = NE;
+                PICK[slot] = NE;
+                WTS[slot] = 0.0f;
+            } else if (lane < TOPK && removed > 0.0f) {
+                WTS[slot] = rbf(weight + bonus);
+            }
+        }
+        __syncthreads();
+    }
 
     const int c = (tid < E_PLAN) ? sh_cnt[tid] : 0;
     const int tiles = (c + T - 1) / T;
@@ -7084,7 +7129,7 @@ static __device__ __forceinline__ void route_topk_plan_impl(
     const int b1 = (c > 0 && T > 8 && rem >= 3 && rem <= 8) ? 1 : ((c > 0 && T <= 8) ? tiles : 0);
     const int b2 = (c > 0 && T > 8 && rem == 2) ? 1 : 0;
     const int b3 = (c > 0 && T > 8 && rem == 1) ? 1 : 0;
-    // At most 32 rows * 12 slots. No packed prefix sum can carry into
+    // At most 64 rows * 12 slots. No packed prefix sum can carry into
     // the next 10-bit field, including at the last warp.
     constexpr uint32_t mask = 1023u;
     uint32_t p0 = (uint32_t)c | ((uint32_t)(c > 0) << 10) | ((uint32_t)b0 << 20);
@@ -7172,14 +7217,15 @@ extern "C" __global__ void __launch_bounds__(1024) tf_route_topk_plan(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
     int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts) {
-    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
+    if (M <= 32) route_topk_plan_impl<1>(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
+    else route_topk_plan_impl<2>(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
 }
 
 extern "C" __global__ void __launch_bounds__(512) tf_route_topk_plan_512(
     const float* L, int NL, int NE, int TOPK, int M, int SLOTS, int shared, int E_PLAN, int T, int RSK,
     int* __restrict__ PICK, float* __restrict__ WTS,
     int* __restrict__ members, int* __restrict__ items, int* __restrict__ counts) {
-    route_topk_plan_impl(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
+    route_topk_plan_impl<1>(L, NL, NE, TOPK, M, SLOTS, shared, E_PLAN, T, RSK, PICK, WTS, members, items, counts);
 }
 
 // Trial 65: Lossless BF11 NW=8 SK=1 Router (1.85MB vs 2.63MB BF16, 65 CTAs x 8 warps, weights-first PDL, STACK:0)
@@ -12406,9 +12452,9 @@ patch_exact(
         try launch_.launch(f, .{ .grid = .{ .x = @intCast((experts + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = blk }, .pdl = true }, s, &a);
     }
 
-    /// Fused 1-CTA top-k + 4-bucket plan (with optional SK-slice router partial reduction) for rows<=32, experts<=512, e_plan<=512, slots<=12.
+    /// Fused 1-CTA top-k + 4-bucket plan (with optional SK-slice router partial reduction) for rows<=64, experts<=512, e_plan<=512, slots<=12.
     pub fn topkPlan(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, rows: usize, slots: usize, shared: bool, e_plan: usize, tile: usize, rsk: usize, picks: u64, wts: u64, members: u64, items: u64, counts: u64) !void {
-        if (rows == 0 or rows > 32 or experts > 512 or e_plan > 512 or slots > 12 or top_k > 32) return error.RowShape;
+        if (rows == 0 or rows > 64 or experts > 512 or e_plan > 512 or slots > 12 or top_k > 32) return error.RowShape;
         var a: launch_.Args = .{};
         a.add(l);
         for ([_]usize{ ld, experts, top_k, rows, slots, @intFromBool(shared), e_plan, tile, rsk }) |v| a.add(@as(i32, @intCast(v)));
@@ -12484,7 +12530,7 @@ patch_exact(
     """            const e = experts_n + 1;
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
-                if (native.world == 1 and native.experts.format == .nvfp4 and n <= 32 and keep.moe_ids == 0 and keep.moe_wts == 0 and self.tri.set == null) {
+                if (native.world == 1 and native.experts.format == .nvfp4 and !self.hooks.prompt and n <= 64 and keep.moe_ids == 0 and keep.moe_wts == 0 and self.tri.set == null) {
                     if (self.tri.own) |g| {
                         return moe_native.runFused(self, g, lw, native, n, pairs, plan);
                     }
