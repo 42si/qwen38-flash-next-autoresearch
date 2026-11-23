@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t362"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -7925,6 +7925,24 @@ extern "C" __global__ void __launch_bounds__(256) fn_attn_merge_gate(
 """,
     encoding="utf-8",
 )
+# Stage BF16 KV vectors with a 128-byte L2 fetch hint for adjacent channels.
+kv_copy = """
+static __device__ __forceinline__ void kv_cp16_l2(
+    void* dst, const void* src, bool valid) {
+    const unsigned sm = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;"
+                 :: "r"(sm), "l"(src), "r"(valid ? 16 : 0) : "memory");
+}
+"""
+patch_k("flashnext_attn.cu", "#include <cuda_bf16.h>", "#include <cuda_bf16.h>\n" + kv_copy)
+for dst, base in (
+    ("dst[k]", "(PAGED ? key_at[buf][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD)"),
+    ("tiles_kv[k]", "(PAGED ? key_at[0][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD)"),
+    ("dst[k]", "key_at[buf][k]"),
+):
+    call = f"(&{dst}[8 * v], src + {base} + 8 * v, key >= 0);"
+    patch_k("flashnext_attn.cu", "qmm_frag::cp16z" + call, "kv_cp16_l2" + call)
+
 instrument_pdl("flashnext_attn_lanes.cuh", expect_min=5)
 instrument_pdl("flashnext_qsa_tile.cuh", expect_min=1)
 instrument_pdl("flashnext_mtp.cu", expect_min=2, stop_marker="extern \"C\" __global__ void __launch_bounds__(128) fn_w2_gemv_fused(")
