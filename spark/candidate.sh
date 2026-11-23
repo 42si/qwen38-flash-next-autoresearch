@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t360"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -2199,7 +2199,17 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
 
     const bool aligned8 = ((reinterpret_cast<uintptr_t>(row) & 15u) == 0u) && ((V & 7) == 0);
     int bad = 0;
-    unsigned int tmax = 0u;
+    unsigned int tmax = 0u, runner_up = 0u;
+    int winner = -1;
+    auto remember = [&](unsigned int key, int column) {
+        if (key > tmax || winner < 0) {
+            runner_up = tmax;
+            tmax = key;
+            winner = column;
+        } else {
+            runner_up = max(runner_up, key);
+        }
+    };
     if (aligned8) {
         const uint4* row4 = reinterpret_cast<const uint4*>(row);
         const int v8 = V >> 3;
@@ -2214,8 +2224,8 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
                 bad |= ((u1 & 0x7FFFu) > 0x7F80u) | (u1 == 0x7F80u);
                 const unsigned int k0 = okey(u0);
                 const unsigned int k1 = okey(u1);
-                if (k0 > tmax) tmax = k0;
-                if (k1 > tmax) tmax = k1;
+                remember(k0, 8 * c + 2 * w);
+                remember(k1, 8 * c + 2 * w + 1);
             }
         }
     } else {
@@ -2223,7 +2233,7 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
             const unsigned short u = row[i];
             bad |= ((u & 0x7FFFu) > 0x7F80u) | (u == 0x7F80u);
             const unsigned int k = okey(u);
-            if (k > tmax) tmax = k;
+            remember(k, i);
         }
     }
     const int row_bad = __syncthreads_or(bad);
@@ -2268,7 +2278,13 @@ extern "C" __global__ void __launch_bounds__(1024) fn_head_topk_floor(
     const unsigned int lb = (lb_hi << 8) | pick_lo;
 
     // Pass 2: only the ~128 threads with tmax >= lb re-read their L1-cached slice to harvest ok >= lb.
-    if (tmax >= lb) {
+    if (winner >= 0 && tmax >= lb && runner_up < lb) {
+        const unsigned int slot = atomicAdd(&n_gt, 1u);
+        if (slot < 2048u) {
+            cand_k[slot] = static_cast<unsigned short>(tmax);
+            cand_c[slot] = winner;
+        }
+    } else if (tmax >= lb) {
         if (aligned8) {
             const uint4* row4 = reinterpret_cast<const uint4*>(row);
             const int v8 = V >> 3;
