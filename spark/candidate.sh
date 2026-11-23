@@ -15,7 +15,7 @@ PORT="${QFN_PORT:-29771}"
 ENGINE_NAME="TensorFold"
 ENGINE_VERSION="1.2.9"
 ENGINE_COMMIT="6b9de695104b6b8b30c20458da87ac06c9480289"
-BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t137"
+BUILD_FLAVOR="mtp-w2f-nvfp4-g4-head4-bf12s3-dynexp-pdl3-sk8-wbn4-hcfast-kvp16-while-fusehc-shgu-hbest-s2-gdn4t-h2-w2h-int6s-w1-tkplan3-c31-wbnv8e-cu4-fa1-hc64-r33-w1h-qtr-c256-mint6c-upmix32-hcd32-agate-outsk4-hcs1sc-s5all-r256-bf11p3-hcf1-t357"
 QUANT_NAME="NVFP4"
 MODEL_REPO="nvidia/Qwen3.8-Flash-Next-NVFP4"
 WEIGHTS_REV="fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -4979,7 +4979,7 @@ static __device__ __forceinline__ uint4 s5_ld4_256(const uint4* p) {
 #endif
 }
 
-static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
+static __device__ __noinline__ uint32_t s5_first_esc_index(
     const uint2* __restrict__ meta, const uint32_t* __restrict__ esc, int midx, uint32_t key) {
   const uint2 mm = __ldg(meta + midx);
   uint32_t lo = 0u, hi = mm.x >> 8;
@@ -4989,16 +4989,22 @@ static __device__ __noinline__ uint32_t s5_lookup_esc_meta(
     const uint32_t k = __ldg(esc + off + mid) >> 8;
     if (k < key) lo = mid + 1u; else hi = mid;
   }
-  return __ldg(esc + off + lo) & 0xFFu;
+  return off + lo;
 }
 
 static __device__ __noinline__ uint32_t s5_fix4(
     uint32_t val, uint32_t eq31, const uint2* __restrict__ meta, const uint32_t* __restrict__ esc,
     int midx, uint32_t key_base) {
-  if (eq31 & 0x00000020u) val = (val & 0xFFFFFF00u) | s5_lookup_esc_meta(meta, esc, midx, key_base);
-  if (eq31 & 0x00002000u) val = (val & 0xFFFF00FFu) | (s5_lookup_esc_meta(meta, esc, midx, key_base + 1u) << 8);
-  if (eq31 & 0x00200000u) val = (val & 0xFF00FFFFu) | (s5_lookup_esc_meta(meta, esc, midx, key_base + 2u) << 16);
-  if (eq31 & 0x20000000u) val = (val & 0x00FFFFFFu) | (s5_lookup_esc_meta(meta, esc, midx, key_base + 3u) << 24);
+  const unsigned first_byte = (__ffs(eq31) - 1) >> 3;
+  unsigned cursor = s5_first_esc_index(meta, esc, midx, key_base + first_byte);
+#pragma unroll
+  for (unsigned i = 0; i < 4; ++i) {
+    const unsigned shift = 8 * i;
+    if (eq31 & (0x20u << shift)) {
+      const unsigned scale = __ldg(esc + cursor++) & 0xffu;
+      val = (val & ~(0xffu << shift)) | (scale << shift);
+    }
+  }
   return val;
 }
 
