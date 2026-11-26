@@ -33,11 +33,46 @@ Full ledger: [`colab/results.tsv`](colab/results.tsv)
 <!-- FRONTIER_TABLE_START -->
 | Track | Hardware | Best Trial | Commit | `decode_c1_tps` | `total_c4_tps` | `total_c8_tps` | `total_c16_tps` | `ttft_c1_s` | `prefill_tps` | GPQA Guard | Engine & Quantization |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
-| `spark` | DGX Spark (GB10 x1) | `137` | `155b6558` | **139.10** | 187.10 | 252.52 | 296.73 | 0.144 s | 1,447.57 | `hash_match=1` (GPQA —) | TensorFold v1.2.9 (`6b9de695`, `spark/candidate.sh` patches) + NVFP4 (`fc694b54`) |
+| `spark` | DGX Spark (GB10 x1) | `137` | `155b6558` | **139.10** | 187.10 | 252.52 | 296.73 | 0.144 s | 1,447.57 | `hash_match=1`; `G198` 185/198 (93.4%, out-of-loop run, [§3.1](#31-gpqa-diamond-full-set-measurement-trial-137)) | TensorFold v1.2.9 (`6b9de695`, `spark/candidate.sh` patches) + NVFP4 (`fc694b54`) |
 | `colab` | RTX PRO 6000 (G4 x1) | — | — | — | — | — | — | — | — | — | — |
 <!-- FRONTIER_TABLE_END -->
 
-*(Baseline trial `0` on the current Spark stack: `77.93` tok/s `decode_c1_tps`, commit `99f86afa`. Trial `137` passed the accuracy guard via greedy 16-prompt exact output match `hash_match=1` with GPQA columns blank in `spark/results.tsv`; the full `engine` tag is recorded in `spark/results.tsv`. Cells remain `—` until measured by the frozen harness and recorded in `<site>/results.tsv`.)*
+*(Baseline trial `0` on the current Spark stack: `77.93` tok/s `decode_c1_tps`, commit `99f86afa`. Trial `137` passed the accuracy guard via greedy 16-prompt exact output match `hash_match=1` with GPQA columns blank in `spark/results.tsv`; the full `engine` tag is recorded in `spark/results.tsv`. The `G198` figure comes from a separate full-set run outside the trial loop, reported with its conditions in §3.1; it is not recorded in the ledger. Other cells remain `—` until measured by the frozen harness and recorded in `<site>/results.tsv`.)*
+
+### 3.1 GPQA Diamond Full-Set Measurement (Trial 137)
+
+All 198 GPQA Diamond items were scored once on the trial `137` build on 2026-11-26 (JST), outside the trial loop. The speed benchmark above runs with thinking off; this run uses the thinking-on profile of the same build.
+
+| Item | Value |
+|---|---|
+| Result | **185 / 198 correct (93.4%)**, single run. Wilson 95% interval: 89.1–96.1% |
+| Misses | 13: 12 answered with a wrong choice, 1 reached the output cap without an answer line. 0 request errors |
+| Subsets | `G13` 12 / 13, `G40` 36 / 40 |
+| Build | Trial `137` (`155b6558`): TensorFold v1.2.9 (`6b9de695`) + `spark/candidate.sh` patches, NVFP4 (`fc694b54`), MTP speculative decoding on |
+| Serving profile | Thinking on, context 139,264 × 2 slots, BF16 KV cache, prompt cache off |
+| Request and grading | `eval_one` in the frozen [`bench/guard.py`](bench/guard.py), unchanged: `temperature=1.0`, `top_p=0.95`, `top_k=20`, `seed=42`, `reasoning_effort="xhigh"`, thinking enabled, 2 clients; the last `Answer: X` line is graded |
+| Output cap | `max_tokens=131072`, the condition on the NVIDIA model card, instead of the guard default `32768` (see the notes below) |
+| Output tokens | 3,366,723 in total; per item: mean 17,004, median 7,521, p90 50,630 |
+| Wall time | 12 h 23 min on one DGX Spark, including one restart to raise the cap |
+
+Published values for comparison:
+
+| Checkpoint | GPQA Diamond | Published conditions | Source |
+|---|---:|---|---|
+| `Qwen/Qwen3.8-Flash-Next` (before quantization) | 91.7% | Not stated on the model card | <https://huggingface.co/Qwen/Qwen3.8-Flash-Next> |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` (the weights used here) | 91.5% (FP8 on the same card: 92.0%) | `temperature=1.0`, `top_p=0.95`, `max_new_tokens=131072`, `reasoning_effort=xhigh`; vLLM on B200 / B300 | <https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4> |
+
+- **Reading the number.** One item is 0.5 points and the interval above contains both published values, so the 1.7 to 1.9 point gap is within single-run noise. The result shows no measurable accuracy loss against the published values; it does not show an improvement over them.
+- **Not a guard verdict.** `program.md` defines the `G198` guard relative to baseline `A0` (trial `0`), which has not been scored. The GPQA columns in `spark/results.tsv` therefore stay blank, and this number is compared only with published values.
+- **Output cap.** The first 27 items ran at the guard default of 32,768 tokens. Three of them reached the cap mid-reasoning with no answer, so the cap was raised to 131,072 for the rest of the run and those three were retaken (38,730 / 46,850 / 62,574 tokens: wrong, wrong, correct). The 24 that had finished on their own were kept.
+- **Cap sensitivity.** 33 of the 198 items produced more than 32,768 output tokens, and 25 of those were correct. Scored at a 32,768 cap, the same run would be 160 / 198 (80.8%).
+- **Differences from the model-card setups.** `top_k=20` and a fixed seed are set; the engine is TensorFold with speculative decoding rather than vLLM; the prompt format and answer extraction are this repository's; one run only.
+- **Records.** Per-item records (Record ID SHA-256, correct or not, finish reason, token count, timing) are kept in the untracked `../private/` directory. No question text or model output was stored. The run used a resumable wrapper around `eval_one` that is kept outside the repository; the frozen CLI equivalent is:
+
+```bash
+python3 bench/guard.py --mode eval --split G198 --clients 2 --max-tokens 131072 \
+  --bundle ../private/eval-bundle.json --out ../private/gpqa-g198.json
+```
 
 ---
 
