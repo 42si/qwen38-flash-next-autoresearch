@@ -1,14 +1,14 @@
 # Qwen3.8-Flash-Next Inference Speed Autoresearch
 
-Autonomous [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style optimization loop targeting world-record single-stream and concurrent inference throughput for **`Qwen/Qwen3.8-Flash-Next`** (125B backbone + 51B n-gram embedding table, 6B active parameters per token, 262,144 native context) while enforcing a strict **GPQA Diamond accuracy guard**.
+Autonomous [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style optimization loop for single-stream and concurrent inference throughput of **`Qwen/Qwen3.8-Flash-Next`** (125B backbone + 51B n-gram embedding table, 6B active parameters per token, 262,144 native context) while enforcing a strict **GPQA Diamond accuracy guard**.
 
 ## 1. Purpose & Goals
 
-1. **Surpass published hardware records under strict accuracy preservation**: Beat both the NVIDIA published recipe reference (**37.77 tok/s** active decode on GB10) and the highest open single-device GB10 report (**119.6 tok/s**, achieved under accuracy-relaxing settings) while keeping GPQA Diamond within **1.0 percentage point (2 items on `G198`)** of the baseline.
+1. **Exceed published throughput numbers under strict accuracy preservation**: Exceed both the NVIDIA published recipe reference (**37.77 tok/s** active decode on GB10) and the highest open single-device GB10 report (**119.6 tok/s**, achieved under accuracy-relaxing settings) while keeping GPQA Diamond within **1.0 percentage point (2 items on `G198`)** of the baseline.
 2. **Two independent hardware tracks** (never mixed across architectures):
    - **Track A (`spark/`)**: Single **NVIDIA DGX Spark (GB10, SM121, 128 GB unified memory, aarch64)**.
    - **Track B (`colab/`)**: Single **NVIDIA RTX PRO 6000 Blackwell (G4, 96 GB VRAM, x86_64)** on Google Colab.
-3. **Verifiable claims only**: Unmeasured numbers are left blank, published numbers carry primary-source URLs and exact measurement conditions in [`records/world-records.tsv`](records/world-records.tsv), and no "world record" claim is made without matching conditions and re-measuring the reference engine on identical hardware.
+3. **Verifiable claims only**: Unmeasured numbers are left blank, published numbers carry primary-source URLs and exact measurement conditions in [`records/world-records.tsv`](records/world-records.tsv), and no claim of exceeding a published number is made without matching its conditions and re-measuring the reference engine on identical hardware.
 
 ---
 

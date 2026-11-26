@@ -22,7 +22,7 @@ Published evaluation figures from official model cards (distinct checkpoints sep
 
 Switching away from NVFP4 is permitted **only** when all three plateau criteria in `program.md` hold simultaneously:
 1. Zero `keep` trials over the last 24 trials, OR total `decode_c1_tps` gain < 3% across the last 3 rounds.
-2. Best guard-passing `decode_c1_tps` remains below 85% of the verified target world record.
+2. Best guard-passing `decode_c1_tps` remains below 85% of the verified target published record.
 3. No high-leverage unattempted NVFP4 hypotheses remain in `records/research-log.md`.
 
 When switching, candidate formats are evaluated in accuracy-preserving order (`FP4-Local`, `MXFP4`, calibrated `INT4` AWQ/GPTQ/AutoRound, `FP8`, calibrated 3-bit), and the new starting point must pass the full `G198` GPQA Diamond guard before becoming the parent commit.
